@@ -33,6 +33,11 @@ THREAD_POOL_TASK_FUNC(lnk_parse_debug_s_task)
   U64                obj_idx = task_id;
   LNK_CodeViewInput *task    = raw_task;
 
+  // A digest obj concatenates the .debug$S of every grouped obj; their internal offsets
+  // (string table <-> checksums <-> lines) are per-origin-obj and cannot be merged as one
+  // module. Leave its CV_DebugS empty -- digest debug is served via the .rrt, not regenerated.
+  if (task->obj_arr[obj_idx]->is_digest) { return; }
+
   String8List sect_list = task->debug_s_list_arr[obj_idx];
   CV_DebugS  *debug_s   = &task->debug_s_arr    [obj_idx];
 
