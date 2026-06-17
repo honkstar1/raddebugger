@@ -115,6 +115,27 @@ lnk_obj_fill_from_digest(Arena *arena, LNK_Obj *obj, LNK_Input *input, LNK_ObjNo
     }
   }
 
+  // per-contrib COMDAT index (-> RGD_Comdat, or max_U32 = not comdat); read by the digest branch of
+  // lnk_try_comdat_props_from_section_number. + associated_sections[section_number] = list of sections
+  // removed together (Associative COMDAT), indexed by section_number (1..contrib_count).
+  U32      *comdats             = push_array_no_zero(arena, U32, contrib_count);
+  U32Node **associated_sections = push_array(arena, U32Node *, contrib_count + 1);
+  MemorySet(comdats, 0xff, contrib_count * sizeof(U32));
+  for EachIndex(cmi, p->header->comdat_count) {
+    RGD_Comdat *cm = &p->comdats[cmi];
+    if (cm->section_idx < contrib_count) {
+      comdats[cm->section_idx] = safe_cast_u32(cmi);
+      if ((COFF_ComdatSelectType)cm->select == COFF_ComdatSelect_Associative && cm->associate_sect_idx != RGD_BAD_IDX) {
+        U32 head = cm->associate_sect_idx + 1; // section this comdat is associated with
+        if (head <= contrib_count) {
+          U32Node *n = push_array(arena, U32Node, 1);
+          n->data = safe_cast_u32(cm->section_idx + 1);
+          SLLStackPush(associated_sections[head], n);
+        }
+      }
+    }
+  }
+
   COFF_FileHeaderInfo header = {0};
   header.is_big_obj            = 1; // 32-bit section count -> no 65535 cap
   header.machine               = p->header->machine;
@@ -126,6 +147,8 @@ lnk_obj_fill_from_digest(Arena *arena, LNK_Obj *obj, LNK_Input *input, LNK_ObjNo
   obj->header              = header;
   obj->section_flags       = section_flags;
   obj->parsed_symbols      = parsed_symbols;
+  obj->comdats             = comdats;
+  obj->associated_sections = associated_sections;
   obj->self                = self;
   obj->link_member         = input->link_member;
   obj->debug_t_sect_idx    = ~0;
@@ -744,6 +767,20 @@ internal B32
 lnk_try_comdat_props_from_section_number(LNK_Obj *obj, U32 section_number, COFF_ComdatSelectType *select_out, U32 *section_number_out, U32 *section_length_out, U32 *check_sum_out)
 {
   Assert(section_number > 0);
+  if (obj->is_digest) {
+    // for a digest obj, comdats[sect] holds the RGD_Comdat index (or max_U32); props come straight
+    // from the digest, not a secdef aux parse.
+    U32 comdat_idx = obj->comdats[section_number-1];
+    if (comdat_idx != max_U32) {
+      RGD_Comdat *cm = &obj->digest->comdats[comdat_idx];
+      if (select_out)         { *select_out         = (COFF_ComdatSelectType)cm->select; }
+      if (section_number_out) { *section_number_out = (cm->associate_sect_idx != RGD_BAD_IDX) ? (cm->associate_sect_idx + 1) : 0; }
+      if (section_length_out) { *section_length_out = cm->length; }
+      if (check_sum_out)      { *check_sum_out      = cm->checksum; }
+      return 1;
+    }
+    return 0;
+  }
   U32 symbol_idx = obj->comdats[section_number-1];
   if (symbol_idx != max_U32) {
     COFF_ParsedSymbol secdef = lnk_parsed_symbol_from_coff_symbol_idx(obj, symbol_idx);
@@ -758,6 +795,7 @@ lnk_coff_section_header_from_section_number(LNK_Obj *obj, U64 section_number)
 {
   Assert(section_number > 0);
   U64 sect_idx = section_number - 1;
+  if (obj->is_digest) { return &obj->digest_sect_headers[sect_idx]; }
   COFF_SectionHeader *section_table = str8_deserial_get_raw_ptr(obj->data, obj->header.section_table_range.min, dim_1u64(obj->header.section_table_range));
   return &section_table[sect_idx];
 }
