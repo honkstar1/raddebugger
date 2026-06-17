@@ -1624,22 +1624,23 @@ THREAD_POOL_TASK_FUNC(lnk_search_lib_task)
     for EachIndex(i, c->count) {
       LNK_Symbol *symbol = c->v[i].symbol;
 
+      // Cheap lib-membership probe FIRST. Most (symbol, lib) pairs miss -- this skips the expensive
+      // per-symbol parse + weak-tag aux read (the profile hot lines) for every symbol this lib does
+      // not define, instead of deriving interp for all symbols x all libs. Equivalent: search_chunks
+      // holds only Undefined/Weak symbols, and the queue stays gated on interp below.
+      U32 member_idx;
+      if (!lnk_search_lib(lib, symbol->name, &member_idx)) { continue; }
+
       LNK_ObjSymbolRef           symbol_ref    = lnk_ref_from_symbol(symbol);
       // skip the name scan here; the resolved name is already cached on symbol->name
       COFF_ParsedSymbol          symbol_parsed = lnk_parsed_symbol_from_coff_symbol_idx_no_name(symbol_ref.obj, symbol_ref.symbol_idx);
       COFF_SymbolValueInterpType symbol_interp = coff_interp_from_parsed_symbol(symbol_parsed);
       if (symbol_interp == COFF_SymbolValueInterp_Undefined) {
-        U32 member_idx;
-        if (lnk_search_lib(lib, symbol->name, &member_idx)) {
-          lnk_queue_lib_member(arena, task->imports_hm, task->link->lib_member_infos_hm, member_ref_list, symbol, lib, lib_member_infos, member_idx);
-        }
+        lnk_queue_lib_member(arena, task->imports_hm, task->link->lib_member_infos_hm, member_ref_list, symbol, lib, lib_member_infos, member_idx);
       } else if (symbol_interp == COFF_SymbolValueInterp_Weak) {
         COFF_SymbolWeakExt *weak_ext = coff_parse_weak_tag(symbol_parsed, symbol_ref.obj->header.is_big_obj);
         if (weak_ext->characteristics == COFF_WeakExt_SearchLibrary) {
-          U32 member_idx;
-          if (lnk_search_lib(lib, symbol->name, &member_idx)) {
-            lnk_queue_lib_member(arena, task->imports_hm, task->link->lib_member_infos_hm, member_ref_list, symbol, lib, lib_member_infos, member_idx);
-          }
+          lnk_queue_lib_member(arena, task->imports_hm, task->link->lib_member_infos_hm, member_ref_list, symbol, lib, lib_member_infos, member_idx);
         } else if (weak_ext->characteristics == COFF_WeakExt_AntiDependency) {
           if (search_anti_deps) {
             LNK_ObjSymbolRef dep_symbol = {0};
@@ -1647,10 +1648,7 @@ THREAD_POOL_TASK_FUNC(lnk_search_lib_task)
               COFF_ParsedSymbol          dep_parsed = lnk_parsed_symbol_from_coff_symbol_idx_no_name(dep_symbol.obj, dep_symbol.symbol_idx);
               COFF_SymbolValueInterpType dep_interp = coff_interp_from_parsed_symbol(dep_parsed);
               if (dep_interp == COFF_SymbolValueInterp_Weak) {
-                U32 member_idx;
-                if (lnk_search_lib(lib, symbol->name, &member_idx)) {
-                  lnk_queue_lib_member(arena, task->imports_hm, task->link->lib_member_infos_hm, member_ref_list, symbol, lib, lib_member_infos, member_idx);
-                }
+                lnk_queue_lib_member(arena, task->imports_hm, task->link->lib_member_infos_hm, member_ref_list, symbol, lib, lib_member_infos, member_idx);
               }
             }
           }
