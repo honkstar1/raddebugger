@@ -137,6 +137,12 @@ rgd_serialize(Arena *arena, RGD_Builder *b)
     syms[k]               = syms_unsorted[sort[k].push_idx];
     perm[sort[k].push_idx] = safe_cast_u32(k);
   }
+  // remap weak_tag (a boundary push idx) -> sorted BoundarySyms idx
+  for EachIndex(k, sym_count) {
+    if (syms[k].interp == COFF_SymbolValueInterp_Weak && syms[k].weak_tag != RGD_BAD_IDX) {
+      syms[k].weak_tag = perm[syms[k].weak_tag];
+    }
+  }
 
   // --- collect relocs; remap _Boundary targets from push-order to sorted BoundarySyms index ---
   U64        reloc_count = b->reloc_count;

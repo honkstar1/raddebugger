@@ -89,8 +89,10 @@ typedef struct RGD_Sym
   U8  storage_class;   // COFF_SymStorageClass
   U8  interp;          // COFF_SymbolValueInterpType
   U32 comdat_idx;      // -> Comdats, or RGD_BAD_IDX
-  U32 def_obj_idx;     // group-local obj that DEFINES this sym (section-bound interp); else RGD_BAD_IDX.
-                       // pairs with section_number to locate the defining contrib at synthesize time.
+  U32 def_obj_idx;     // group-local origin obj. For section-bound (Regular) syms it pairs with
+                       // section_number to locate the defining contrib at consume; also remaps weak_tag.
+  U32 weak_char;       // COFF_WeakExtType for Weak interp; else 0
+  U32 weak_tag;        // Weak interp: -> BoundarySyms (the default/tag symbol, post-sort); else RGD_BAD_IDX
 } RGD_Sym;
 
 // --- Comdats -----------------------------------------------------------------

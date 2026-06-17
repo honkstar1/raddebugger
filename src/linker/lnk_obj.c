@@ -77,8 +77,17 @@ lnk_obj_fill_from_digest(Arena *arena, LNK_Obj *obj, LNK_Input *input, LNK_ObjNo
     d->section_number = s->section_number;
     d->type.v         = s->type;
     d->storage_class  = s->storage_class;
-    // TODO(weak): weak boundary syms need the aux tag (coff_parse_weak_tag reads raw_symbol+1);
-    // not carried in RGD_Sym yet. Weak-heavy targets will fault until the stage emits the tag.
+    if (s->interp == COFF_SymbolValueInterp_Weak) {
+      // synth a [COFF_Symbol32][COFF_SymbolWeakExt] record so coff_parse_weak_tag(.., is_big_obj=1)
+      // reads a valid aux at raw_symbol+1. aux_symbol_count stays 0: the aux is out-of-band (not a slot
+      // in the flat parsed_symbols array that lnk_input_coff_symbol_table steps through), and the
+      // coff_parse_weak_tag aux-count Assert is compiled out in release.
+      U8                 *buf = push_array(arena, U8, sizeof(COFF_Symbol32) + sizeof(COFF_SymbolWeakExt));
+      COFF_SymbolWeakExt *aux = (COFF_SymbolWeakExt *)(buf + sizeof(COFF_Symbol32));
+      aux->tag_index       = s->weak_tag;
+      aux->characteristics = s->weak_char;
+      d->raw_symbol        = buf;
+    }
   }
 
   COFF_SectionFlags  *section_flags = push_array(arena, COFF_SectionFlags,  contrib_count);

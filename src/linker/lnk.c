@@ -5985,7 +5985,14 @@ lnk_run_group_digest(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
       s.storage_class  = symbol.storage_class;
       s.interp         = (U8)interp;
       s.comdat_idx     = RGD_BAD_IDX;
-      s.def_obj_idx    = (interp == COFF_SymbolValueInterp_Regular) ? safe_cast_u32(obj_idx) : RGD_BAD_IDX;
+      s.def_obj_idx    = safe_cast_u32(obj_idx); // origin obj (Regular section lookup + weak_tag remap)
+      s.weak_char      = 0;
+      s.weak_tag       = RGD_BAD_IDX;
+      if (interp == COFF_SymbolValueInterp_Weak) {
+        COFF_SymbolWeakExt *ext = coff_parse_weak_tag(symbol, obj->header.is_big_obj);
+        s.weak_char = ext->characteristics;
+        s.weak_tag  = ext->tag_index; // obj-local idx; remapped to boundary push idx after pass 1
+      }
       sym_to_boundary[obj_idx][symbol_idx] = rgd_builder_push_sym(&b, symbol.name, s);
     }
 
@@ -5993,6 +6000,14 @@ lnk_run_group_digest(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
     String8List raw_dirs = lnk_raw_directives_from_obj(scratch.arena, obj);
     for (String8Node *t = raw_dirs.first; t != 0; t = t->next) {
       rgd_builder_push_directive(&b, t->string);
+    }
+  }
+
+  // resolve weak tags: obj-local symbol idx -> boundary push idx (sym_to_boundary is now complete).
+  // rgd_serialize then remaps push idx -> sorted BoundarySyms idx.
+  for (RGD_SymNode *n = b.first_sym; n != 0; n = n->next) {
+    if (n->sym.interp == COFF_SymbolValueInterp_Weak && n->sym.weak_tag != RGD_BAD_IDX) {
+      n->sym.weak_tag = sym_to_boundary[n->sym.def_obj_idx][n->sym.weak_tag];
     }
   }
 
@@ -6056,6 +6071,29 @@ lnk_run_group_digest(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
     }
   }
 #undef lnk_rgd_sym_is_internal
+
+  // Remap section references from (origin obj, obj-local sect) into the digest's flat contrib space.
+  // Contribs are flattened across all group objs, so a sym's/reloc's original obj section index does
+  // not equal its digest contrib index; without this, COMDAT/section lookups hit the wrong contrib.
+  {
+    HashTable *sect2contrib = hash_table_init(scratch.arena, (U32)(b.contrib_count + 1));
+    U64 ci = 0;
+    for (RGD_ContribNode *cn = b.first_contrib; cn != 0; cn = cn->next, ci += 1) {
+      hash_table_push_u64_u64(scratch.arena, sect2contrib, Compose64Bit(cn->contrib.source_obj_idx, cn->contrib.obj_sect_idx), ci);
+    }
+    for (RGD_SymNode *n = b.first_sym; n != 0; n = n->next) {
+      if (n->sym.interp == COFF_SymbolValueInterp_Regular && n->sym.section_number != 0) {
+        BucketNode *hit = hash_table_search_u64(sect2contrib, Compose64Bit(n->sym.def_obj_idx, n->sym.section_number - 1));
+        if (hit) { n->sym.section_number = safe_cast_u32(hit->v.value_u64 + 1); }
+      }
+    }
+    for (RGD_RelocNode *n = b.first_reloc; n != 0; n = n->next) {
+      if (n->reloc.target_kind == RGD_RelocTarget_Internal) {
+        BucketNode *hit = hash_table_search_u64(sect2contrib, Compose64Bit(n->reloc.apply_obj_idx, n->reloc.target_sect_idx));
+        if (hit) { n->reloc.target_sect_idx = safe_cast_u32(hit->v.value_u64); }
+      }
+    }
+  }
 
   String8List digest_data = rgd_serialize(scratch.arena, &b);
   String8     temp_path   = push_str8f(scratch.arena, "%S.tmp%x", config->group_digest_name, config->time_stamp);
