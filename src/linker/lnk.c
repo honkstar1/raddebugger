@@ -6098,6 +6098,10 @@ entry_point(CmdLine *cmdline)
   case LNK_BootMode_GroupDigest: lnk_run_group_digest (tp, tp_arena, config); break;
   }
 
-  lnk_log_end();
-  scratch_end(scratch);
+  // Exit "dirty": all outputs are already flushed to disk (synchronously, inside the boot-mode run),
+  // so skip the single-threaded process rundown that reclaims radlink's large working arenas + the
+  // ~1GB image buffer page-by-page -- a multi-second tail at scale. _exit (via lnk_exit, which flushes
+  // stdout/stderr first) hands the whole address space to the OS for bulk reclaim, off the critical
+  // path. Mirrors link.exe / lld. Stop-class errors already exited non-zero earlier via lnk_exit(code).
+  lnk_exit(0);
 }
