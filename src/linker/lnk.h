@@ -34,6 +34,7 @@ typedef struct LNK_Input
   String8           data;
   B32               disallow;
   B32               is_thin;
+  B32               is_digest; // data is a .rgd group digest; lnk_obj_initer builds the obj from it
   B32               has_disk_read_failed;
   B32               exclude_from_debug_info;
   LNK_LibMemberRef *link_member;

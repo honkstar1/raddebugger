@@ -15,6 +15,13 @@ typedef struct LNK_Obj
   COFF_ParsedSymbol  *parsed_symbols; // memoized parse per symbol_idx (aux slots zeroed). Mutable: symbol-value
                                        // patching writes here, NOT into the mmapped obj->data symbol table.
 
+  // group digest (.rgd) backing: when is_digest, this obj is NOT a parsed COFF -- parsed_symbols,
+  // section headers and relocs are served from the digest by the obj accessors, not from obj->data.
+  B8                  is_digest;
+  struct RGD_Parsed  *digest;              // parsed view of the .rgd (read-only mapping)
+  COFF_SectionHeader *digest_sect_headers; // [contrib_count] synthesized headers for the section accessors
+  COFF_RelocArray    *digest_relocs;       // [contrib_count] per-section reloc arrays (built at load)
+
   // flags
   B8 hotpatch;
   B8 exclude_from_debug_info;
