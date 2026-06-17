@@ -8,6 +8,7 @@ typedef enum
 {
   LNK_BootMode_Linker,
   LNK_BootMode_TypeServer,
+  LNK_BootMode_GroupDigest,
 } LNK_BootMode;
 
 #if OS_WINDOWS
@@ -142,6 +143,7 @@ typedef enum
 
   LNK_CmdSwitch_RadTypeServer,
   LNK_CmdSwitch_RadTypeServer_MatchObj,
+  LNK_CmdSwitch_RadGroupDigest,
 
   LNK_CmdSwitch_Help,
 
@@ -165,6 +167,7 @@ typedef enum
   LNK_Input_Res,
   LNK_Input_Manifest,
   LNK_Input_RRT,
+  LNK_Input_RGD,
   LNK_Input_Count
 } LNK_InputType;
 
@@ -387,6 +390,8 @@ typedef struct LNK_Config
   LLVM_GHashAlg               type_hash_alg;
   String8                     type_server_name;
   LNK_SwitchState             type_server;
+  String8                     group_digest_name;
+  String8                     temp_group_digest_name;
 } LNK_Config;
 
 // --- MSVC Error Codes --------------------------------------------------------

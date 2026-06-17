@@ -105,6 +105,7 @@ global read_only LNK_CmdSwitch g_cmd_switch_map[] =
   { LNK_CmdSwitch_Rad_WorkDir,                      0, "RAD_WORK_DIR",                         ":PATH",     "Working directory used for stable debug paths."                                   },
 
   { LNK_CmdSwitch_RadTypeServer,                   0, "RAD_TYPE_SERVER", ":FILENAME", "Merge types and store them in the specified file. The filename must have the .rrt extension." },
+  { LNK_CmdSwitch_RadGroupDigest,                  0, "RAD_GROUP_DIGEST", ":FILENAME", "Stage the input objs into a group digest at the specified file. The filename must have the .rgd extension." },
 
   { LNK_CmdSwitch_Help, 0, "HELP", "", "" },
   { LNK_CmdSwitch_Help, 0, "?",    "", "" },
@@ -121,6 +122,7 @@ global read_only struct
   { "rlib", LNK_Input_Lib }, // rust libs
   { "res",  LNK_Input_Res },
   { "rrt",  LNK_Input_RRT },
+  { "rgd",  LNK_Input_RGD },
 };
 
 global read_only struct
@@ -2181,6 +2183,20 @@ lnk_apply_cmd_option_to_config(LNK_Config *config, String8 cmd_name, String8List
       }
     } else {
       lnk_error_cmd_switch(LNK_Error_Cmdl, obj, cmd_switch, "missing type server file path");
+    }
+  } break;
+  case LNK_CmdSwitch_RadGroupDigest: {
+    lnk_cmd_switch_parse_string_copy(config->arena, obj, cmd_switch, value_strings, &config->group_digest_name);
+
+    if (config->group_digest_name.size) {
+      String8 ext = str8_postfix(config->group_digest_name, s("rgd").size);
+      if (str8_matchi(ext, s("rgd"))) {
+        config->boot_mode = LNK_BootMode_GroupDigest;
+      } else {
+        lnk_error_cmd_switch(LNK_Error_Cmdl, obj, cmd_switch, "missing .rgd file extension after group digest name %S", config->group_digest_name);
+      }
+    } else {
+      lnk_error_cmd_switch(LNK_Error_Cmdl, obj, cmd_switch, "missing group digest file path");
     }
   } break;
   }

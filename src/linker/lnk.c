@@ -105,6 +105,7 @@
 #include "lnk_obj.h"
 #include "lnk_lib.h"
 #include "lnk_debug_info.h"
+#include "rgd.h"
 #include "lnk.h"
 
 #include "lnk_log.c"
@@ -118,6 +119,7 @@
 #include "lnk_debug_helper.c"
 #include "lnk_lib.c"
 #include "lnk_debug_info.c"
+#include "rgd.c"
 
 // -----------------------------------------------------------------------------
 
@@ -1960,6 +1962,99 @@ lnk_link_inputs(TP_Context      *tp,
 }
 
 
+// Synthesize a single COFF obj from a parsed group digest. One synthetic section per contrib, one
+// symbol per boundary sym (resolved cross-group by the global trie), relocs retargeted to those
+// symbols (boundary) or to synthetic statics at the group-local section+offset (internal). The
+// existing link pipeline then consumes it as an ordinary obj -> correctness by construction, and the
+// per-group merge already done at stage keeps the trie/contrib/reloc work small.
+internal String8
+lnk_coff_obj_from_rgd(Arena *arena, RGD_Parsed *p)
+{
+  Temp scratch = scratch_begin(&arena, 1);
+  COFF_ObjWriter *w = coff_obj_writer_alloc(COFF_TimeStamp_Max, p->header->machine);
+
+  // sections (one per contrib); map (obj_idx,sect_idx) -> section handle
+  COFF_ObjSection **contrib_sect = push_array(scratch.arena, COFF_ObjSection *, p->contrib_count);
+  HashTable        *sect_ht      = hash_table_init(scratch.arena, p->contrib_count + 1);
+  for EachIndex(ci, p->contrib_count) {
+    RGD_Contrib *c    = &p->contribs[ci];
+    String8      name = rgd_name_from_off(p, c->name_off);
+    String8      data = c->data_size ? str8(p->section_data.str + c->data_off, c->data_size) : str8_zero();
+    COFF_ObjSection *s = coff_obj_writer_push_section(w, name, c->flags, data);
+    contrib_sect[ci] = s;
+    hash_table_push_u64_raw(scratch.arena, sect_ht, Compose64Bit(c->source_obj_idx, c->obj_sect_idx), s);
+  }
+
+  // boundary symbols (cross-group resolution happens in the global trie)
+  COFF_ObjSymbol **bsym = push_array(scratch.arena, COFF_ObjSymbol *, p->header->boundary_sym_count);
+  for EachIndex(si, p->header->boundary_sym_count) {
+    RGD_Sym *s    = &p->syms[si];
+    String8  name = rgd_name_from_off(p, s->name_off);
+    COFF_ObjSymbol *sym = 0;
+    switch (s->interp) {
+      case COFF_SymbolValueInterp_Regular: {
+        COFF_ObjSection *sect = hash_table_search_u64_raw(sect_ht, Compose64Bit(s->def_obj_idx, s->section_number - 1));
+        if (sect) {
+          if (s->storage_class == COFF_SymStorageClass_External) {
+            sym = coff_obj_writer_push_symbol_extern(w, name, (U32)s->value, sect);
+          } else {
+            sym = coff_obj_writer_push_symbol_static(w, name, (U32)s->value, sect);
+          }
+        } else {
+          sym = coff_obj_writer_push_symbol_undef(w, name);
+        }
+      } break;
+      case COFF_SymbolValueInterp_Common:    sym = coff_obj_writer_push_symbol_common(w, name, (U32)s->value); break;
+      case COFF_SymbolValueInterp_Abs:       sym = coff_obj_writer_push_symbol_abs(w, name, (U32)s->value, s->storage_class); break;
+      case COFF_SymbolValueInterp_Undefined: sym = coff_obj_writer_push_symbol_undef(w, name); break;
+      case COFF_SymbolValueInterp_Weak:      sym = coff_obj_writer_push_symbol_undef(w, name); break; // TODO: carry weak tag/default
+      default:                               sym = coff_obj_writer_push_symbol_undef(w, name); break;
+    }
+    bsym[si] = sym;
+  }
+
+  // COMDAT section-definition symbols
+  for EachIndex(cmi, p->header->comdat_count) {
+    RGD_Comdat *cd = &p->comdats[cmi];
+    if (cd->section_idx >= p->contrib_count) { continue; }
+    COFF_ObjSection *sect = contrib_sect[cd->section_idx];
+    if ((COFF_ComdatSelectType)cd->select == COFF_ComdatSelect_Associative) {
+      RGD_Contrib     *cc    = &p->contribs[cd->section_idx];
+      COFF_ObjSection *assoc = hash_table_search_u64_raw(sect_ht, Compose64Bit(cc->source_obj_idx, cd->associate_sect_idx));
+      if (assoc) { coff_obj_writer_push_symbol_associative(w, sect, assoc); }
+    } else {
+      coff_obj_writer_push_symbol_secdef(w, sect, (COFF_ComdatSelectType)cd->select);
+    }
+  }
+
+  // relocs
+  for EachIndex(ri, p->reloc_count) {
+    RGD_Reloc       *r     = &p->relocs[ri];
+    COFF_ObjSection *apply = hash_table_search_u64_raw(sect_ht, Compose64Bit(r->apply_obj_idx, r->apply_obj_sect_idx));
+    if (!apply) { continue; }
+
+    COFF_ObjSymbol *tgt = 0;
+    if (r->target_kind == RGD_RelocTarget_Boundary) {
+      if (r->target_boundary_sym < p->header->boundary_sym_count) { tgt = bsym[r->target_boundary_sym]; }
+    } else {
+      // internal: synth a static at the group-local target section+offset (unique name per reloc;
+      // statics aren't in the global trie, so duplication is harmless)
+      COFF_ObjSection *tsect = hash_table_search_u64_raw(sect_ht, Compose64Bit(r->apply_obj_idx, r->target_sect_idx));
+      if (tsect) {
+        tgt = coff_obj_writer_push_symbol_static(w, push_str8f(scratch.arena, "$rgdi.%llx", (U64)ri), (U32)r->target_value, tsect);
+      }
+    }
+    if (tgt) {
+      coff_obj_writer_section_push_reloc(w, apply, (U32)r->apply_off, tgt, (COFF_RelocType)r->type);
+    }
+  }
+
+  String8 obj = coff_obj_writer_serialize(arena, w);
+  coff_obj_writer_release(&w);
+  scratch_end(scratch);
+  return obj;
+}
+
 internal LNK_LinkResult
 lnk_link_image(TP_Context *tp, TP_Arena *arena, LNK_Config *config, LNK_Inputer *inputer, LNK_SymbolTable *symtab)
 {
@@ -1975,6 +2070,18 @@ lnk_link_image(TP_Context *tp, TP_Arena *arena, LNK_Config *config, LNK_Inputer 
   // input objs on command line
   for (String8Node *obj_path = config->input_list[LNK_Input_Obj].first; obj_path != 0; obj_path = obj_path->next) {
     lnk_inputer_push_obj_thin(inputer, 0, obj_path->string);
+  }
+
+  // input group digests (synthesized to COFF objs, then consumed as ordinary objs)
+  for (String8Node *rgd_path = config->input_list[LNK_Input_RGD].first; rgd_path != 0; rgd_path = rgd_path->next) {
+    String8    raw = lnk_read_data_from_file_path(scratch.arena, config->io_flags, rgd_path->string);
+    RGD_Parsed pp  = rgd_parse(raw);
+    if (!rgd_is_valid(&pp)) {
+      lnk_error(LNK_Error_IllData, "ERROR: invalid or unreadable group digest \"%S\"", rgd_path->string);
+      continue;
+    }
+    String8 coff = lnk_coff_obj_from_rgd(inputer->arena, &pp);
+    lnk_inputer_push_obj_linkgen(inputer, 0, push_str8f(inputer->arena, "* RGD %S *", str8_skip_last_slash(rgd_path->string)), coff);
   }
 
   // input libs from command line
@@ -2953,15 +3060,8 @@ THREAD_POOL_TASK_FUNC(lnk_patch_comdat_leaders_task)
             task->u.patch_symtabs.was_symbol_patched[obj_idx][symbol_idx] = 1;
           }
 
-          if (obj->header.is_big_obj) {
-            COFF_Symbol32 *symbol32  = symbol.raw_symbol;
-            symbol32->section_number = section_number;
-            symbol32->value          = value;
-          } else {
-            COFF_Symbol16 *symbol16  = symbol.raw_symbol;
-            symbol16->section_number = (U16)section_number;
-            symbol16->value          = value;
-          }
+          obj->parsed_symbols[symbol_idx].section_number = section_number;
+          obj->parsed_symbols[symbol_idx].value          = value;
         }
       }
     }
@@ -3025,15 +3125,8 @@ THREAD_POOL_TASK_FUNC(lnk_patch_common_block_leaders_task)
     COFF_ParsedSymbol       parsed_symbol  = lnk_parsed_from_symbol(symbol);
     U64                     section_number = task->u.patch_symtabs.common_block_sect->sect_idx + 1;
 
-    if (symbol_ref.obj->header.is_big_obj) {
-      COFF_Symbol32 *symbol32 = parsed_symbol.raw_symbol;
-      symbol32->value          = contrib->u.offset;
-      symbol32->section_number = safe_cast_u32(section_number);
-    } else {
-      COFF_Symbol16 *symbol16 = parsed_symbol.raw_symbol;
-      symbol16->value          = contrib->u.offset;
-      symbol16->section_number = safe_cast_u16(section_number);
-    }
+    symbol_ref.obj->parsed_symbols[symbol_ref.symbol_idx].value          = contrib->u.offset;
+    symbol_ref.obj->parsed_symbols[symbol_ref.symbol_idx].section_number = safe_cast_u32(section_number);
 
     task->u.patch_symtabs.was_symbol_patched[symbol_ref.obj->input_idx][symbol_ref.symbol_idx] = 1;
   }
@@ -3058,17 +3151,9 @@ THREAD_POOL_TASK_FUNC(lnk_patch_common_block_symbols_task)
       COFF_ParsedSymbol defn_parsed = lnk_parsed_from_symbol(defn);
       Assert(lnk_interp_from_symbol(defn) == COFF_SymbolValueInterp_Regular);
       if (defn) {
-        if (obj->header.is_big_obj) {
-          COFF_Symbol32 *symbol32  = symbol.raw_symbol;
-          symbol32->section_number = defn_parsed.section_number;
-          symbol32->value          = safe_cast_u32(defn_parsed.value);
-          symbol32->storage_class  = COFF_SymStorageClass_Static;
-        } else {
-          COFF_Symbol16 *symbol16  = symbol.raw_symbol;
-          symbol16->section_number = safe_cast_u16(defn_parsed.section_number);
-          symbol16->value          = safe_cast_u32(defn_parsed.value);
-          symbol16->storage_class  = COFF_SymStorageClass_Static;
-        }
+        obj->parsed_symbols[symbol_idx].section_number = defn_parsed.section_number;
+        obj->parsed_symbols[symbol_idx].value          = defn_parsed.value;
+        obj->parsed_symbols[symbol_idx].storage_class  = COFF_SymStorageClass_Static;
       }
     }
   }
@@ -3106,15 +3191,8 @@ THREAD_POOL_TASK_FUNC(lnk_patch_regular_symbols_task)
         value          = sc->u.off + symbol.value;
       }
 
-      if (obj->header.is_big_obj) {
-        COFF_Symbol32 *symbol32  = symbol.raw_symbol;
-        symbol32->section_number = section_number;
-        symbol32->value          = value;
-      } else {
-        COFF_Symbol16 *symbol16  = symbol.raw_symbol;
-        symbol16->section_number = safe_cast_u16(section_number);
-        symbol16->value          = value;
-      }
+      obj->parsed_symbols[symbol_idx].section_number = section_number;
+      obj->parsed_symbols[symbol_idx].value          = value;
     }
   }
   ProfEnd();
@@ -3151,17 +3229,9 @@ lnk_patch_obj_symtab(LNK_SymbolTable *symtab, LNK_Obj *obj, B8 *was_symbol_patch
         value          = fixup_src.value;
       }
 
-      if (obj->header.is_big_obj) {
-        COFF_Symbol32 *symbol32  = fixup_dst.raw_symbol;
-        symbol32->section_number = section_number;
-        symbol32->value          = value;
-        symbol32->storage_class  = COFF_SymStorageClass_Static;
-      } else {
-        COFF_Symbol16 *symbol16  = fixup_dst.raw_symbol;
-        symbol16->section_number = (U16)section_number;
-        symbol16->value          = value;
-        symbol16->storage_class  = COFF_SymStorageClass_Static;
-      }
+      obj->parsed_symbols[symbol_idx].section_number = section_number;
+      obj->parsed_symbols[symbol_idx].value          = value;
+      obj->parsed_symbols[symbol_idx].storage_class  = COFF_SymStorageClass_Static;
 
       was_symbol_patched[symbol_idx] = 1;
     }
@@ -3842,17 +3912,9 @@ THREAD_POOL_TASK_FUNC(lnk_patch_section_symbols_task)
         if (sect && (~sect->flags & COFF_SectionFlag_LnkRemove)) {
           if (~sect->flags & COFF_SectionFlag_MemDiscardable) {
             LNK_SectionContrib *first_sc = lnk_get_first_section_contrib(sect);
-            if (obj->header.is_big_obj) {
-              COFF_Symbol32 *symbol32 = symbol.raw_symbol;
-              symbol32->section_number = safe_cast_u32(first_sc->u.sect_idx + 1);
-              symbol32->value          = first_sc->u.off;
-              symbol32->storage_class  = COFF_SymStorageClass_Static;
-            } else {
-              COFF_Symbol16 *symbol16 = symbol.raw_symbol;
-              symbol16->section_number = safe_cast_u16(first_sc->u.sect_idx + 1);
-              symbol16->value          = first_sc->u.off;
-              symbol16->storage_class  = COFF_SymStorageClass_Static;
-            }
+            obj->parsed_symbols[symbol_idx].section_number = safe_cast_u32(first_sc->u.sect_idx + 1);
+            obj->parsed_symbols[symbol_idx].value          = first_sc->u.off;
+            obj->parsed_symbols[symbol_idx].storage_class  = COFF_SymStorageClass_Static;
           } else {
             lnk_error_obj(LNK_Error_SectRefsDiscardedMemory, obj, "symbol %S (No. 0x%llx) references section with discard flag", symbol.name, symbol_idx);
           }
@@ -3870,17 +3932,9 @@ THREAD_POOL_TASK_FUNC(lnk_patch_section_symbols_task)
           LNK_Section *fallback_sect = task->image_sects.v[task->image_sects.count-1];
           U32 fallback_section_number = safe_cast_u32(fallback_sect->sect_idx + 1);
           U32 fallback_section_offset = safe_cast_u32(fallback_voff - fallback_sect->voff);
-          if (obj->header.is_big_obj) {
-            COFF_Symbol32 *symbol32 = symbol.raw_symbol;
-            symbol32->section_number = fallback_section_number;
-            symbol32->value          = fallback_section_offset;
-            symbol32->storage_class  = COFF_SymStorageClass_Static;
-          } else {
-            COFF_Symbol16 *symbol16 = symbol.raw_symbol;
-            symbol16->section_number = safe_cast_u16(fallback_section_number);
-            symbol16->value          = fallback_section_offset;
-            symbol16->storage_class  = COFF_SymStorageClass_Static;
-          }
+          obj->parsed_symbols[symbol_idx].section_number = fallback_section_number;
+          obj->parsed_symbols[symbol_idx].value          = fallback_section_offset;
+          obj->parsed_symbols[symbol_idx].storage_class  = COFF_SymStorageClass_Static;
 
           lnk_error_obj(LNK_Warning_UndefinedSectionSymbol, obj, "undefined section symbol %S (No. 0x%llx) refers to an image section that doesn't exist; patching to %#llx", symbol.name, symbol_idx, fallback_voff);
         }
@@ -5418,7 +5472,7 @@ lnk_run_linker(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
   LNK_SymbolTable *symtab = lnk_symbol_table_init(arena);
 
   //
-  // Link Image
+  // Link Image (group digests, if any, are synthesized + consumed inside lnk_link_image)
   //
   LNK_LinkResult link = lnk_link_image(tp, arena, config, inputer, symtab);
 
@@ -5866,6 +5920,146 @@ lnk_run_type_server(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
 }
 
 internal void
+lnk_run_group_digest(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
+{
+  ProfBeginFunction();
+  Temp scratch = scratch_begin(arena->v, arena->count);
+
+  // push default staging switches: never pull library members; we digest exactly the named objs
+  lnk_config_pushf(config, "/NOD");
+  lnk_config_pushf(config, "/RAD_WRITE_TEMP_FILES");
+
+  // load objs (mirror type-server front-end)
+  U64       objs_count = 0;
+  LNK_Obj **objs       = 0;
+  {
+    LNK_Inputer *inputer = lnk_inputer_init();
+    LNK_Link    *link    = lnk_link_init(arena, config);
+
+    // NOTE: no null obj here -- the consuming link supplies its own; digesting it would multiply-define
+    // *** RAD_NULL_SYMBOL ***.
+    for (String8Node *obj_path = config->input_list[LNK_Input_Obj].first; obj_path != 0; obj_path = obj_path->next) {
+      lnk_inputer_push_obj_thin(inputer, 0, obj_path->string);
+    }
+
+    LNK_ObjNode *obj_nodes = lnk_load_objs(tp, arena, config, inputer, 0, link, &objs_count);
+    objs = push_array(scratch.arena, LNK_Obj *, objs_count);
+    for EachIndex(obj_idx, objs_count) { objs[obj_idx] = &obj_nodes[obj_idx].data; }
+  }
+
+  // build digest -- phase 1: boundary symbols only (External/Weak/Common/Abs/Undefined/COMDAT). Purely
+  // internal Static-Regular symbols are bound within the group and omitted from the global trie set.
+  RGD_Builder b = rgd_builder_init(scratch.arena, config->machine, 0);
+  b.source_obj_count = objs_count;
+
+  // a symbol is "internal" (omitted from the boundary set, bound group-locally) iff Static + Regular
+#define lnk_rgd_sym_is_internal(s, interp) ((s).storage_class == COFF_SymStorageClass_Static && (interp) == COFF_SymbolValueInterp_Regular)
+
+  // pass 1: boundary symbols. record obj-local symbol_idx -> boundary push index (BAD if internal)
+  U32 **sym_to_boundary = push_array(scratch.arena, U32 *, objs_count);
+  for EachIndex(obj_idx, objs_count) {
+    LNK_Obj *obj = objs[obj_idx];
+    sym_to_boundary[obj_idx] = push_array(scratch.arena, U32, obj->header.symbol_count);
+    MemorySet(sym_to_boundary[obj_idx], 0xff, obj->header.symbol_count * sizeof(U32)); // RGD_BAD_IDX
+
+    COFF_ParsedSymbol symbol = {0};
+    for (U64 symbol_idx = 0; symbol_idx < obj->header.symbol_count; symbol_idx += (1 + symbol.aux_symbol_count)) {
+      symbol = lnk_parsed_symbol_from_coff_symbol_idx(obj, symbol_idx);
+      COFF_SymbolValueInterpType interp = coff_interp_symbol(symbol.section_number, symbol.value, symbol.storage_class);
+      if (lnk_rgd_sym_is_internal(symbol, interp)) { continue; }
+
+      RGD_Sym s = {0};
+      s.trie_hash      = lnk_symbol_table_hasher(symbol.name);
+      s.value          = symbol.value;
+      s.section_number = symbol.section_number;
+      s.type           = symbol.type.v;
+      s.storage_class  = symbol.storage_class;
+      s.interp         = (U8)interp;
+      s.comdat_idx     = RGD_BAD_IDX;
+      s.def_obj_idx    = (interp == COFF_SymbolValueInterp_Regular) ? safe_cast_u32(obj_idx) : RGD_BAD_IDX;
+      sym_to_boundary[obj_idx][symbol_idx] = rgd_builder_push_sym(&b, symbol.name, s);
+    }
+
+    // .drectve tokens (replayed into config at consume; obj order preserved)
+    String8List raw_dirs = lnk_raw_directives_from_obj(scratch.arena, obj);
+    for (String8Node *t = raw_dirs.first; t != 0; t = t->next) {
+      rgd_builder_push_directive(&b, t->string);
+    }
+  }
+
+  // pass 2: section contributions (obj_sect_idx order) + classified relocs
+  for EachIndex(obj_idx, objs_count) {
+    LNK_Obj *obj = objs[obj_idx];
+    for (U64 sect_idx = 0; sect_idx < obj->header.section_count_no_null; sect_idx += 1) {
+      LNK_ObjSection section = lnk_obj_section_from_sect_idx(obj, sect_idx);
+      String8        bytes   = str8_substr(obj->data, section.frange);
+
+      RGD_Contrib c = {0};
+      c.source_obj_idx = safe_cast_u32(obj_idx);
+      c.obj_sect_idx   = safe_cast_u32(sect_idx);
+      c.name_off       = rgd_name_off(&b, section.name);
+      c.flags          = *section.flags;
+      c.align          = safe_cast_u32(coff_align_size_from_section_flags(*section.flags));
+      c.vsize          = dim_1u64(section.vrange);
+      c.reloc_first    = safe_cast_u32(b.reloc_count);
+
+      COFF_RelocArray relocs = lnk_coff_relocs_from_section_header(obj, section.header);
+      for EachIndex(reloc_idx, relocs.count) {
+        COFF_Reloc       *r   = &relocs.v[reloc_idx];
+        COFF_ParsedSymbol tgt = lnk_parsed_symbol_from_coff_symbol_idx(obj, r->isymbol);
+        COFF_SymbolValueInterpType tgt_interp = coff_interp_symbol(tgt.section_number, tgt.value, tgt.storage_class);
+
+        RGD_Reloc rr = {0};
+        rr.apply_obj_idx      = safe_cast_u32(obj_idx);
+        rr.apply_obj_sect_idx = safe_cast_u32(sect_idx);
+        rr.apply_off          = r->apply_off;
+        rr.type               = (U16)r->type;
+        if (lnk_rgd_sym_is_internal(tgt, tgt_interp)) {
+          rr.target_kind         = RGD_RelocTarget_Internal;
+          rr.target_boundary_sym = RGD_BAD_IDX;
+          rr.target_sect_idx     = safe_cast_u32(tgt.section_number - 1);
+          rr.target_value        = tgt.value;
+        } else {
+          rr.target_kind         = RGD_RelocTarget_Boundary;
+          rr.target_boundary_sym = sym_to_boundary[obj_idx][r->isymbol]; // push-order; remapped at serialize
+        }
+        rgd_builder_push_reloc(&b, rr);
+      }
+
+      c.reloc_count = safe_cast_u32(b.reloc_count) - c.reloc_first;
+
+      // COMDAT candidate metadata (consume associates the leader via boundary syms' section_number)
+      if (*section.flags & COFF_SectionFlag_LnkCOMDAT) {
+        COFF_ComdatSelectType select = 0; U32 sno = 0, length = 0, checksum = 0;
+        if (lnk_try_comdat_props_from_section_number(obj, sect_idx + 1, &select, &sno, &length, &checksum)) {
+          RGD_Comdat cd = {0};
+          cd.select             = (U16)select;
+          cd.length             = length;
+          cd.checksum           = checksum;
+          cd.section_idx        = safe_cast_u32(b.contrib_count); // == index of the contrib pushed next
+          cd.leader_sym_idx     = RGD_BAD_IDX;
+          cd.associate_sect_idx = (select == COFF_ComdatSelect_Associative && sno > 0) ? (sno - 1) : RGD_BAD_IDX;
+          rgd_builder_push_comdat(&b, cd);
+        }
+      }
+
+      rgd_builder_push_contrib(&b, c, bytes);
+    }
+  }
+#undef lnk_rgd_sym_is_internal
+
+  String8List digest_data = rgd_serialize(scratch.arena, &b);
+  String8     temp_path   = push_str8f(scratch.arena, "%S.tmp%x", config->group_digest_name, config->time_stamp);
+  lnk_write_data_list_to_file_path(config->group_digest_name, temp_path, digest_data);
+
+  lnk_log(LNK_Log_Debug, "group digest %S: %llu objs, %llu boundary symbols, %llu contribs, %llu relocs, %llu comdats, %llu section bytes, %llu total bytes",
+          config->group_digest_name, objs_count, b.sym_count, b.contrib_count, b.reloc_count, b.comdat_count, b.section_data_size, digest_data.total_size);
+
+  scratch_end(scratch);
+  ProfEnd();
+}
+
+internal void
 entry_point(CmdLine *cmdline)
 {
   Temp scratch = scratch_begin(0,0);
@@ -5899,8 +6093,9 @@ entry_point(CmdLine *cmdline)
   }
 
   switch (config->boot_mode) {
-  case LNK_BootMode_Linker:     lnk_run_linker     (tp, tp_arena, config); break;
-  case LNK_BootMode_TypeServer: lnk_run_type_server(tp, tp_arena, config); break;
+  case LNK_BootMode_Linker:      lnk_run_linker       (tp, tp_arena, config); break;
+  case LNK_BootMode_TypeServer:  lnk_run_type_server  (tp, tp_arena, config); break;
+  case LNK_BootMode_GroupDigest: lnk_run_group_digest (tp, tp_arena, config); break;
   }
 
   lnk_log_end();
