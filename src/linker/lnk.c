@@ -2072,16 +2072,17 @@ lnk_link_image(TP_Context *tp, TP_Arena *arena, LNK_Config *config, LNK_Inputer 
     lnk_inputer_push_obj_thin(inputer, 0, obj_path->string);
   }
 
-  // input group digests (synthesized to COFF objs, then consumed as ordinary objs)
+  // input group digests -- consume v2: push the .rgd bytes as a digest input; lnk_obj_initer builds a
+  // digest-backed LNK_Obj directly (no COFF round-trip), and the obj accessors serve it from the digest.
   for (String8Node *rgd_path = config->input_list[LNK_Input_RGD].first; rgd_path != 0; rgd_path = rgd_path->next) {
-    String8    raw = lnk_read_data_from_file_path(scratch.arena, config->io_flags, rgd_path->string);
-    RGD_Parsed pp  = rgd_parse(raw);
+    String8 raw = lnk_read_data_from_file_path(inputer->arena, config->io_flags, rgd_path->string);
+    RGD_Parsed pp = rgd_parse(raw);
     if (!rgd_is_valid(&pp)) {
       lnk_error(LNK_Error_IllData, "ERROR: invalid or unreadable group digest \"%S\"", rgd_path->string);
       continue;
     }
-    String8 coff = lnk_coff_obj_from_rgd(inputer->arena, &pp);
-    lnk_inputer_push_obj_linkgen(inputer, 0, push_str8f(inputer->arena, "* RGD %S *", str8_skip_last_slash(rgd_path->string)), coff);
+    LNK_Input *rgd_input = lnk_inputer_push_obj_linkgen(inputer, 0, push_str8f(inputer->arena, "* RGD %S *", str8_skip_last_slash(rgd_path->string)), raw);
+    rgd_input->is_digest = 1;
   }
 
   // input libs from command line

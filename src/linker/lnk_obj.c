@@ -46,12 +46,108 @@ lnk_array_from_obj_list(Arena *arena, LNK_ObjList list)
   return arr;
 }
 
+// Build a digest-backed LNK_Obj directly from a .rgd (no COFF round-trip). parsed_symbols,
+// synthesized section headers and per-section reloc arrays are produced here; the obj accessors
+// branch on is_digest to serve them. obj->data is the .rgd itself, and each section header's foff is
+// the absolute offset of its bytes within the .rgd SectionData stream, so the contrib gather reads
+// section data through the normal str8_substr(obj->data, frange) path.
+internal void
+lnk_obj_fill_from_digest(Arena *arena, LNK_Obj *obj, LNK_Input *input, LNK_ObjNode *self)
+{
+  RGD_Parsed *p = push_array(arena, RGD_Parsed, 1);
+  *p = rgd_parse(input->data);
+
+  U64 boundary_count = p->header->boundary_sym_count;
+  U64 contrib_count  = p->contrib_count;
+  U64 sectdata_off   = p->header->streams[RGD_Stream_SectionData].off;
+
+  // each internal-target reloc gets a synthesized Static-Regular symbol appended after the boundary set
+  U64 internal_count = 0;
+  for EachIndex(ri, p->reloc_count) {
+    if (p->relocs[ri].target_kind == RGD_RelocTarget_Internal) { internal_count += 1; }
+  }
+  U64 symbol_count = boundary_count + internal_count;
+
+  COFF_ParsedSymbol *parsed_symbols = push_array(arena, COFF_ParsedSymbol, symbol_count);
+  for EachIndex(si, boundary_count) {
+    RGD_Sym           *s = &p->syms[si];
+    COFF_ParsedSymbol *d = &parsed_symbols[si];
+    d->name           = rgd_name_from_off(p, s->name_off);
+    d->value          = s->value;
+    d->section_number = s->section_number;
+    d->type.v         = s->type;
+    d->storage_class  = s->storage_class;
+    // TODO(weak): weak boundary syms need the aux tag (coff_parse_weak_tag reads raw_symbol+1);
+    // not carried in RGD_Sym yet. Weak-heavy targets will fault until the stage emits the tag.
+  }
+
+  COFF_SectionFlags  *section_flags = push_array(arena, COFF_SectionFlags,  contrib_count);
+  COFF_SectionHeader *sect_headers  = push_array(arena, COFF_SectionHeader, contrib_count);
+  COFF_RelocArray    *relocs        = push_array(arena, COFF_RelocArray,    contrib_count);
+  U64 next_internal = boundary_count;
+  for EachIndex(ci, contrib_count) {
+    RGD_Contrib        *c = &p->contribs[ci];
+    COFF_SectionHeader *h = &sect_headers[ci];
+    section_flags[ci] = c->flags;
+    h->vsize       = safe_cast_u32(c->vsize);
+    h->fsize       = safe_cast_u32(c->data_size);
+    h->foff        = c->data_size ? safe_cast_u32(sectdata_off + c->data_off) : 0; // absolute into the .rgd
+    h->flags       = c->flags;
+    h->reloc_count = safe_cast_u16(c->reloc_count);
+
+    relocs[ci].count = c->reloc_count;
+    relocs[ci].v     = c->reloc_count ? push_array(arena, COFF_Reloc, c->reloc_count) : 0;
+    for EachIndex(k, c->reloc_count) {
+      RGD_Reloc  *r  = &p->relocs[c->reloc_first + k];
+      COFF_Reloc *cr = &relocs[ci].v[k];
+      cr->apply_off = safe_cast_u32(r->apply_off);
+      cr->type      = r->type;
+      if (r->target_kind == RGD_RelocTarget_Boundary) {
+        cr->isymbol = r->target_boundary_sym;
+      } else {
+        U64                isym = next_internal++;
+        COFF_ParsedSymbol *d    = &parsed_symbols[isym];
+        d->value          = safe_cast_u32(r->target_value);
+        d->section_number = r->target_sect_idx + 1;
+        d->storage_class  = COFF_SymStorageClass_Static;
+        cr->isymbol       = safe_cast_u32(isym);
+      }
+    }
+  }
+
+  COFF_FileHeaderInfo header = {0};
+  header.is_big_obj            = 1; // 32-bit section count -> no 65535 cap
+  header.machine               = p->header->machine;
+  header.section_count_no_null = contrib_count;
+  header.symbol_count          = symbol_count;
+
+  obj->data                = input->data;
+  obj->path                = push_str8_copy(arena, input->path);
+  obj->header              = header;
+  obj->section_flags       = section_flags;
+  obj->parsed_symbols      = parsed_symbols;
+  obj->self                = self;
+  obj->link_member         = input->link_member;
+  obj->debug_t_sect_idx    = ~0;
+  obj->debug_p_sect_idx    = ~0;
+  obj->debug_h_sect_idx    = ~0;
+  obj->is_digest           = 1;
+  obj->digest              = p;
+  obj->digest_sect_headers = sect_headers;
+  obj->digest_relocs       = relocs;
+}
+
 internal
 THREAD_POOL_TASK_FUNC(lnk_obj_initer)
 {
   LNK_ObjIniter *task    = raw_task;
   LNK_Input     *input   = task->inputs[task_id];
   LNK_Obj       *obj     = &task->objs[task_id].data;
+
+  if (input->is_digest) {
+    lnk_obj_fill_from_digest(arena, obj, input, &task->objs[task_id]);
+    return;
+  }
 
   //ProfBeginV("Init Obj [%S%s%S]", input->lib_path, (input->lib_path.size ? ": " : 0), input->path);
 
@@ -556,6 +652,7 @@ lnk_obj_get_comdat_symlink(LNK_Obj *obj, U64 section_number)
 internal COFF_SectionHeader *
 lnk_coff_section_table_from_obj(LNK_Obj *obj)
 {
+  if (obj->is_digest) { return obj->digest_sect_headers; } // synthesized headers (see lnk_obj_fill_from_digest)
   return (COFF_SectionHeader *)str8_substr(obj->data, obj->header.section_table_range).str;
 }
 
@@ -596,7 +693,11 @@ internal LNK_ObjSection
 lnk_obj_section_from_sect_idx(LNK_Obj *obj, U64 sect_idx)
 {
   LNK_ObjSection section = lnk_obj_section_from_sect_idx_no_name(obj, sect_idx);
-  section.name           = coff_name_from_section_header(lnk_coff_string_table_from_obj(obj), section.header);
+  if (obj->is_digest) {
+    section.name = rgd_name_from_off(obj->digest, obj->digest->contribs[sect_idx].name_off);
+  } else {
+    section.name = coff_name_from_section_header(lnk_coff_string_table_from_obj(obj), section.header);
+  }
   return section;
 }
 
@@ -610,6 +711,7 @@ lnk_obj_section_from_section_number(LNK_Obj *obj, U64 section_number)
 internal COFF_RelocArray
 lnk_coff_relocs_from_section_header(LNK_Obj *obj, COFF_SectionHeader *section_header)
 {
+  if (obj->is_digest) { return obj->digest_relocs[section_header - obj->digest_sect_headers]; }
   COFF_RelocInfo   reloc_info = coff_reloc_info_from_section_header(obj->data, section_header);
   COFF_Reloc      *relocs     = (COFF_Reloc *)(obj->data.str + reloc_info.array_off);
   COFF_RelocArray  result     = { .count = reloc_info.count, .v = relocs };
