@@ -2706,12 +2706,6 @@ THREAD_POOL_TASK_FUNC(lnk_walk_relocs_and_mark_ref_sections_task)
                 break;
               }
 
-              // TODO(rgd): resolve sometimes returns a digest ref with an out-of-range symbol_idx
-              // (corrupt winner ref -- root cause TBD). Treat as unresolved to keep walking the rest.
-              if (ref_symbol.obj == 0 || (ref_symbol.obj->is_digest && ref_symbol.symbol_idx >= ref_symbol.obj->header.symbol_count)) {
-                ref_symbol = (LNK_ObjSymbolRef){0};
-                break;
-              }
               // unpack symbol
               COFF_ParsedSymbol          ref_parsed = lnk_parsed_symbol_from_coff_symbol_idx(ref_symbol.obj, ref_symbol.symbol_idx);
               COFF_SymbolValueInterpType ref_interp = coff_interp_from_parsed_symbol(ref_parsed);
@@ -3060,6 +3054,14 @@ THREAD_POOL_TASK_FUNC(lnk_patch_comdat_leaders_task)
             COFF_ParsedSymbol parsed_symlink = lnk_parsed_from_symbol(symlink);
             section_number = symbol.section_number;
             value          = parsed_symlink.value;
+          } else if (obj->is_digest) {
+            // digest internal target (static / section symbol) in a folded COMDAT: leave it pointing
+            // at the folded section + offset. image_section_table redirects the folded section to the
+            // surviving copy (identical content -> same offset), so the relocation still resolves.
+            // (Real objs mark these removed because COMDAT_SELECT_ANY survivors may differ in size; the
+            // digest only emits internal targets within the group, where the contents match.)
+            section_number = symbol.section_number;
+            value          = symbol.value;
           } else {
             // COMDAT section may have static symbols which are now invalid to relocate against
             section_number = lnk_obj_get_removed_section_number(obj);

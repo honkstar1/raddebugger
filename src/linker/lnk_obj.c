@@ -767,6 +767,11 @@ lnk_coff_symbol_table_from_obj(LNK_Obj *obj)
 internal COFF_RelocArray
 lnk_coff_reloc_info_from_section_number(LNK_Obj *obj, U64 section_number)
 {
+  if (obj->is_digest) {
+    // digest relocs live in the .rgd, not COFF reloc records in obj->data; route through the
+    // section-header -> digest_relocs accessor instead of deserializing obj->data as COFF.
+    return lnk_coff_relocs_from_section_header(obj, lnk_coff_section_header_from_section_number(obj, section_number));
+  }
   LNK_ObjSection   section    = lnk_obj_section_from_section_number(obj, section_number);
   COFF_RelocInfo   reloc_info = coff_reloc_info_from_section_header(obj->data, section.header);
   COFF_Reloc      *relocs     = str8_deserial_get_raw_ptr(obj->data, reloc_info.array_off, sizeof(*relocs)*reloc_info.count);
