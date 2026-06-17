@@ -84,7 +84,9 @@ lnk_obj_fill_from_digest(Arena *arena, LNK_Obj *obj, LNK_Input *input, LNK_ObjNo
       // coff_parse_weak_tag aux-count Assert is compiled out in release.
       U8                 *buf = push_array(arena, U8, sizeof(COFF_Symbol32) + sizeof(COFF_SymbolWeakExt));
       COFF_SymbolWeakExt *aux = (COFF_SymbolWeakExt *)(buf + sizeof(COFF_Symbol32));
-      aux->tag_index       = s->weak_tag;
+      // tag must index a real parsed_symbols slot; an invalid/dropped tag (internal default not in the
+      // boundary set) clamps to self so the weak resolves to itself instead of a garbage index.
+      aux->tag_index       = (s->weak_tag < boundary_count) ? s->weak_tag : safe_cast_u32(si);
       aux->characteristics = s->weak_char;
       d->raw_symbol        = buf;
     }
@@ -921,7 +923,8 @@ lnk_raw_directives_from_obj(Arena *arena, LNK_Obj *obj)
     // only LnkInfo sections (rare) need the name; skip the string-table lookup for the rest
     LNK_ObjSection section = lnk_obj_section_from_sect_idx_no_name(obj, sect_idx);
     if (*section.flags & COFF_SectionFlag_LnkInfo) {
-      section.name = coff_name_from_section_header(lnk_coff_string_table_from_obj(obj), section.header);
+      section.name = obj->is_digest ? rgd_name_from_off(obj->digest, obj->digest->contribs[sect_idx].name_off)
+                                    : coff_name_from_section_header(lnk_coff_string_table_from_obj(obj), section.header);
       if (str8_match(section.name, str8_lit(".drectve"), 0)) {
         if (*section.flags & COFF_SectionFlag_CntUninitializedData) {
           lnk_error_obj(LNK_Error_IllData, obj, ".drectve section header has flag COFF_SectionFlag_CntUninitializedData");

@@ -2706,6 +2706,12 @@ THREAD_POOL_TASK_FUNC(lnk_walk_relocs_and_mark_ref_sections_task)
                 break;
               }
 
+              // TODO(rgd): resolve sometimes returns a digest ref with an out-of-range symbol_idx
+              // (corrupt winner ref -- root cause TBD). Treat as unresolved to keep walking the rest.
+              if (ref_symbol.obj == 0 || (ref_symbol.obj->is_digest && ref_symbol.symbol_idx >= ref_symbol.obj->header.symbol_count)) {
+                ref_symbol = (LNK_ObjSymbolRef){0};
+                break;
+              }
               // unpack symbol
               COFF_ParsedSymbol          ref_parsed = lnk_parsed_symbol_from_coff_symbol_idx(ref_symbol.obj, ref_symbol.symbol_idx);
               COFF_SymbolValueInterpType ref_interp = coff_interp_from_parsed_symbol(ref_parsed);
@@ -2894,7 +2900,7 @@ THREAD_POOL_TASK_FUNC(lnk_gather_section_definitions_task)
 
   HashTable          *sect_defn_ht  = task->u.gather_sects.defns[worker_id];
   LNK_Obj            *obj           = task->objs[obj_idx];
-  COFF_SectionHeader *section_table = (COFF_SectionHeader *)str8_substr(obj->data, obj->header.section_table_range).str;
+  COFF_SectionHeader *section_table = lnk_coff_section_table_from_obj(obj); // digest-aware
   String8             string_table  = str8_substr(obj->data, obj->header.string_table_range);
 
   for (U64 sect_idx = 0; sect_idx < obj->header.section_count_no_null; sect_idx += 1) {
@@ -2940,7 +2946,7 @@ THREAD_POOL_TASK_FUNC(lnk_gather_section_contribs_task)
   U64                 obj_idx = task_id;
 
   LNK_Obj            *obj           = task->objs[obj_idx];
-  COFF_SectionHeader *section_table = (COFF_SectionHeader *)str8_substr(obj->data, obj->header.section_table_range).str;
+  COFF_SectionHeader *section_table = lnk_coff_section_table_from_obj(obj); // digest-aware
   String8             string_table  = str8_substr(obj->data, obj->header.string_table_range);
 
   ProfBeginV("Gather Section Contribs [%S]", obj->path);
@@ -3837,7 +3843,7 @@ THREAD_POOL_TASK_FUNC(lnk_patch_virtual_offsets_and_sizes_in_obj_section_headers
   LNK_Obj            *obj     = task->objs[obj_idx];
 
   ProfBeginV("Patch Virtual Offset And Size In Section Headers [%S]", obj->path);
-  COFF_SectionHeader *section_table = (COFF_SectionHeader *)str8_substr(obj->data, obj->header.section_table_range).str;
+  COFF_SectionHeader *section_table = lnk_coff_section_table_from_obj(obj); // digest-aware
   for (U64 sect_idx = 0; sect_idx < obj->header.section_count_no_null; sect_idx += 1) {
     COFF_SectionHeader *sect_header = &section_table[sect_idx];
     if (~obj->section_flags[sect_idx] & COFF_SectionFlag_LnkRemove) {
@@ -3858,7 +3864,7 @@ THREAD_POOL_TASK_FUNC(lnk_patch_file_offsets_and_sizes_in_obj_section_headers_ta
   LNK_Obj            *obj     = task->objs[obj_idx];
 
   ProfBeginV("Patch File Offsets And Sizes In Obj Section Headers [%S]", obj->path);
-  COFF_SectionHeader *section_table = (COFF_SectionHeader *)str8_substr(obj->data, obj->header.section_table_range).str;
+  COFF_SectionHeader *section_table = lnk_coff_section_table_from_obj(obj); // digest-aware
   for (U64 sect_idx = 0; sect_idx < obj->header.section_count_no_null; sect_idx += 1) {
     COFF_SectionHeader *sect_header = &section_table[sect_idx];
     COFF_SectionFlags   sect_flags  = obj->section_flags[sect_idx];
