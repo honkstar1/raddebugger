@@ -2905,7 +2905,8 @@ THREAD_POOL_TASK_FUNC(lnk_gather_section_definitions_task)
       Temp temp = temp_begin(scratch.arena);
 
       // was section defined?
-      String8                sect_name            = coff_name_from_section_header(string_table, sect_header);
+      String8                sect_name            = obj->is_digest ? rgd_name_from_off(obj->digest, obj->digest->contribs[sect_idx].name_off)
+                                                                    : coff_name_from_section_header(string_table, sect_header);
       String8                sect_name_with_flags = lnk_make_name_with_flags(temp.arena, sect_name, sect_flags & ~COFF_SectionFlags_LnkFlags);
       LNK_SectionDefinition *sect_defn            = hash_table_search_string_raw(sect_defn_ht, sect_name_with_flags);
 
@@ -2952,7 +2953,8 @@ THREAD_POOL_TASK_FUNC(lnk_gather_section_contribs_task)
       LNK_SectionContribChunk *sc_chunk = 0;
       {
         Temp temp = temp_begin(scratch.arena);
-        String8 sect_name            = coff_name_from_section_header(string_table, sect_header);
+        String8 sect_name            = obj->is_digest ? rgd_name_from_off(obj->digest, obj->digest->contribs[sect_idx].name_off)
+                                                       : coff_name_from_section_header(string_table, sect_header);
         String8 sect_name_with_flags = lnk_make_name_with_flags(temp.arena, sect_name, sect_flags & ~COFF_SectionFlags_LnkFlags);
         sc_chunk = hash_table_search_string_raw(task->contribs_ht, sect_name_with_flags);
         temp_end(temp);

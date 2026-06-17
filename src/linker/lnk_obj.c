@@ -97,13 +97,18 @@ lnk_obj_fill_from_digest(Arena *arena, LNK_Obj *obj, LNK_Input *input, LNK_ObjNo
   COFF_RelocArray    *relocs        = push_array(arena, COFF_RelocArray,    contrib_count);
   U64 next_internal = boundary_count;
   for EachIndex(ci, contrib_count) {
-    RGD_Contrib        *c = &p->contribs[ci];
-    COFF_SectionHeader *h = &sect_headers[ci];
-    section_flags[ci] = c->flags;
+    RGD_Contrib        *c     = &p->contribs[ci];
+    COFF_SectionHeader *h     = &sect_headers[ci];
+    COFF_SectionFlags   flags = c->flags;
+    // digest debug is served via the .rrt, not regenerated; the digest debug pipeline is skipped
+    // (lnk_parse_debug_s_task), so discardable (.debug$*) contribs would otherwise never be marked
+    // removed and would leak into the image. Drop them here, as the debug pipeline normally would.
+    if (flags & COFF_SectionFlag_MemDiscardable) { flags |= COFF_SectionFlag_LnkRemove; }
+    section_flags[ci] = flags;
     h->vsize       = safe_cast_u32(c->vsize);
     h->fsize       = safe_cast_u32(c->data_size);
     h->foff        = c->data_size ? safe_cast_u32(sectdata_off + c->data_off) : 0; // absolute into the .rgd
-    h->flags       = c->flags;
+    h->flags       = flags;
     h->reloc_count = safe_cast_u16(c->reloc_count);
 
     relocs[ci].count = c->reloc_count;
