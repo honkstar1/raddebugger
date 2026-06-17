@@ -59,7 +59,6 @@ lnk_obj_fill_from_digest(Arena *arena, LNK_Obj *obj, LNK_Input *input, LNK_ObjNo
 
   U64 boundary_count = p->header->boundary_sym_count;
   U64 contrib_count  = p->contrib_count;
-  U64 sectdata_off   = p->header->streams[RGD_Stream_SectionData].off;
 
   // each internal-target reloc gets a synthesized Static-Regular symbol appended after the boundary set
   U64 internal_count = 0;
@@ -107,7 +106,9 @@ lnk_obj_fill_from_digest(Arena *arena, LNK_Obj *obj, LNK_Input *input, LNK_ObjNo
     section_flags[ci] = flags;
     h->vsize       = safe_cast_u32(c->vsize);
     h->fsize       = safe_cast_u32(c->data_size);
-    h->foff        = c->data_size ? safe_cast_u32(sectdata_off + c->data_off) : 0; // absolute into the .rgd
+    h->foff        = 0; // unused for digest: section data is addressed by U64 frange (the .rgd can be
+                        // >4GB, so the absolute offset does not fit COFF's U32 foff). See
+                        // lnk_obj_section_from_sect_idx_no_name / lnk_obj_digest_section_frange.
     h->flags       = flags;
     h->reloc_count = safe_cast_u16(c->reloc_count);
 
@@ -709,6 +710,17 @@ lnk_obj_section_number_from_sect_idx(LNK_Obj *obj, U64 sect_idx)
   return sect_idx+1;
 }
 
+// U64 byte range of a digest contrib's section data within the .rgd (the SectionData stream can
+// exceed 4GB, so this cannot be carried in the synth header's U32 foff).
+internal Rng1U64
+lnk_obj_digest_section_frange(LNK_Obj *obj, U64 sect_idx)
+{
+  RGD_Contrib *c = &obj->digest->contribs[sect_idx];
+  if (c->data_size == 0) { return rng_1u64(0, 0); }
+  U64 off = obj->digest->header->streams[RGD_Stream_SectionData].off + c->data_off;
+  return rng_1u64(off, off + c->data_size);
+}
+
 // NOTE: skips section.name (coff_name_from_section_header does a string-table
 // lookup); use when only the header/flags/ranges are needed (e.g. checking
 // section flags). Callers that need the name should use lnk_obj_section_from_sect_idx.
@@ -723,7 +735,10 @@ lnk_obj_section_from_sect_idx_no_name(LNK_Obj *obj, U64 sect_idx)
   section.header         = &lnk_coff_section_table_from_obj(obj)[sect_idx];
   section.flags          = &obj->section_flags[sect_idx];
   section.vrange         = rng_1u64(section.header->voff, section.header->voff + section.header->vsize);
-  section.frange         = rng_1u64(section.header->foff, section.header->foff + section.header->fsize);
+  // digest section data is addressed by a U64 offset into the .rgd (which may exceed 4GB), not the
+  // synth header's U32 foff.
+  section.frange         = obj->is_digest ? lnk_obj_digest_section_frange(obj, sect_idx)
+                                          : rng_1u64(section.header->foff, section.header->foff + section.header->fsize);
   section.reloc_count    = section.header->reloc_count;
   return section;
 }

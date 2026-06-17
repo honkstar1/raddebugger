@@ -2964,6 +2964,9 @@ THREAD_POOL_TASK_FUNC(lnk_gather_section_contribs_task)
         String8 data;
         if (sect_flags & COFF_SectionFlag_CntUninitializedData) {
           data = str8(0, sect_header->fsize);
+        } else if (obj->is_digest) {
+          // digest section data uses a U64 offset (the .rgd may exceed 4GB; foff is U32)
+          data = str8_substr(obj->data, lnk_obj_digest_section_frange(obj, sect_idx));
         } else {
           data = str8_substr(obj->data, rng_1u64(sect_header->foff, sect_header->foff + sect_header->fsize));
         }
