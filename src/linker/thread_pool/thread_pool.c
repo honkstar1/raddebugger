@@ -210,20 +210,21 @@ tp_for_parallel(TP_Context *pool, TP_Arena *task_arena, U64 task_count, TP_TaskF
 
     U64 drop_count = Min(task_count, pool->worker_count);
 
-    // The main thread runs as worker 0 (tp_run_tasks below), so only the other
-    // drop_count-1 workers need waking. Waking exactly that many leaves no
-    // residual permit, which keeps the single batched semaphore release from ever
-    // exceeding the semaphore's max count (a residual + a full-count release would
-    // make ReleaseSemaphore fail outright and deadlock at the next barrier).
-    U64 wake_count = drop_count - 1;
-
-    // if we are in shared mode ping local semaphore
+    // Wake drop_count workers with individual releases. A single batched
+    // ReleaseSemaphore(count) is faster but unsafe here: it either overflows the
+    // semaphore max (count + residual) or, if shaved to avoid that, under-wakes by
+    // one -- which deadlocks tasks that nest tp_broadcast_ (e.g.
+    // lnk_walk_relocs_and_mark_ref_sections_task), whose barrier is then short a
+    // participant. Per-permit releases never overflow and wake the exact count.
     if (pool->exec_semaphore.u64[0] != 0) {
-      semaphore_drop_n(pool->exec_semaphore, (U32)wake_count);
+      for (U64 worker_idx = 0; worker_idx < drop_count; worker_idx += 1) {
+        semaphore_drop(pool->exec_semaphore);
+      }
     }
 
-    // ping shared semaphore
-    semaphore_drop_n(pool->task_semaphore, (U32)wake_count);
+    for (U64 worker_idx = 0; worker_idx < drop_count; worker_idx += 1) {
+      semaphore_drop(pool->task_semaphore);
+    }
 
     // run tasks on main worker
     tp_run_tasks(pool, &pool->worker_arr[0]);
