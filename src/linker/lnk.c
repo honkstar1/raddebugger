@@ -3489,8 +3489,15 @@ internal
 THREAD_POOL_TASK_FUNC(lnk_icf_refine_region_task)
 {
   LNK_ICFRegion *rs = raw_task;
-  U64 wid = worker_id; // 1:1 worker<->task: every participant blocks on the first barrier before any
-                       // can steal a second task, so task_id == worker_id throughout (see note below).
+  // LANE = task_id, NOT worker_id. The cohort is `W = rs->worker_count` (the
+  // fair-share cohort C for this barrier pass), and task_ids are the contiguous
+  // [0,C) lane indices assigned by the dispatch. Every participant blocks on the
+  // first barrier before it can steal a second task, so each runs exactly one
+  // lane for the whole region. Using task_id (not worker_id) makes this correct
+  // for ANY set of woken physical workers -- their ids need not be contiguous,
+  // only the lanes do. All per-lane scratch (refine_ranges[wid], work_ranges[wid],
+  // hist+wid*RADIX, chunk_*[wid]) is sized to W and indexed by this lane.
+  U64 wid = task_id;
   U64 W   = rs->worker_count;
 
   for (U64 round = 0; round < rs->max_rounds; round += 1) {
@@ -4322,6 +4329,12 @@ lnk_opt_icf(TP_Context *tp, Arena *perm, LNK_SymbolTable *symtab, LNK_Config *co
   // (radix prefixes, group-scan prefix, convergence/swap) runs on worker 0. Byte-identical to the
   // per-round path (preserves chunk boundaries, processing order, and serial-prefix math).
   if (active_count > 0) {
+    // FAIR-SHARE: pin the barrier-pass cohort BEFORE building the region's
+    // per-worker scratch and rs.worker_count, so all of W / rs.worker_count /
+    // hist[W*..] / chunk_*[W] / ranges[W+1] / the C-sized barrier agree on the
+    // cohort. tp->worker_count now reads the cohort C for the whole region.
+    tp_barrier_begin(tp);
+
     LNK_ICFRegion rs = {0};
     rs.tp           = tp;
     rs.cands        = cands;
@@ -4399,6 +4412,12 @@ lnk_opt_icf(TP_Context *tp, Arena *perm, LNK_SymbolTable *symtab, LNK_Config *co
     color_base         = rs.color_base;
     active_count       = rs.active_count;
     active_class_count = rs.active_class_count;
+
+    // FAIR-SHARE: close the cohort bracket now -- the region's barrier passes are
+    // done. The worklist tail + fold below are path-A (governor-driven), so they
+    // must NOT run with the cohort pinned (the held slots / barrier_pass=1 would
+    // block path-A workers from returning budget). Restore full width here.
+    tp_barrier_end(tp);
 
     // hand off the tail to the dirty-class worklist if the region stopped at the cap (not yet converged)
     if (!rs.converged && active_count > 0) {

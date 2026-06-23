@@ -162,16 +162,17 @@ tp_alloc(Arena *arena, U32 worker_count, U32 max_worker_count, String8 name)
     if (is_shared) {
       AssertAlways(worker_count <= max_worker_count);
 
-      // Two NAMED cross-process semaphores. CreateSemaphoreW on an existing name
-      // returns the existing object (first process inits with these counts; later
-      // processes attach and the supplied counts are ignored by the OS), so all
-      // processes share one BUDGET and one BARRIER-LOCK.
-      //   BUDGET:       init=max=max_worker_count (the machine core budget).
-      //   BARRIER-LOCK: init=max=1 (one full-cohort barrier pass at a time).
+      // ONE NAMED cross-process semaphore. CreateSemaphoreW on an existing name
+      // returns the existing object (first process inits with this count; later
+      // processes attach and the supplied count is ignored by the OS), so all
+      // processes share one BUDGET.
+      //   BUDGET: init=max=max_worker_count (the machine core budget).
+      // FAIR-SHARE: there is no longer a barrier-lock. A barrier pass (path B)
+      // does NOT amass the full cohort; it runs at whatever budget is free right
+      // now (best-effort), so multiple processes can run barrier passes
+      // concurrently and none can deadlock waiting to amass the machine.
       String8 budget_name = push_str8f(scratch.arena, "%S.budget", name);
-      String8 block_name  = push_str8f(scratch.arena, "%S.barrierlock", name);
       pool->budget_semaphore       = semaphore_alloc(max_worker_count, max_worker_count, budget_name);
-      pool->barrier_lock_semaphore = semaphore_alloc(1, 1, block_name);
 
       // local wake/governor signalling. governor_semaphore is a 0/1 "at least one
       // pending pass" flag: main pings it with semaphore_drop_if_room (a redundant
@@ -236,7 +237,6 @@ tp_release(TP_Context *pool)
     if (pool->worker_count > 1) {
       thread_detach(pool->governor_handle);
       semaphore_release(pool->budget_semaphore);
-      semaphore_release(pool->barrier_lock_semaphore);
       semaphore_release(pool->wake_semaphore);
       semaphore_release(pool->governor_semaphore);
     }
@@ -394,16 +394,100 @@ tp_for_parallel(TP_Context *pool, TP_Arena *task_arena, U64 task_count, TP_TaskF
 }
 
 //
-// PATH B: barrier-pass dispatch. The cohort MUST be exactly worker_count (every
-// participant live for the whole pass) so the barrier_wait/broadcast/sum math is
-// byte-identical to the non-shared run. In shared mode we reserve the full cohort
-// up front: take barrier_lock (only one full-cohort barrier pass globally at a
-// time), then acquire worker_count-1 budget slots.
+// FAIR-SHARE barrier-pass cohort bracket.
 //
-// Deadlock-freedom: holding barrier_lock, no OTHER process can be inside a barrier
-// pass. Every other process is therefore doing path-A work (which releases budget
-// slots as workers drain), or idle, or blocked on barrier_lock holding ZERO budget
-// slots. So the worker_count-1 slots we need WILL free up. We hold no other lock.
+// A barrier pass (path B) runs at the cohort this process currently holds, NOT
+// the full machine. tp_barrier_begin grabs whatever budget slots are FREE RIGHT
+// NOW (best-effort, never blocking to amass), up to worker_count-1, and pins the
+// pool to cohort C = 1 (main) + grabbed slots for the pass duration:
+//   - pool->worker_count := C   (so every tp->worker_count read -- divide_work,
+//                                 lane_count, per-worker array sizing in the
+//                                 caller's setup -- sees the cohort)
+//   - pool->barrier      := a fresh C-sized barrier (so barrier_wait/broadcast/sum
+//                                 rendezvous exactly the C participants)
+//   - the grabbed slots are HELD until tp_barrier_end (cohort stays live; the
+//     governor only touches budget during a path-A pass, which cannot overlap a
+//     barrier pass within this process).
+//
+// Deadlock-freedom: tp_barrier_begin NEVER blocks on budget. If the machine is
+// busy and zero slots are free, C == 1 and the pass runs serially on main. A
+// process therefore ALWAYS makes progress (>= main) and never waits to amass ->
+// no starvation, no deadlock, no barrier-lock. Output is width-independent
+// (proven: w1 == w64), so a cohort-C pass is byte-identical to a full-width pass.
+//
+// Re-entrant: a caller that pre-distributes work by tp->worker_count must open
+// the bracket itself (so its setup sees C); nested tp_barrier_begin calls just
+// return the already-pinned C and tp_for_parallel_reserve will not re-open/close.
+//
+internal U32
+tp_barrier_begin(TP_Context *pool)
+{
+  if (!pool->is_shared || pool->worker_count == 1) {
+    return pool->worker_count; // no-op: non-shared / single-worker
+  }
+  if (pool->barrier_depth > 0) {
+    pool->barrier_depth += 1;   // nested: cohort already pinned
+    return pool->worker_count;
+  }
+
+  // best-effort grab: take as many free budget slots as we can WITHOUT blocking
+  // (endt_us==0 -> WaitForSingleObject(.,0) non-blocking poll). Stop at the first
+  // empty take or when we hold worker_count-1.
+  U32 want  = pool->worker_count - 1;
+  U32 extra = 0;
+  for (; extra < want; ) {
+    if (semaphore_take(pool->budget_semaphore, 0)) {
+      extra += 1;
+    } else {
+      break; // no more free slots right now
+    }
+  }
+
+  U32 cohort = 1 + extra; // main + grabbed workers
+
+  pool->barrier_saved_workers = pool->worker_count;
+  pool->barrier_cohort_extra  = extra;
+  pool->barrier_saved         = pool->barrier;
+  pool->barrier               = barrier_alloc(cohort);
+  pool->worker_count          = cohort;
+  pool->barrier_pass          = 1;
+  pool->barrier_depth         = 1;
+  return cohort;
+}
+
+internal void
+tp_barrier_end(TP_Context *pool)
+{
+  if (!pool->is_shared || pool->barrier_saved_workers == 0) {
+    return; // no-op: non-shared / single-worker / not in a bracket
+  }
+  pool->barrier_depth -= 1;
+  if (pool->barrier_depth > 0) {
+    return; // nested: outer bracket still owns the cohort
+  }
+
+  U32 extra = pool->barrier_cohort_extra;
+
+  // restore the full-width pool + the original barrier
+  barrier_release(pool->barrier);
+  pool->barrier      = pool->barrier_saved;
+  pool->worker_count = pool->barrier_saved_workers;
+  pool->barrier_pass = 0;
+
+  pool->barrier_saved_workers = 0;
+  pool->barrier_cohort_extra  = 0;
+  MemoryZeroStruct(&pool->barrier_saved);
+
+  // hand the grabbed budget slots back to the machine
+  semaphore_drop_n(pool->budget_semaphore, extra);
+}
+
+//
+// PATH B: barrier-pass dispatch (fair-share). Runs the task once per lane on the
+// CURRENT cohort (main + woken workers). If the caller has not already opened a
+// tp_barrier_begin/end bracket, this opens one (cohort = whatever is free now),
+// runs, and closes it. The passed task_count is ignored for sizing -- the pass
+// always runs exactly pool->worker_count tasks (== cohort).
 //
 internal void
 tp_for_parallel_reserve(TP_Context *pool, TP_Arena *task_arena, U64 task_count, TP_TaskFunc *task_func, void *task_data)
@@ -418,32 +502,37 @@ tp_for_parallel_reserve(TP_Context *pool, TP_Arena *task_arena, U64 task_count, 
     return;
   }
 
-  AssertAlways(task_count == pool->worker_count);
+  // open a cohort bracket unless the caller already pinned one
+  B32 opened = 0;
+  if (pool->barrier_depth == 0) {
+    tp_barrier_begin(pool);
+    opened = 1;
+  }
 
-  U32 cohort_workers = pool->worker_count - 1; // worker 0 == main is the Nth
+  U32 cohort = pool->worker_count; // pinned for the whole pass
 
-  // serialize full-cohort barrier passes across processes
-  semaphore_take(pool->barrier_lock_semaphore, max_U64);
+  if (cohort == 1) {
+    // machine fully busy: run serially on main (byte-identical -- width independent)
+    tp_for_parallel_init_state(pool, task_arena, cohort, task_func, task_data);
+    tp_run_tasks(pool, &pool->worker_arr[0]);
+  } else {
+    tp_for_parallel_init_state(pool, task_arena, cohort, task_func, task_data);
 
-  // reserve the whole cohort's budget (blocking, deadlock-free per above)
-  semaphore_take_n(pool->budget_semaphore, cohort_workers, max_U64);
+    // wake exactly the cohort's workers (ids 1..cohort-1). These are barrier-pass
+    // wakes: workers must NOT return budget on drain -- the slots are held by the
+    // bracket and released in tp_barrier_end so the cohort stays live for the pass.
+    semaphore_drop_n(pool->wake_semaphore, cohort - 1);
 
-  tp_for_parallel_init_state(pool, task_arena, task_count, task_func, task_data);
+    // main is the cohort-th participant (lane 0)
+    tp_run_tasks(pool, &pool->worker_arr[0]);
 
-  // wake the full cohort; these are barrier-pass wakes (workers must not touch
-  // budget on drain -- we release in bulk below)
-  pool->barrier_pass = 1;
-  semaphore_drop_n(pool->wake_semaphore, cohort_workers);
+    // wait for the cohort to finish
+    semaphore_take(pool->main_semaphore, max_U64);
+  }
 
-  // main is the worker_count-th participant
-  tp_run_tasks(pool, &pool->worker_arr[0]);
-
-  // wait for the cohort to finish
-  semaphore_take(pool->main_semaphore, max_U64);
-
-  // release the cohort budget + barrier lock
-  semaphore_drop_n(pool->budget_semaphore, cohort_workers);
-  semaphore_drop(pool->barrier_lock_semaphore);
+  if (opened) {
+    tp_barrier_end(pool);
+  }
 }
 
 internal Rng1U64 *
