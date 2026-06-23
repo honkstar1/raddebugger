@@ -37,17 +37,6 @@ typedef struct TP_Context
   U64          broadcast_size;
   U64          sum;
 
-  // shared (cross-process) governor mode; all zero in non-shared mode
-  B32          is_shared;
-  Semaphore    budget_semaphore;       // NAMED: global core budget; init=max=max_worker_count
-  Semaphore    barrier_lock_semaphore; // NAMED: serializes full-cohort barrier passes; init=max=1
-  Semaphore    wake_semaphore;         // local: governor/dispatcher wakes one parked worker per drop
-  Semaphore    governor_semaphore;     // local: main pings governor that a path-A pass is active
-  Thread       governor_handle;
-  volatile U32 pass_active;            // 1 while a path-A (barrier-free) pass is in flight
-  volatile U32 barrier_pass;           // 1 while the current wake cohort is a path-B barrier pass
-  volatile S64 granted;                // budget slots currently held by woken path-A workers
-
   U32          worker_count;
   TP_Worker   *worker_arr;
 
@@ -67,12 +56,6 @@ internal TP_Temp      tp_temp_begin(TP_Arena *arena);
 internal void         tp_temp_end(TP_Temp temp);
 #define tp_for_parallel_prof(pool, arena, task_count, task_func, task_data, zone_name) ProfBegin(zone_name); tp_for_parallel(pool, arena, task_count, task_func, task_data); ProfEnd();
 internal void         tp_for_parallel(TP_Context *pool, TP_Arena *arena, U64 task_count, TP_TaskFunc *task_func, void *task_data);
-// Barrier-pass dispatch: task_func uses barrier_wait/tp_broadcast/tp_sum_u64, so the
-// cohort MUST be exactly worker_count. In shared mode this reserves the full cohort
-// (barrier_lock + worker_count-1 budget slots) before running; in non-shared mode it is
-// identical to tp_for_parallel.
-internal void         tp_for_parallel_reserve(TP_Context *pool, TP_Arena *arena, U64 task_count, TP_TaskFunc *task_func, void *task_data);
-#define tp_for_parallel_reserve_prof(pool, arena, task_count, task_func, task_data, zone_name) ProfBegin(zone_name); tp_for_parallel_reserve(pool, arena, task_count, task_func, task_data); ProfEnd();
 internal Rng1U64 *    tp_divide_work(Arena *arena, U64 item_count, U32 worker_count);
 #define tp_broadcast(p) tp_broadcast_(tp, task_id, p, sizeof(*p))
 

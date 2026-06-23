@@ -4385,13 +4385,13 @@ lnk_opt_icf(TP_Context *tp, Arena *perm, LNK_SymbolTable *symtab, LNK_Config *co
       ref.active_count = active_count; ref.active_class_count = active_class_count;
       ref.color_base = color_base; ref.converged = 0;
       ref.max_rounds = 64;             // uncapped (true fixpoint)
-      tp_for_parallel_reserve(tp, 0, tp->worker_count, lnk_icf_refine_region_task, &ref); // BARRIER pass (path B)
+      tp_for_parallel(tp, 0, tp->worker_count, lnk_icf_refine_region_task, &ref);
     }
     // colors[] was untouched (ref ran on ref_colors); active/active2 untouched (ref used clones).
 #endif
 
     rs.max_rounds = region_cap;
-    tp_for_parallel_reserve(tp, 0, tp->worker_count, lnk_icf_refine_region_task, &rs); // BARRIER pass (path B)
+    tp_for_parallel(tp, 0, tp->worker_count, lnk_icf_refine_region_task, &rs);
 
     // mirror final state back (active/colors already mutated in place; pointers may have swapped)
     active             = rs.active;
@@ -4514,7 +4514,7 @@ internal void
 lnk_opt_ref(TP_Context *tp, LNK_SymbolTable *symtab, LNK_Config *config, LNK_ObjList objs)
 {
   ProfScope("Mark Live Sections")
-    tp_for_parallel_reserve(tp, // BARRIER pass (path B): tp_broadcast + barrier_wait
+    tp_for_parallel(tp,
                     0,
                     tp->worker_count,
                     lnk_walk_relocs_and_mark_ref_sections_task,
@@ -7282,7 +7282,7 @@ lnk_run_linker(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
       ProfBegin("Decommit Scratch");
       // task_count == worker_count + the in-worker barrier => every worker
       // (worker 0 IS the main thread) runs exactly once, covering main's scratch.
-      tp_for_parallel_reserve(tp, 0, tp->worker_count, lnk_scratch_decommit_worker, 0); // BARRIER pass (path B)
+      tp_for_parallel(tp, 0, tp->worker_count, lnk_scratch_decommit_worker, 0);
       ProfEnd();
     }
 
@@ -7317,7 +7317,7 @@ lnk_run_linker(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
         lnk_timer_begin(LNK_Timer_Rdi);
 
         LNK_P2R p2r = { .config = config, .pdb_data = str8_list_join(lnk_get_huge_arena(), &pdb_data, 0), .image_data = image_ctx.image_data };
-        tp_for_parallel_reserve(tp, arena, tp->worker_count, lnk_p2r_worker, &p2r); // BARRIER pass (path B)
+        tp_for_parallel(tp, arena, tp->worker_count, lnk_p2r_worker, &p2r);
 
         String8List rdi_blobs = rdim_file_blobs_from_section_bundle(scratch.arena, &p2r.bake_results.section_bundle);
         lnk_write_data_list_to_file_path(config->rad_debug_name, config->temp_rad_debug_name, rdi_blobs);
@@ -7599,7 +7599,7 @@ lnk_run_type_server(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
   ProfScope("Pack Type Data & Data Ranges")
   {
     LNK_RRTTypeDataSerializer task = { &cv_types, &rrt.type_data_raw, rrt.type_data_ranges };
-    tp_for_parallel_reserve(tp, arena, tp->worker_count, lnk_serialize_rrt_type_data_task, &task); // BARRIER pass (path B)
+    tp_for_parallel(tp, arena, tp->worker_count, lnk_serialize_rrt_type_data_task, &task);
 
     // pack type index ranges
     for EachIndex(i, CV_TypeIndexSource_COUNT) {

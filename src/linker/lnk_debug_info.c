@@ -4196,13 +4196,13 @@ lnk_build_pdb(TP_Context *tp, TP_Arena *tp_arena, String8 image_data, LNK_Config
         task.mod_arr[obj_idx] = dbi_push_module(task.pdb->dbi, cv->obj_arr[obj_idx]->path, lnk_obj_get_lib_path(cv->obj_arr[obj_idx]));
 
     ProfScope("Move Global Symbols")
-      tp_for_parallel_reserve(tp, 0, tp->worker_count, lnk_move_global_symbols_to_gsi, &task); // BARRIER pass (path B): tp_sum_u64/tp_broadcast/barrier_wait
+      tp_for_parallel(tp, 0, tp->worker_count, lnk_move_global_symbols_to_gsi, &task);
 
       ProfScope("Build GSI and PSI")
         pdb_build_gsi_psi(tp, task.pdb);
 
     ProfScope("Write Modules")
-      tp_for_parallel_reserve(tp, 0, tp->worker_count, lnk_write_pdb_modules, &task); // BARRIER pass (path B): barrier_wait/tp_broadcast
+      tp_for_parallel(tp, 0, tp->worker_count, lnk_write_pdb_modules, &task);
   }
 
   ProfBegin("Add string tables");
