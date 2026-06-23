@@ -113,20 +113,26 @@ tp_governor_main(void *raw_pool)
         // Bounded wait so we re-check pass_active/demand and never block forever
         // on budget that may never free if the pass ends first.
         if (semaphore_take(pool->budget_semaphore, now_time_us() + 1000)) {
-          // RE-CHECK pass_active AFTER acquiring the slot. Without this there is a
-          // race: the governor can read pass_active==1, get preempted while the
-          // main thread ends the pass (pass_active=0) AND finishes its granted==0
-          // drain AND starts a path-B barrier pass (which sets barrier_pass=1).
-          // A grant issued in that window would wake a worker that reads
-          // barrier_pass==1, skip its `granted--`, and corrupt both the path-B
-          // cohort and the granted accounting -> permanent hang. Granting only
-          // while the pass is still active keeps every path-A grant paired with a
-          // worker that drains with barrier_pass==0 before main can return.
+          // Publish the grant (granted++) BEFORE checking pass_active, and ABORT
+          // with granted-- if the pass already ended. This makes main's path-A
+          // drain-spin (waits granted==0) observe any in-flight grant and block
+          // until the governor resolves it -- so main cannot exit tp_for_parallel
+          // and start a path-B barrier pass (which sets barrier_pass=1) while a
+          // grant is pending. Hence a woken worker ALWAYS captures barrier_pass==0
+          // for a path-A grant and does its paired granted--.
+          //
+          // The earlier "check pass_active, then granted++" ordering was NOT
+          // atomic: the governor could pass the check, get preempted while main
+          // ended the pass + drained granted to 0 + started a path-B pass, then
+          // wake a worker that captured barrier_pass==1, skipped granted--, and
+          // wedged granted>0 forever (observed: main spinning in tp_for_parallel,
+          // all workers parked). granted++ first closes that window.
+          ins_atomic_u64_inc_eval(&pool->granted);
           if (ins_atomic_u32_eval(&pool->pass_active)) {
-            ins_atomic_u64_inc_eval(&pool->granted);
             semaphore_drop(pool->wake_semaphore);
           } else {
-            semaphore_drop(pool->budget_semaphore); // give the slot back; pass ended
+            ins_atomic_u64_dec_eval(&pool->granted);   // abort: pass ended
+            semaphore_drop(pool->budget_semaphore);     // give the slot back
           }
         }
       } else {
