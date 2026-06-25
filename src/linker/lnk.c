@@ -4481,10 +4481,34 @@ lnk_compute_win32_image_header_size(LNK_Config *config, U64 sect_count)
   return image_header_size;
 }
 
+// reloc patch ordering: sort each section's relocs by apply_off so the RMW
+// write stream into the image is monotone-forward (HW-prefetchable) instead of
+// scattered in on-disk table order. apply_off is the primary key; orig_idx is a
+// tiebreak so the total order is deterministic and the final bytes are identical
+// to the unsorted patch order (each reloc writes its own disjoint field; only a
+// pathological same-apply_off overlap could depend on order, and the orig_idx
+// tiebreak preserves the original sequence there too).
+typedef struct LNK_RelocSortKey
+{
+  COFF_Reloc reloc;
+  U32        orig_idx;
+} LNK_RelocSortKey;
+
+internal int
+lnk_reloc_sort_key_is_before(void *raw_a, void *raw_b)
+{
+  LNK_RelocSortKey *a = raw_a, *b = raw_b;
+  if (a->reloc.apply_off != b->reloc.apply_off) {
+    return a->reloc.apply_off < b->reloc.apply_off;
+  }
+  return a->orig_idx < b->orig_idx;
+}
+
 internal
 THREAD_POOL_TASK_FUNC(lnk_obj_reloc_patcher)
 {
   ProfBeginFunction();
+  Temp scratch = scratch_begin(0, 0);
 
   LNK_ObjRelocPatcher *task = raw_task;
   LNK_Obj             *obj  = task->objs[task_id];
@@ -4493,10 +4517,6 @@ THREAD_POOL_TASK_FUNC(lnk_obj_reloc_patcher)
   COFF_SectionHeader  *section_table = lnk_coff_section_table_from_obj(obj);
   String8              symbol_table  = lnk_coff_symbol_table_from_obj(obj);
   String8              string_table  = lnk_coff_string_table_from_obj(obj);
-
-  U32 closest_sect  = 0;
-  U32 closest_reloc = 0;
-  U32 closest_foff  = max_U32;
 
   for EachIndex(sect_idx, obj_header.section_count_no_null) {
     COFF_SectionHeader *section_header = &section_table[sect_idx];
@@ -4511,10 +4531,17 @@ THREAD_POOL_TASK_FUNC(lnk_obj_reloc_patcher)
     Rng1U64 section_frange = rng_1u64(section_header->foff, section_header->foff + section_header->fsize);
     String8 section_data   = str8_substr(data, section_frange);
 
-    // apply relocs
+    // apply relocs (sorted by apply_off for monotone-forward image writes)
     COFF_RelocArray relocs = lnk_coff_relocs_from_section_header(obj, section_header);
+    Temp reloc_temp = temp_begin(scratch.arena);
+    LNK_RelocSortKey *sorted_relocs = push_array_no_zero(reloc_temp.arena, LNK_RelocSortKey, relocs.count);
     for EachIndex(reloc_idx, relocs.count) {
-      COFF_Reloc *reloc = &relocs.v[reloc_idx];
+      sorted_relocs[reloc_idx].reloc    = relocs.v[reloc_idx];
+      sorted_relocs[reloc_idx].orig_idx = (U32)reloc_idx;
+    }
+    radsort(sorted_relocs, relocs.count, lnk_reloc_sort_key_is_before);
+    for EachIndex(reloc_idx, relocs.count) {
+      COFF_Reloc *reloc = &sorted_relocs[reloc_idx].reloc;
 
       // error check relocation
       if (obj->header.machine == COFF_MachineType_X64) {
@@ -4587,8 +4614,10 @@ THREAD_POOL_TASK_FUNC(lnk_obj_reloc_patcher)
       // commit new reloc value
       MemoryCopy(section_data.str + reloc->apply_off, &reloc_result, reloc_value.size);
     }
+    temp_end(reloc_temp);
   }
 
+  scratch_end(scratch);
   ProfEnd();
 }
 
