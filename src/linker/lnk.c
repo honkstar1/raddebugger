@@ -3399,6 +3399,12 @@ lnk_icf_dense_colors_active(TP_Context *tp, Arena *arena, U32 *active, U64 n, U6
 #define LNK_RADIX_SIZE (1 << LNK_RADIX_BITS)
 #endif
 
+// false-sharing pad: stride (in U64s) that fills one 64B cache line, so each lane's
+// chunk_*[lane*LNK_ICF_CL_STRIDE_U64] entry owns a private line.
+#if !defined(LNK_ICF_CL_STRIDE_U64)
+#define LNK_ICF_CL_STRIDE_U64 8
+#endif
+
 // ============================================================================================
 // PERSISTENT-WORKER ICF REFINE REGION
 //
@@ -3554,12 +3560,12 @@ THREAD_POOL_TASK_FUNC(lnk_icf_refine_region_task)
         Rng1U64 r = rs->work_ranges[wid];
         U64 m = 0;
         for EachInRange(i, r) { if (rs->sk[i] > m) m = rs->sk[i]; }
-        rs->chunk_max[wid] = m;
+        rs->chunk_max[wid * LNK_ICF_CL_STRIDE_U64] = m;
       }
       barrier_wait(rs->tp->barrier);
       if (wid == 0) {
         U64 max_key = 0;
-        for EachIndex(w, W) { if (rs->chunk_max[w] > max_key) max_key = rs->chunk_max[w]; }
+        for EachIndex(w, W) { U64 mw = rs->chunk_max[w * LNK_ICF_CL_STRIDE_U64]; if (mw > max_key) max_key = mw; }
         U64 pass_count;
         if (max_key != 0) {
           U64 sig_bits   = 64 - clz64(max_key);
@@ -3641,7 +3647,7 @@ THREAD_POOL_TASK_FUNC(lnk_icf_refine_region_task)
         if (survive)             { kloc += 1; }
         if (boundary && survive) { sloc += 1; }
       }
-      rs->chunk_nc[wid] = nloc; rs->chunk_kp[wid] = kloc; rs->chunk_sc[wid] = sloc;
+      rs->chunk_nc[wid * LNK_ICF_CL_STRIDE_U64] = nloc; rs->chunk_kp[wid * LNK_ICF_CL_STRIDE_U64] = kloc; rs->chunk_sc[wid * LNK_ICF_CL_STRIDE_U64] = sloc;
     }
     barrier_wait(rs->tp->barrier);
 
@@ -3649,8 +3655,8 @@ THREAD_POOL_TASK_FUNC(lnk_icf_refine_region_task)
     if (wid == 0) {
       U64 nc = 0, next_count = 0, next_class_count = 0;
       for EachIndex(w, W) {
-        U64 cn = rs->chunk_nc[w], ck = rs->chunk_kp[w], cs = rs->chunk_sc[w];
-        rs->chunk_nc[w] = nc; rs->chunk_kp[w] = next_count;
+        U64 cn = rs->chunk_nc[w * LNK_ICF_CL_STRIDE_U64], ck = rs->chunk_kp[w * LNK_ICF_CL_STRIDE_U64], cs = rs->chunk_sc[w * LNK_ICF_CL_STRIDE_U64];
+        rs->chunk_nc[w * LNK_ICF_CL_STRIDE_U64] = nc; rs->chunk_kp[w * LNK_ICF_CL_STRIDE_U64] = next_count;
         nc += cn; next_count += ck; next_class_count += cs;
       }
       // stash round totals in chunk_max[0..2] (free scratch; radix max-reduce reuses it fresh next
@@ -3664,8 +3670,8 @@ THREAD_POOL_TASK_FUNC(lnk_icf_refine_region_task)
     // -------- PHASE: scan apply (re-derive color_at[]/out_slot[] from chunk's exclusive base) --------
     {
       Rng1U64 r = rs->work_ranges[wid];
-      U64 nc   = rs->chunk_nc[wid];
-      U64 slot = rs->chunk_kp[wid];
+      U64 nc   = rs->chunk_nc[wid * LNK_ICF_CL_STRIDE_U64];
+      U64 slot = rs->chunk_kp[wid * LNK_ICF_CL_STRIDE_U64];
       for (U64 k = r.min; k < r.max; k += 1) {
         B32 boundary = (k == 0 || rs->sk[k] != rs->sk[k - 1]);
         if (boundary) { nc += 1; }
@@ -4364,10 +4370,16 @@ lnk_opt_icf(TP_Context *tp, Arena *perm, LNK_SymbolTable *symtab, LNK_Config *co
     rs.kbuf      = push_array_no_zero(arena, U64, cand_count ? cand_count : 1);
     rs.vbuf      = push_array_no_zero(arena, U32, cand_count ? cand_count : 1);
     rs.hist      = push_array_no_zero(arena, U32, W * LNK_RADIX_SIZE);
-    rs.chunk_nc  = push_array_no_zero(arena, U64, W ? W : 1);
-    rs.chunk_kp  = push_array_no_zero(arena, U64, W ? W : 1);
-    rs.chunk_sc  = push_array_no_zero(arena, U64, W ? W : 1);
-    rs.chunk_max = push_array_no_zero(arena, U64, (W > 3 ? W : 3) ? (W > 3 ? W : 3) : 1);
+    // chunk_* are written per-lane as chunk_X[wid]; at 8B stride adjacent lanes share a
+    // cache line on the per-round scan/radix reductions. Pad each lane entry to a full
+    // 64B line (LNK_ICF_CL_STRIDE_U64 stride, indexed wid*stride) so each lane owns its
+    // line. Pure layout change; the indexed values are identical -> byte-identical output.
+    // chunk_max's round-total scratch slots [0..2] live inside lane-0's line and are
+    // untouched by other lanes, so reuse stays correct.
+    rs.chunk_nc  = push_array_no_zero(arena, U64, (W ? W : 1) * LNK_ICF_CL_STRIDE_U64);
+    rs.chunk_kp  = push_array_no_zero(arena, U64, (W ? W : 1) * LNK_ICF_CL_STRIDE_U64);
+    rs.chunk_sc  = push_array_no_zero(arena, U64, (W ? W : 1) * LNK_ICF_CL_STRIDE_U64);
+    rs.chunk_max = push_array_no_zero(arena, U64, ((W > 3 ? W : 3) ? (W > 3 ? W : 3) : 1) * LNK_ICF_CL_STRIDE_U64);
     rs.refine_ranges = push_array_no_zero(arena, Rng1U64, W + 1);
     rs.work_ranges   = push_array_no_zero(arena, Rng1U64, W + 1);
 
