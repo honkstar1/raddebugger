@@ -121,7 +121,7 @@ typedef struct
 // Type Merging
 
 typedef struct { U32 obj_idx; U32 leaf_idx;  } LNK_LeafRef;
-typedef struct { U64 count; LNK_LeafRef **v; } LNK_LeafRefArray;
+typedef struct { U64 count; LNK_LeafRef *v; } LNK_LeafRefArray; // value array (post-dedup, position-indexed)
 
 typedef struct
 {
@@ -184,19 +184,20 @@ typedef struct
   U64 *counts [CV_TypeIndexSource_COUNT];
   U64 *offsets[CV_TypeIndexSource_COUNT];
 
-  // leaf ref radix sort
+  // leaf ref radix sort (packed U64 keys = (obj_idx<<32)|leaf_idx)
   U64           obj_idx_bit_count_0;
   U64           obj_idx_bit_count_1;
   U64           obj_idx_bit_count_2;
   U64           counts_max;
   U32         **counts_arr;
-  LNK_LeafRef **dst;
-  LNK_LeafRef **src;
+  U64          *dst;
+  U64          *src;
   U64           pass_idx;
 
   // assign type indices
   CV_TypeIndex        min_type_indices    [CV_TypeIndexSource_COUNT];
   LNK_LeafRefArray    unique_leaf_refs_arr[CV_TypeIndexSource_COUNT];
+  U64                *unique_hashes_arr   [CV_TypeIndexSource_COUNT]; // pre-gathered, parallel to unique_leaf_refs_arr[].v
 
   U64          *obj_ti_map_counts;
   U64          *obj_ti_map_offsets;

@@ -1891,7 +1891,7 @@ lnk_leaf_ref_compare(LNK_LeafRef a, LNK_LeafRef b)
 internal int
 lnk_leaf_ref_is_before(void *raw_a, void *raw_b)
 {
-  return lnk_leaf_ref_compare(**(LNK_LeafRef **)raw_a, **(LNK_LeafRef **)raw_b) < 0;
+  return lnk_leaf_ref_compare(*(LNK_LeafRef *)raw_a, *(LNK_LeafRef *)raw_b) < 0;
 }
 
 internal B32
@@ -2279,12 +2279,32 @@ THREAD_POOL_TASK_FUNC(lnk_get_present_buckets_task)
   LNK_LeafHashTable *ht               = &task->leaf_ht_arr[task->ti_source];
   LNK_LeafRefArray   unique_leaf_refs = task->unique_leaf_refs_arr[task->ti_source];
 
+  // Emit the deduped bucket's VALUE (not the heap-scattered pointer) so the downstream radix sort /
+  // assign / unbucket read dense sequential memory instead of chasing the bucket pointer per element.
   for EachInRange(bucket_idx, task->ranges[task_id]) {
-    if (ht->bucket_arr[bucket_idx]) {
-      unique_leaf_refs.v[cursor++] = ht->bucket_arr[bucket_idx];
+    LNK_LeafRef *bucket = ht->bucket_arr[bucket_idx];
+    if (bucket) {
+      unique_leaf_refs.v[cursor++] = *bucket;
     }
   }
 
+  ProfEnd();
+}
+
+internal
+THREAD_POOL_TASK_FUNC(lnk_gather_unique_hashes_task)
+{
+  ProfBeginFunction();
+  LNK_MergeTypes  *task          = raw_task;
+  LNK_LeafRefArray unique_leaf_refs = task->unique_leaf_refs_arr[task->ti_source];
+  U64             *unique_hashes = task->unique_hashes_arr[task->ti_source];
+  CV_DebugH       *debug_h_arr   = task->input->debug_h_arr;
+  // Gather hashes from the SORTED value array (one sequential pass) so assign + unbucket_hashes read
+  // unique_hashes[i] directly instead of the 3-load debug_h_arr[obj].v[leaf] chain per element.
+  for EachInRange(i, task->ranges[task_id]) {
+    LNK_LeafRef leaf_ref = unique_leaf_refs.v[i];
+    unique_hashes[i] = debug_h_arr[leaf_ref.obj_idx].v[leaf_ref.leaf_idx];
+  }
   ProfEnd();
 }
 
@@ -2304,46 +2324,47 @@ THREAD_POOL_TASK_FUNC(lnk_leaf_ref_histo_task)
   MemoryZeroTyped(task->counts_arr[task_id], task->counts_max);
 
   switch (task->pass_idx) {
+  // packed key = (obj_idx<<32)|leaf_idx; leaf_idx in bits [0,32), obj_idx in bits [32,64)
   case 0: {
     for EachInRange(i, range) {
-      LNK_LeafRef *bucket = task->src[i];
-      U64 leaf_digit0 = BitExtract(bucket->leaf_idx, 10, 0);
+      U64 key = task->src[i];
+      U64 leaf_digit0 = BitExtract(key, 10, 0);
       counts_ptr[leaf_digit0] += 1;
     }
   } break;
   case 1: {
     for EachInRange(i, range) {
-      LNK_LeafRef *bucket = task->src[i];
-      U64 leaf_digit1 = BitExtract(bucket->leaf_idx, 11, 10);
+      U64 key = task->src[i];
+      U64 leaf_digit1 = BitExtract(key, 11, 10);
       counts_ptr[leaf_digit1] += 1;
     }
   } break;
   case 2: {
     for EachInRange(i, range) {
-      LNK_LeafRef *bucket = task->src[i];
-      U64 leaf_digit2 = BitExtract(bucket->leaf_idx, 11, 21);
+      U64 key = task->src[i];
+      U64 leaf_digit2 = BitExtract(key, 11, 21);
       counts_ptr[leaf_digit2] += 1;
     }
   } break;
 
   case 3: {
     for EachInRange(i, range) {
-      LNK_LeafRef *bucket = task->src[i];
-      U64 digit0 = BitExtract(bucket->obj_idx, obj_idx_bit_count_0, 0);
+      U64 key = task->src[i];
+      U64 digit0 = BitExtract(key, obj_idx_bit_count_0, 32 + 0);
       counts_ptr[digit0] += 1;
     }
   } break;
   case 4: {
     for EachInRange(i, range) {
-      LNK_LeafRef *bucket = task->src[i];
-      U64 digit1 = BitExtract(bucket->obj_idx, obj_idx_bit_count_1, obj_idx_bit_count_0);
+      U64 key = task->src[i];
+      U64 digit1 = BitExtract(key, obj_idx_bit_count_1, 32 + obj_idx_bit_count_0);
       counts_ptr[digit1] += 1;
     }
   } break;
   case 5: {
     for EachInRange(i, range) {
-      LNK_LeafRef *bucket = task->src[i];
-      U64 digit2 = BitExtract(bucket->obj_idx, obj_idx_bit_count_2, obj_idx_bit_count_0 + obj_idx_bit_count_1);
+      U64 key = task->src[i];
+      U64 digit2 = BitExtract(key, obj_idx_bit_count_2, 32 + obj_idx_bit_count_0 + obj_idx_bit_count_1);
       counts_ptr[digit2] += 1;
     }
   } break;
@@ -2372,27 +2393,27 @@ THREAD_POOL_TASK_FUNC(lnk_loc_idx_radix_sort_task)
   case 0: {
     ProfBegin("Leaf Sort Low");
     for EachInRange(i, range) {
-      LNK_LeafRef *bucket = task->src[i];
-      U64 leaf_digit0 = BitExtract(bucket->leaf_idx, 10, 0);
-      task->dst[counts_ptr[leaf_digit0]++] = bucket;
+      U64 key = task->src[i];
+      U64 leaf_digit0 = BitExtract(key, 10, 0);
+      task->dst[counts_ptr[leaf_digit0]++] = key;
     }
     ProfEnd();
   } break;
   case 1: {
     ProfBegin("Leaf Sort Mid");
     for EachInRange(i, range) {
-      LNK_LeafRef *bucket = task->src[i];
-      U64 leaf_digit1 = BitExtract(bucket->leaf_idx, 11, 10);
-      task->dst[counts_ptr[leaf_digit1]++] = bucket;
+      U64 key = task->src[i];
+      U64 leaf_digit1 = BitExtract(key, 11, 10);
+      task->dst[counts_ptr[leaf_digit1]++] = key;
     }
     ProfEnd();
   } break;
   case 2: {
     ProfBegin("Leaf Sort High");
     for EachInRange(i, range) {
-      LNK_LeafRef *bucket = task->src[i];
-      U64 leaf_digit2 = BitExtract(bucket->leaf_idx, 11, 21);
-      task->dst[counts_ptr[leaf_digit2]++] = bucket;
+      U64 key = task->src[i];
+      U64 leaf_digit2 = BitExtract(key, 11, 21);
+      task->dst[counts_ptr[leaf_digit2]++] = key;
     }
     ProfEnd();
   } break;
@@ -2403,28 +2424,28 @@ THREAD_POOL_TASK_FUNC(lnk_loc_idx_radix_sort_task)
   case 3: {
     ProfBegin("Obj Sort Low");
     for EachInRange(i, range) {
-      LNK_LeafRef *bucket = task->src[i];
-      U64 digit0 = BitExtract(bucket->obj_idx, obj_idx_bit_count_0, 0);
-      task->dst[counts_ptr[digit0]++] = bucket;
+      U64 key = task->src[i];
+      U64 digit0 = BitExtract(key, obj_idx_bit_count_0, 32 + 0);
+      task->dst[counts_ptr[digit0]++] = key;
     }
     ProfEnd();
   } break;
   case 4: {
     ProfBegin("Obj Sort Mid");
     for EachInRange(i, range) {
-      LNK_LeafRef *bucket = task->src[i];
-      U64 digit1 = BitExtract(bucket->obj_idx, obj_idx_bit_count_1, obj_idx_bit_count_0);
-      task->dst[counts_ptr[digit1]++] = bucket;
+      U64 key = task->src[i];
+      U64 digit1 = BitExtract(key, obj_idx_bit_count_1, 32 + obj_idx_bit_count_0);
+      task->dst[counts_ptr[digit1]++] = key;
     }
     ProfEnd();
   } break;
   case 5: {
     ProfBegin("Obj Sort High");
     for EachInRange(i, range) {
-      LNK_LeafRef *bucket = task->src[i];
-      U64 digit2 = BitExtract(bucket->obj_idx, obj_idx_bit_count_2, obj_idx_bit_count_0 + obj_idx_bit_count_1);
+      U64 key = task->src[i];
+      U64 digit2 = BitExtract(key, obj_idx_bit_count_2, 32 + obj_idx_bit_count_0 + obj_idx_bit_count_1);
       Assert(counts_ptr[digit2] != max_U32);
-      task->dst[counts_ptr[digit2]++] = bucket;
+      task->dst[counts_ptr[digit2]++] = key;
     }
     ProfEnd();
   } break;
@@ -2453,19 +2474,17 @@ THREAD_POOL_TASK_FUNC(lnk_assign_type_indices_task)
   LNK_MergeTypes *task  = raw_task;
 
   CV_TypeIndexSource  ti_source        = task->ti_source;
-  LNK_LeafRefArray    unique_leaf_refs = task->unique_leaf_refs_arr[ti_source];
   CV_TypeIndex        min_type_index   = task->min_type_indices[ti_source];
   LNK_AssignedTiHash *at               = &task->assigned_ti_arr[ti_source];
-  CV_DebugH          *debug_h_arr      = task->input->debug_h_arr;
+  U64                *unique_hashes    = task->unique_hashes_arr[ti_source];
 
   // Insert each unique leaf's assigned type index into the (unique-sized) hash->ti table, keyed by leaf
   // hash. Unique leaves have distinct hashes (dedup is by hash), so each claims its own empty slot.
   // search_ti (in the later fixup phase, after this barrier) recovers ti in one deref-free probe.
   for EachInRange(i, task->ranges[task_id]) {
-    LNK_LeafRef  *leaf_ref   = unique_leaf_refs.v[i];
     CV_TypeIndex  type_index = min_type_index + i;
 
-    U64 hash     = debug_h_arr[leaf_ref->obj_idx].v[leaf_ref->leaf_idx];
+    U64 hash     = unique_hashes[i]; // pre-gathered, parallel to unique_leaf_refs (sorted order)
     U64 best_idx = hash & (at->cap - 1); // cap is pow2
     U64 idx      = best_idx;
 
@@ -2557,11 +2576,11 @@ THREAD_POOL_TASK_FUNC(lnk_cv_patcher_leaves_task)
   Arena          *fixed_arena = task->fixed_arenas[task_id];
   for EachInRange(leaf_ref_idx, range) {
     Temp temp = temp_begin(fixed_arena);
-    LNK_LeafRef          *patch        = task->unique_leaf_refs_arr[task->ti_source].v[leaf_ref_idx];
-    CV_DebugT            *debug_t      = &task->input->debug_t_arr[patch->obj_idx];
-    CV_Leaf               leaf         = cv_debug_t_get_leaf(debug_t, patch->leaf_idx);
+    LNK_LeafRef           patch        = task->unique_leaf_refs_arr[task->ti_source].v[leaf_ref_idx];
+    CV_DebugT            *debug_t      = &task->input->debug_t_arr[patch.obj_idx];
+    CV_Leaf               leaf         = cv_debug_t_get_leaf(debug_t, patch.leaf_idx);
     CV_TypeIndexInfoList  ti_info_list = cv_get_leaf_type_index_offsets(temp.arena, leaf.kind, leaf.data);
-    lnk_fixup_cv_type_indices(task, patch->obj_idx, leaf.data, ti_info_list);
+    lnk_fixup_cv_type_indices(task, patch.obj_idx, leaf.data, ti_info_list);
     temp_end(temp);
   }
   ProfEnd();
@@ -2573,7 +2592,7 @@ THREAD_POOL_TASK_FUNC(lnk_unbucket_raw_leaves_task)
   LNK_MergeTypes *task = raw_task;
   Rng1U64 range = task->ranges[task_id];
   for EachInRange(i, range) {
-    LNK_LeafRef  leaf_ref = *task->unique_leaf_refs_arr[task->ti_source].v[i];
+    LNK_LeafRef  leaf_ref = task->unique_leaf_refs_arr[task->ti_source].v[i];
     CV_DebugT   *debug_t  = &task->input->debug_t_arr[leaf_ref.obj_idx];
     String8      raw_leaf = cv_debug_t_get_raw_leaf(debug_t, leaf_ref.leaf_idx);
     task->result.v[task->ti_source][i] = raw_leaf.str;
@@ -2585,11 +2604,9 @@ THREAD_POOL_TASK_FUNC(lnk_unbucket_hashes_task)
 {
   LNK_MergeTypes *task = raw_task;
   Rng1U64 range = task->ranges[task_id];
+  U64 *unique_hashes = task->unique_hashes_arr[task->ti_source];
   for EachInRange(i, range) {
-    LNK_LeafRef  leaf_ref = *task->unique_leaf_refs_arr[task->ti_source].v[i];
-    CV_DebugT   *debug_t  = &task->input->debug_t_arr[leaf_ref.obj_idx];
-    String8      raw_leaf = cv_debug_t_get_raw_leaf(debug_t, leaf_ref.leaf_idx);
-    task->result.hashes[task->ti_source][i] = task->input->debug_h_arr[leaf_ref.obj_idx].v[leaf_ref.leaf_idx];
+    task->result.hashes[task->ti_source][i] = unique_hashes[i]; // pre-gathered, parallel to sorted refs
   }
 }
 
@@ -2827,7 +2844,7 @@ lnk_merge_types(TP_Context *tp, TP_Arena *tp_temp, LNK_CodeViewInput *input, LNK
     tp_for_parallel_prof(tp, 0, tp->worker_count, lnk_count_present_buckets_task, &task, "Count present buckets");
 
     task.unique_leaf_refs_arr[ti_source].count = sum_array_u64(tp->worker_count, task.counts[ti_source]);
-    task.unique_leaf_refs_arr[ti_source].v     = push_array_no_zero(scratch.arena, LNK_LeafRef *, task.unique_leaf_refs_arr[ti_source].count);
+    task.unique_leaf_refs_arr[ti_source].v     = push_array_no_zero(scratch.arena, LNK_LeafRef, task.unique_leaf_refs_arr[ti_source].count);
 
     // assigned-ti table sized to the unique (deduped) count -- not the total leaf count, which would
     // add the bucket-parallel ti/hash arrays' worth of peak working set (~3GB on large links)
@@ -2850,8 +2867,17 @@ lnk_merge_types(TP_Context *tp, TP_Arena *tp_temp, LNK_CodeViewInput *input, LNK
         task.obj_idx_bit_count_2   = Clamp(0, (S32)obj_idx_max_bits,      10);
         task.counts_max            = (1 << 11);
         task.ranges                = tp_divide_work(scratch.arena, arr.count, tp->worker_count);
-        task.dst                   = push_array_no_zero(scratch.arena, LNK_LeafRef *, arr.count);
-        task.src                   = arr.v;
+
+        // pack leaf refs into U64 keys = (obj_idx<<32)|leaf_idx -> dense sequential sweeps, digit is a
+        // register shift, no pointee. LSD pass order (leaf_idx passes 0-2 then obj_idx passes 3-5)
+        // matches lnk_leaf_ref_compare's key order (obj primary, leaf secondary) -> identical order.
+        U64 *keys_a = push_array_no_zero(scratch.arena, U64, arr.count);
+        U64 *keys_b = push_array_no_zero(scratch.arena, U64, arr.count);
+        for EachIndex(i, arr.count) {
+          keys_a[i] = ((U64)arr.v[i].obj_idx << 32) | (U64)arr.v[i].leaf_idx;
+        }
+        task.src = keys_a;
+        task.dst = keys_b;
 
         ProfBegin("Push Counts");
         task.counts_arr = push_array_no_zero(scratch.arena, U32 *, tp->worker_count);
@@ -2892,14 +2918,16 @@ lnk_merge_types(TP_Context *tp, TP_Arena *tp_temp, LNK_CodeViewInput *input, LNK
 
           ProfBegin("Sort");
           tp_for_parallel(tp, 0, tp->worker_count, lnk_loc_idx_radix_sort_task, &task);
-          Swap(LNK_LeafRef **, task.src, task.dst);
+          Swap(U64 *, task.src, task.dst);
           ProfEnd();
 
           ProfEnd();
         }
 
-        if (task.src != arr.v) {
-          MemoryCopyTyped(arr.v, task.dst, arr.count);
+        // unpack sorted keys back into the value array
+        for EachIndex(i, arr.count) {
+          arr.v[i].obj_idx  = (U32)(task.src[i] >> 32);
+          arr.v[i].leaf_idx = (U32)(task.src[i] & max_U32);
         }
 
         ProfEnd();
@@ -2911,13 +2939,18 @@ lnk_merge_types(TP_Context *tp, TP_Arena *tp_temp, LNK_CodeViewInput *input, LNK
 
 #if 0
       for (U64 i = 1; i < arr.count; ++i) {
-        AssertAlways(arr.v[i-1]->obj_idx <= arr.v[i]->obj_idx);
-        if (arr.v[i-1]->obj_idx == arr.v[i]->obj_idx) {
-          AssertAlways(arr.v[i-1]->obj_idx <= arr.v[i]->obj_idx);
+        AssertAlways(arr.v[i-1].obj_idx <= arr.v[i].obj_idx);
+        if (arr.v[i-1].obj_idx == arr.v[i].obj_idx) {
+          AssertAlways(arr.v[i-1].obj_idx <= arr.v[i].obj_idx);
         }
       }
 #endif
     }
+
+    // pre-gather hashes over the now-sorted value array; assign + unbucket_hashes read these directly
+    task.unique_hashes_arr[ti_source] = push_array_no_zero(scratch.arena, U64, task.unique_leaf_refs_arr[ti_source].count);
+    task.ranges = tp_divide_work(scratch.arena, task.unique_leaf_refs_arr[ti_source].count, tp->worker_count);
+    tp_for_parallel_prof(tp, 0, tp->worker_count, lnk_gather_unique_hashes_task, &task, "Gather Hashes");
   }
 
   // bucket_arr is fully consumed (copied into unique_leaf_refs / sorted) -- release the probe tables
