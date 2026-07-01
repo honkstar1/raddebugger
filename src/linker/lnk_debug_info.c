@@ -2568,35 +2568,51 @@ THREAD_POOL_TASK_FUNC(lnk_cv_patcher_inlines_task)
 }
 
 internal
-THREAD_POOL_TASK_FUNC(lnk_cv_patcher_leaves_task)
+THREAD_POOL_TASK_FUNC(lnk_count_unique_leaf_sizes_task)
+{
+  LNK_MergeTypes *task = raw_task;
+  Rng1U64 range = task->ranges[task_id];
+  U64 size = 0;
+  for EachInRange(i, range) {
+    LNK_LeafRef  leaf_ref = task->unique_leaf_refs_arr[task->ti_source].v[i];
+    CV_DebugT   *debug_t  = &task->input->debug_t_arr[leaf_ref.obj_idx];
+    size += cv_debug_t_get_raw_leaf(debug_t, leaf_ref.leaf_idx).size;
+  }
+  task->leaf_buffer_offsets[task_id] = size; // exclusive-scanned into offsets on the main thread
+}
+
+// Materialize unique leaves: copy each unique raw leaf (existing sorted order) into one contiguous
+// private buffer and apply the type-index fixup to the COPY. This fuses the old
+// lnk_cv_patcher_leaves_task (which patched TIs in-place into the mapped input, dirtying
+// copy-on-write pages) with the old lnk_unbucket_raw_leaves_task (which pointed result.v into the
+// input). result.v now points into the copy: identical bytes, identical order, clean input pages.
+internal
+THREAD_POOL_TASK_FUNC(lnk_materialize_unique_leaves_task)
 {
   ProfBeginFunction();
   LNK_MergeTypes *task        = raw_task;
   Rng1U64         range       = task->ranges[task_id];
   Arena          *fixed_arena = task->fixed_arenas[task_id];
-  for EachInRange(leaf_ref_idx, range) {
-    Temp temp = temp_begin(fixed_arena);
-    LNK_LeafRef           patch        = task->unique_leaf_refs_arr[task->ti_source].v[leaf_ref_idx];
-    CV_DebugT            *debug_t      = &task->input->debug_t_arr[patch.obj_idx];
-    CV_Leaf               leaf         = cv_debug_t_get_leaf(debug_t, patch.leaf_idx);
-    CV_TypeIndexInfoList  ti_info_list = cv_get_leaf_type_index_offsets(temp.arena, leaf.kind, leaf.data);
-    lnk_fixup_cv_type_indices(task, patch.obj_idx, leaf.data, ti_info_list);
-    temp_end(temp);
-  }
-  ProfEnd();
-}
-
-internal
-THREAD_POOL_TASK_FUNC(lnk_unbucket_raw_leaves_task)
-{
-  LNK_MergeTypes *task = raw_task;
-  Rng1U64 range = task->ranges[task_id];
+  U8             *cursor      = task->leaf_buffer + task->leaf_buffer_offsets[task_id];
   for EachInRange(i, range) {
     LNK_LeafRef  leaf_ref = task->unique_leaf_refs_arr[task->ti_source].v[i];
     CV_DebugT   *debug_t  = &task->input->debug_t_arr[leaf_ref.obj_idx];
     String8      raw_leaf = cv_debug_t_get_raw_leaf(debug_t, leaf_ref.leaf_idx);
-    task->result.v[task->ti_source][i] = raw_leaf.str;
+
+    // copy raw leaf into the private buffer
+    MemoryCopy(cursor, raw_leaf.str, raw_leaf.size);
+    task->result.v[task->ti_source][i] = cursor;
+    cursor += raw_leaf.size;
+
+    // fixup type indices on the copy (same math the in-place leaf patcher applied)
+    Temp temp = temp_begin(fixed_arena);
+    CV_Leaf leaf = {0};
+    cv_read_leaf(str8(task->result.v[task->ti_source][i], raw_leaf.size), 0, 1, &leaf);
+    CV_TypeIndexInfoList ti_info_list = cv_get_leaf_type_index_offsets(temp.arena, leaf.kind, leaf.data);
+    lnk_fixup_cv_type_indices(task, leaf_ref.obj_idx, leaf.data, ti_info_list);
+    temp_end(temp);
   }
+  ProfEnd();
 }
 
 internal
@@ -2985,11 +3001,8 @@ lnk_merge_types(TP_Context *tp, TP_Arena *tp_temp, LNK_CodeViewInput *input, LNK
       tp_for_parallel_prof(tp, 0, input->count, lnk_cv_patcher_inlines_task, &task, "Fixup Inlines Type Indices");
     }
 
-    for EachIndex(ti_source, CV_TypeIndexSource_COUNT) {
-      task.ti_source = ti_source;
-      task.ranges    = tp_divide_work(scratch.arena, task.unique_leaf_refs_arr[ti_source].count, tp->worker_count);
-      tp_for_parallel_prof(tp, 0, tp->worker_count, lnk_cv_patcher_leaves_task, &task, "Fixup Types Type Indices");
-    }
+    // NOTE: leaf TI-fixup is fused into the unbucket/materialize pass below -- it copies each
+    // unique leaf into a private buffer and patches the copy, instead of patching the mapped input.
   }
   ProfEnd();
 
@@ -3016,7 +3029,19 @@ lnk_merge_types(TP_Context *tp, TP_Arena *tp_temp, LNK_CodeViewInput *input, LNK
     task.result.count[ti_source] = unique_leaf_refs.count;
     task.result.v    [ti_source] = push_array(tp_temp->v[0], U8 *, unique_leaf_refs.count);
     task.ranges                  = tp_divide_work(scratch.arena, unique_leaf_refs.count, tp->worker_count);
-    tp_for_parallel_prof(tp, 0, tp->worker_count, lnk_unbucket_raw_leaves_task, &task, "Unbucket Leaves");
+
+    // materialize unique leaves into one contiguous private buffer, fixing up their type indices
+    // during the copy (input leaves stay pre-fixup; dedup/hash phases already consumed them)
+    task.leaf_buffer_offsets = push_array_no_zero(scratch.arena, U64, tp->worker_count);
+    tp_for_parallel_prof(tp, 0, tp->worker_count, lnk_count_unique_leaf_sizes_task, &task, "Count Leaf Sizes");
+    U64 leaf_buffer_size = 0;
+    for EachIndex(i, tp->worker_count) {
+      U64 range_size = task.leaf_buffer_offsets[i];
+      task.leaf_buffer_offsets[i] = leaf_buffer_size;
+      leaf_buffer_size += range_size;
+    }
+    task.leaf_buffer = push_array_no_zero(tp_temp->v[0], U8, leaf_buffer_size);
+    tp_for_parallel_prof(tp, 0, tp->worker_count, lnk_materialize_unique_leaves_task, &task, "Materialize Leaves");
 
     if (merge_flags & LNK_MergeTypeFlag_ExportHashes) {
       task.result.hashes[ti_source] = push_array_no_zero(tp_temp->v[0], U64, unique_leaf_refs.count);

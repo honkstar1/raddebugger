@@ -206,6 +206,11 @@ typedef struct
   U64        pop_obj_idx;
   Rng1U64   *pop_range;
 
+  // materialize unique leaves (unbucket + leaf TI-fixup fused, applied to a private copy so the
+  // fixup never dirties the copy-on-write input mapping)
+  U64 *leaf_buffer_offsets; // [worker_count] per-task-range byte offsets into leaf_buffer
+  U8  *leaf_buffer;
+
   LNK_MergedTypes result;
 } LNK_MergeTypes;
 
