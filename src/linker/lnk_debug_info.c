@@ -1120,7 +1120,9 @@ lnk_apply_ifc_debug_records(TP_Context *tp, TP_Arena *tp_arena, LNK_CodeViewInpu
   // leaves and emits an ordered list of resolved redirects. A serial merge then replays them in
   // ascending obj_idx, then ascending leaf_idx -- the exact original serial order -- so the redirect
   // hash-map push order, ref_bits seeding, and redirect_count are bit-for-bit identical to serial.
-  input->has_ifc_redirects = 1;
+  input->has_ifc_redirects   = 1;
+  input->ifc_redirect_bits   = push_array(arena, U64 *,   input->count);
+  input->ifc_redirect_ti_rng = push_array(arena, Rng1U64, input->count);
   U64 redirect_count = 0;
   {
     LNK_IfcScanTask scan      = {0};
@@ -1137,11 +1139,20 @@ lnk_apply_ifc_debug_records(TP_Context *tp, TP_Arena *tp_arena, LNK_CodeViewInpu
     for EachIndex(obj_idx, input->obj_count) {
       LNK_IfcRedirectRec *recs = scan.out_recs[obj_idx];
       U64                 n    = scan.out_counts[obj_idx];
+      if (n) {
+        // exact key filter: records are K-ascending (worker scans leaf_idx ascending and
+        // cv_ti_from_leaf_idx is monotonic), so [recs[0].K, recs[n-1].K] spans all keys.
+        Rng1U64 krng = r1u64(recs[0].K, (U64)recs[n-1].K + 1);
+        input->ifc_redirect_ti_rng[obj_idx] = krng;
+        input->ifc_redirect_bits[obj_idx]   = push_array(arena, U64, (dim_1u64(krng) + 63) / 64);
+      }
       for EachIndex(t, n) {
         LNK_IfcRedirectRec *r = &recs[t];
         hash_map_push_u64_u64(arena, &input->ifc_redirect_hm,
                               Compose64Bit(obj_idx, r->K),
                               Compose64Bit(r->blob_obj_idx, r->blob_leaf_idx));
+        U64 rel = r->K - input->ifc_redirect_ti_rng[obj_idx].min;
+        input->ifc_redirect_bits[obj_idx][rel >> 6] |= (1ull << (rel & 63));
         redirect_count += 1;
         // seed closure root: this blob leaf is referenced
         ref_bits[r->blob_i][r->blob_leaf_idx >> 3] |= (U8)(1u << (r->blob_leaf_idx & 7));
@@ -1822,9 +1833,18 @@ lnk_leaf_ref_from_ti(LNK_CodeViewInput *input, U32 obj_idx, CV_TypeIndexSource s
   // to a leaf inside an injected .ifc debug-records blob obj. The blob leaves then
   // dedup/hash/fixup natively through the rest of this function.
   if (input->has_ifc_redirects && source == CV_TypeIndexSource_TPI) {
-    U64 *packed = hash_map_search_u64_u64(&input->ifc_redirect_hm, Compose64Bit(obj_idx, ti));
-    if (packed) {
-      return (LNK_LeafRef){ (U32)(*packed >> 32), (U32)(*packed & max_U32) };
+    // exact per-obj bitset filter: bit set iff Compose64Bit(obj_idx, ti) is a key in
+    // ifc_redirect_hm. skips the (miss-dominated) per-call key hash + map walk; on a set
+    // bit the original map search runs unchanged, so behavior is bit-identical.
+    U64 *bits = input->ifc_redirect_bits[obj_idx];
+    if (bits != 0 && contains_1u64(input->ifc_redirect_ti_rng[obj_idx], ti)) {
+      U64 rel = ti - input->ifc_redirect_ti_rng[obj_idx].min;
+      if (bits[rel >> 6] & (1ull << (rel & 63))) {
+        U64 *packed = hash_map_search_u64_u64(&input->ifc_redirect_hm, Compose64Bit(obj_idx, ti));
+        if (packed) {
+          return (LNK_LeafRef){ (U32)(*packed >> 32), (U32)(*packed & max_U32) };
+        }
+      }
     }
   }
 
