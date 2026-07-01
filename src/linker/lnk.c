@@ -3545,6 +3545,20 @@ typedef struct LNK_ICFRegion
   U32         *radix_vdst;
   B32          converged;        // set by worker 0 -> all break together
   U64          max_rounds;       // hard cap on rounds (region stops, may hand off to worklist tail)
+  U32         *final_oldcol;     // optional [active_count]: on the FINAL round (round+1 == max_rounds), the
+                                 // gather phase snapshots the PRE-round color of the round's active set,
+                                 // position-indexed (final_oldcol[i] = colors[active[i]] before scatter).
+                                 // Lets the worklist tail seed its dirty set from only the classes that
+                                 // split in that round. Written iff the region runs its final round; the
+                                 // handoff consumer only reads it when !converged (which implies it ran).
+  U32         *final_newcol;     // optional [active_count], final round only: POST-round color by PRE-round
+                                 // position (final_newcol[i] = new color of active[i]). Lets the handoff
+                                 // seed scan run on two sequential arrays instead of a 10M+ random gather
+                                 // of colors[active_prev[i]].
+  U32         *final_survcol;    // optional [active_count], final round only: POST-round color by SURVIVOR
+                                 // slot (final_survcol[j] = color of the round's active2[j]). Lets the
+                                 // worklist build its initial class slots with a sequential run-scan
+                                 // instead of a 10M+ random gather of colors[active[i]].
 } LNK_ICFRegion;
 
 // in-place reloc-weighted division (mirrors lnk_icf_divide_by_reloc; writes into preallocated ranges)
@@ -3624,6 +3638,13 @@ THREAD_POOL_TASK_FUNC(lnk_icf_refine_region_task)
     {
       Rng1U64 r = rs->work_ranges[wid];
       for EachInRange(i, r) { rs->sk[i] = rs->newkey[rs->active[i]]; rs->sv[i] = (U32)i; }
+      // final-round pre-scatter color snapshot for the worklist tail seed (see final_oldcol decl).
+      // colors[] is still the pre-round state here (scatter happens later this round). Log-free,
+      // output-neutral: only the worklist dirty-seed READS this, and it only prunes provably-no-op
+      // re-keys (same fixpoint partition).
+      if (rs->final_oldcol != 0 && round + 1 == rs->max_rounds) {
+        for EachInRange(i, r) { rs->final_oldcol[i] = rs->colors[rs->active[i]]; }
+      }
     }
     barrier_wait(rs->tp->barrier);
 
@@ -3763,6 +3784,10 @@ THREAD_POOL_TASK_FUNC(lnk_icf_refine_region_task)
     {
       Rng1U64 r = rs->work_ranges[wid];
       for EachInRange(k, r) { rs->colors[rs->active[rs->sv[k]]] = rs->color_at[k]; }
+      // final-round handoff export: post-round color by pre-round position (see final_newcol decl)
+      if (rs->final_newcol != 0 && round + 1 == rs->max_rounds) {
+        for EachInRange(k, r) { rs->final_newcol[rs->sv[k]] = rs->color_at[k]; }
+      }
     }
     barrier_wait(rs->tp->barrier);
 
@@ -3771,6 +3796,12 @@ THREAD_POOL_TASK_FUNC(lnk_icf_refine_region_task)
       Rng1U64 r = rs->work_ranges[wid];
       for EachInRange(k, r) {
         if (rs->keep[k]) { rs->active2[rs->out_slot[k]] = rs->active[rs->sv[k]]; }
+      }
+      // final-round handoff export: post-round color by survivor slot (see final_survcol decl)
+      if (rs->final_survcol != 0 && round + 1 == rs->max_rounds) {
+        for EachInRange(k, r) {
+          if (rs->keep[k]) { rs->final_survcol[rs->out_slot[k]] = rs->color_at[k]; }
+        }
       }
     }
     barrier_wait(rs->tp->barrier);
@@ -4135,63 +4166,160 @@ lnk_icf_small_sort(U64 *keys, U32 *vals, U64 n)
 // stored iff BOTH endpoints can still matter to the worklist:
 //   - T active: an inactive T's class is final and can never split, so T never appears in split_mem and
 //     its referrer row is never read.
-//   - C active: an inactive C's class is final; its color is never registered in slot_of_color, so the
-//     worklist drops it at the lookup (lnk_icf_map_get -> 0) anyway.
-// Duplicate (C,T) edges (multiple relocs from C to the same T) are deduped: cands are iterated in
-// ascending index and each cand's relocs are drained before the next, so per-target appends arrive in
-// non-decreasing C -- a duplicate is exactly "tail of T's bucket == C" (last_ref[] in the count pass,
-// bucket-tail check in the fill pass; identical predicates under identical iteration order).
-// Filtering/dedup only removes provably-redundant re-key requests (the worklist dirties CLASSES, set
-// semantics), so it visits the same dirty sets -> identical partition -> byte-identical output.
+//   - C active: an inactive C's class is final; its color has no slot, so the worklist drops it at the
+//     slot lookup (lnk_icf_wl_slot_from_color -> 0) anyway.
+// Duplicate (C,T) edges (multiple relocs from C to the same T) are deduped. Filtering/dedup only removes
+// provably-redundant re-key requests (the worklist dirties CLASSES, set semantics), so it visits the
+// same dirty sets -> identical partition -> byte-identical output.
+//
+// PARALLEL BUILD: the old serial builder (two full scans over every active cand's relocs + a per-target
+// last_ref/cursor dedup) was the dominant serial cost of the whole worklist tail (~0.4-0.9s wall at
+// editor scale). Instead: parallel count/fill of the filtered (target, referrer) edge list over
+// reloc-weighted cand ranges (dups kept), one parallel stable radix sort by target, then a serial
+// compaction pass. Identical result:
+//   - per-target referrer order: edges are emitted in ascending referrer ci (workers own contiguous
+//     cand ranges, concatenated in order), and the radix sort is stable -> per-target ascending ci,
+//     exactly the old iteration order;
+//   - dedup: duplicate (C,T) pairs only arise within one cand's reloc list (C is unique per cand), so
+//     they are adjacent after the stable sort; dropping equal-neighbor pairs removes exactly the pairs
+//     last_ref/cursor dropped.
+typedef struct LNK_ICFRevIdxTask
+{
+  LNK_ICFCand *cands;
+  U8          *rt_iscand;
+  U64         *rt_target;
+  U8          *is_active;
+  U32         *active;
+  Rng1U64     *act_ranges;  // [W+1] even split over active_count (is_active scatter)
+  Rng1U64     *cand_ranges; // [W+1] reloc-weighted split over cand_count (count/fill)
+  U64         *counts;      // [W] per-worker filtered edge counts
+  U64         *offsets;     // [W] exclusive prefix of counts
+  U64         *ek;          // [edge] key: target cand idx
+  U32         *ev;          // [edge] val: referrer cand idx
+} LNK_ICFRevIdxTask;
+
+internal
+THREAD_POOL_TASK_FUNC(lnk_icf_revidx_active_task)
+{
+  LNK_ICFRevIdxTask *t = raw_task;
+  Rng1U64 r = t->act_ranges[task_id];
+  for EachInRange(i, r) { t->is_active[t->active[i]] = 1; }
+}
+
+internal
+THREAD_POOL_TASK_FUNC(lnk_icf_revidx_count_task)
+{
+  LNK_ICFRevIdxTask *t = raw_task;
+  Rng1U64 r = t->cand_ranges[task_id];
+  U64 n = 0;
+  for EachInRange(ci, r) {
+    if (!t->is_active[ci]) { continue; }
+    LNK_ICFCand *c = &t->cands[ci];
+    for EachIndex(j, c->reloc_count) {
+      U64 idx = (U64)c->reloc_first + j;
+      if (!t->rt_iscand[idx]) { continue; }
+      if (!t->is_active[t->rt_target[idx]]) { continue; }
+      n += 1;
+    }
+  }
+  t->counts[task_id] = n;
+}
+
+internal
+THREAD_POOL_TASK_FUNC(lnk_icf_revidx_fill_task)
+{
+  LNK_ICFRevIdxTask *t = raw_task;
+  Rng1U64 r = t->cand_ranges[task_id];
+  U64 out = t->offsets[task_id];
+  for EachInRange(ci, r) {
+    if (!t->is_active[ci]) { continue; }
+    LNK_ICFCand *c = &t->cands[ci];
+    for EachIndex(j, c->reloc_count) {
+      U64 idx = (U64)c->reloc_first + j;
+      if (!t->rt_iscand[idx]) { continue; }
+      U64 tg = t->rt_target[idx];
+      if (!t->is_active[tg]) { continue; }
+      t->ek[out] = tg; t->ev[out] = (U32)ci; out += 1;
+    }
+  }
+}
+
 internal void
-lnk_icf_build_reverse_index(Arena *arena, U64 cand_count, LNK_ICFCand *cands, U8 *rt_iscand, U64 *rt_target,
+lnk_icf_build_reverse_index(TP_Context *tp, Arena *arena, U64 cand_count, LNK_ICFCand *cands, U8 *rt_iscand, U64 *rt_target,
                             U32 *active, U64 active_count,
                             U32 **out_rev_off, U32 **out_rev_adj)
 {
   Temp scratch = scratch_begin(&arena, 1);
-  U8  *is_active = push_array(scratch.arena, U8, cand_count ? cand_count : 1);
-  for EachIndex(i, active_count) { is_active[active[i]] = 1; }
-  U32 *last_ref = push_array(scratch.arena, U32, cand_count ? cand_count : 1); // ci+1 of last referrer counted per target; 0 = none
+  U64 W = tp->worker_count ? tp->worker_count : 1;
+  U64 total_relocs = cand_count ? ((U64)cands[cand_count - 1].reloc_first + cands[cand_count - 1].reloc_count) : 0;
 
-  U32 *rev_off = push_array(arena, U32, cand_count + 1);
-  U64 raw_iscand = 0; // instrumentation: unfiltered edge count (old rev_adj size)
-  for EachIndex(ci, cand_count) {
-    LNK_ICFCand *c = &cands[ci];
-    for EachIndex(j, c->reloc_count) {
-      U64 idx = (U64)c->reloc_first + j;
-      if (!rt_iscand[idx]) { continue; }
-      raw_iscand += 1;
-      if (!is_active[ci]) { continue; }
-      U32 tg = (U32)rt_target[idx];
-      if (!is_active[tg]) { continue; }
-      if (last_ref[tg] == (U32)ci + 1) { continue; } // duplicate (C,T)
-      last_ref[tg] = (U32)ci + 1;
-      rev_off[tg + 1] += 1;
+  LNK_ICFRevIdxTask task = {0};
+  task.cands     = cands;
+  task.rt_iscand = rt_iscand;
+  task.rt_target = rt_target;
+  task.active    = active;
+  task.is_active = push_array(scratch.arena, U8, cand_count ? cand_count : 1);
+
+  // active-bit scatter (disjoint ranges; all stores are the constant 1)
+  task.act_ranges = tp_divide_work(scratch.arena, active_count, W);
+  tp_for_parallel(tp, 0, W, lnk_icf_revidx_active_task, &task);
+
+  // reloc-weighted cand ranges: split at the cand whose reloc_first crosses w/W of total_relocs
+  // (reloc_first is monotone). Splitting at cand boundaries keeps each cand's (potentially
+  // duplicated) targets inside ONE worker's contiguous, in-order output range.
+  task.cand_ranges = push_array_no_zero(scratch.arena, Rng1U64, W + 1);
+  {
+    U64 prev = 0;
+    for (U64 w = 1; w <= W; w += 1) {
+      U64 goal = (total_relocs * w) / W;
+      U64 lo = prev, hi = cand_count;
+      while (lo < hi) { U64 mid = (lo + hi) >> 1; if ((U64)cands[mid].reloc_first < goal) { lo = mid + 1; } else { hi = mid; } }
+      task.cand_ranges[w - 1] = rng_1u64(prev, lo);
+      prev = lo;
     }
+    task.cand_ranges[W - 1].max = cand_count; // last range absorbs the tail
+    task.cand_ranges[W] = rng_1u64(cand_count, cand_count);
+  }
+
+  task.counts = push_array(scratch.arena, U64, W);
+  tp_for_parallel(tp, 0, W, lnk_icf_revidx_count_task, &task);
+  task.offsets = offsets_from_counts_array_u64(scratch.arena, task.counts, W);
+  U64 edge_raw = task.offsets[W - 1] + task.counts[W - 1];
+
+  task.ek = push_array_no_zero(scratch.arena, U64, edge_raw ? edge_raw : 1);
+  task.ev = push_array_no_zero(scratch.arena, U32, edge_raw ? edge_raw : 1);
+  tp_for_parallel(tp, 0, W, lnk_icf_revidx_fill_task, &task);
+
+  // stable parallel radix sort by target (ties keep input order = ascending referrer ci)
+  lnk_radix_sort_u64_pairs(tp, scratch.arena, edge_raw, task.ek, task.ev);
+
+  // serial compaction: drop adjacent duplicate (target, referrer) pairs, count per target, emit CSR.
+  // rev_adj is written strictly sequentially (edges are sorted by target).
+  U32 *rev_off = push_array(arena, U32, cand_count + 1);
+  U64  edge_count = 0;
+  for (U64 e = 0; e < edge_raw; e += 1) {
+    if (e > 0 && task.ek[e] == task.ek[e - 1] && task.ev[e] == task.ev[e - 1]) { continue; } // duplicate (C,T)
+    rev_off[task.ek[e] + 1] += 1;
+    edge_count += 1;
   }
   for EachIndex(t, cand_count) { rev_off[t + 1] += rev_off[t]; }
-  U64 edge_count = rev_off[cand_count];
   U32 *rev_adj = push_array_no_zero(arena, U32, edge_count ? edge_count : 1);
-  U32 *cursor = push_array(scratch.arena, U32, cand_count ? cand_count : 1);
-  for EachIndex(ci, cand_count) {
-    if (!is_active[ci]) { continue; }
-    LNK_ICFCand *c = &cands[ci];
-    for EachIndex(j, c->reloc_count) {
-      U64 idx = (U64)c->reloc_first + j;
-      if (!rt_iscand[idx]) { continue; }
-      U32 tg = (U32)rt_target[idx];
-      if (!is_active[tg]) { continue; }
-      U32 n = cursor[tg];
-      if (n > 0 && rev_adj[rev_off[tg] + n - 1] == (U32)ci) { continue; } // duplicate (C,T)
-      rev_adj[rev_off[tg] + n] = (U32)ci;
-      cursor[tg] = n + 1;
+  {
+    U64 out = 0;
+    for (U64 e = 0; e < edge_raw; e += 1) {
+      if (e > 0 && task.ek[e] == task.ek[e - 1] && task.ev[e] == task.ev[e - 1]) { continue; }
+      rev_adj[out++] = task.ev[e];
     }
   }
   scratch_end(scratch);
   if (lnk_get_log_status(LNK_Log_Debug)) {
-    U64 total_relocs = cand_count ? ((U64)cands[cand_count - 1].reloc_first + cands[cand_count - 1].reloc_count) : 0;
-    lnk_log(LNK_Log_Debug, "/OPT:ICF worklist rev-index: relocs=%llu iscand=%llu kept=%llu (active-rows+dedup); rev_adj %llu -> %llu bytes",
-            total_relocs, raw_iscand, edge_count, raw_iscand * sizeof(U32), edge_count * sizeof(U32));
+    U64 raw_iscand = 0; // instrumentation: unfiltered edge count (old rev_adj size); debug-log only
+    for EachIndex(ci, cand_count) {
+      LNK_ICFCand *c = &cands[ci];
+      for EachIndex(j, c->reloc_count) { raw_iscand += rt_iscand[(U64)c->reloc_first + j]; }
+    }
+    lnk_log(LNK_Log_Debug, "/OPT:ICF worklist rev-index: relocs=%llu iscand=%llu filtered=%llu kept=%llu (active-rows+dedup); rev_adj %llu -> %llu bytes",
+            total_relocs, raw_iscand, edge_raw, edge_count, raw_iscand * sizeof(U32), edge_count * sizeof(U32));
   }
   *out_rev_off = rev_off;
   *out_rev_adj = rev_adj;
@@ -4202,17 +4330,42 @@ lnk_icf_build_reverse_index(Arena *arena, U64 cand_count, LNK_ICFCand *cands, U8
 // Runs the worklist to fixpoint, updating colors[] in place. Returns the round count via *out_rounds and
 // 1 on success / 0 if the hang-guard tripped (caller must NOT ship -- it is a bug).
 //
-// Data model: the work unit is a CLASS (a color). Per-color member lists live in one flat slab `mem[]`;
-// a class's members are mem[slot_first[s] .. slot_first[s]+slot_count[s]). `slot_of_color` maps a live
-// color -> slot+1. A split replaces the parent slot's mem range, in sorted (newkey, cand-idx) order, with
+// Data model: the work unit is a CLASS (a color). Per-color member lists live in one flat slab `mem[]`
+// (aliasing the caller's active[]); a class's members are mem[slot_first[s] .. slot_first[s]+slot_count[s]).
+// Color -> slot+1 lookup is a binary search over the strictly-ascending slot_color[] (see
+// lnk_icf_wl_slot_from_color). A split replaces the parent slot's mem range, in sorted (newkey, cand-idx) order, with
 // its sub-runs: the first sub-run KEEPS the parent slot & color; later sub-runs get fresh slots & fresh
 // color ids. Singletons are dropped (final). Determinism: members in ascending cand index within a class;
 // sub-runs sub-sorted by cand index; new ids from a deterministic running counter.
+// slot lookup by color, replacing the old slot_of_color hash map. slot_color[] is STRICTLY ascending
+// for the worklist's whole lifetime: initial slots come from the ascending-color grouped handoff;
+// a split's first sub-run reuses the parent slot (color unchanged); later sub-runs append fresh ids
+// drawn from the monotone color_base counter (every fresh id > all earlier colors, appended in
+// increasing order). Lookups are FEW (referrer expansion over tiny split sets), while the map cost
+// was per-LINK large (a 2*cap pow2 table: ~256MB 0xff memset + one random-cacheline put per initial
+// class, ~4M puts at editor scale). Returns slot+1, or 0 if no slot has this color (inactive class).
+internal U64
+lnk_icf_wl_slot_from_color(U32 *slot_color, U64 slot_n, U32 col)
+{
+  U64 lo = 0, hi = slot_n;
+  while (lo < hi) {
+    U64 mid = (lo + hi) >> 1;
+    if (slot_color[mid] < col) { lo = mid + 1; } else { hi = mid; }
+  }
+  return (lo < slot_n && slot_color[lo] == col) ? lo + 1 : 0;
+}
+
+// `seed_mem`/`seed_n` (optional): members of the classes that split in the caller's LAST refinement
+// round (the region's final round). When given, the first round's dirty set is seeded with just the
+// referrers of these members -- the same recurrence the worklist applies between its own rounds --
+// instead of re-keying EVERY active class to rediscover a handful of splits (measured: first round
+// re-keyed ~10.79M members to find ~132 split members). seed_mem == 0 => legacy all-slots seed.
 internal B32
 lnk_icf_worklist_refine(TP_Context *tp, Arena *arena, U64 cand_count, LNK_ICFCand *cands,
                         U32 *colors, U8 *rt_iscand, U64 *rt_target,
                         U32 *rev_off, U32 *rev_adj,
-                        U32 *active, U64 active_count, U64 color_base, U64 *out_rounds)
+                        U32 *active, U64 active_count, U64 color_base,
+                        U32 *active_col, U32 *seed_mem, U64 seed_n, U64 *out_rounds)
 {
   (void)tp; (void)cand_count;
   Temp t = temp_begin(arena);
@@ -4221,38 +4374,61 @@ lnk_icf_worklist_refine(TP_Context *tp, Arena *arena, U64 cand_count, LNK_ICFCan
   // exceeds active_count, and a class of size m can split into at most m sub-classes, so total slots
   // ever created <= active_count. Size all slot-indexed arrays to active_count (+slack).
   U64 cap = active_count + 16;
-  U32 *mem        = push_array_no_zero(t.arena, U32, cap);
+  U32 *mem        = active; // the worklist owns active[] IN PLACE as its member slab (split sub-run
+                            // reordering permutes members within their class range) -- saves the
+                            // 10M+-entry copy. CALLER CONTRACT: active[] is clobbered on return.
   U32 *slot_first = push_array_no_zero(t.arena, U32, cap);
   U32 *slot_count = push_array_no_zero(t.arena, U32, cap);
   U32 *slot_color = push_array_no_zero(t.arena, U32, cap);
-  U64  slot_n = 0, mem_n = 0;
-  LNK_ICFMap slot_of_color = lnk_icf_map_make(t.arena, cap);
+  U64  slot_n = 0;
 
-  // initial slots: group the active set by current color (one sort). Active members are already only in
-  // classes of size>=2, so every produced slot has count>=2.
-  {
-    U64 *sk = push_array_no_zero(t.arena, U64, active_count ? active_count : 1);
-    U32 *sv = push_array_no_zero(t.arena, U32, active_count ? active_count : 1);
-    for EachIndex(i, active_count) { sk[i] = (U64)colors[active[i]]; sv[i] = active[i]; }
-    lnk_radix_sort_u64_pairs(tp, t.arena, active_count, sk, sv); // by color, ties by cand idx (stable-by-value)
-    for (U64 a = 0; a < active_count; ) {
-      U32 col = (U32)sk[a];
-      U64 b = a; while (b < active_count && (U32)sk[b] == col) { b += 1; }
-      U32 first = (U32)mem_n;
-      for (U64 q = a; q < b; q += 1) { mem[mem_n++] = sv[q]; }
-      slot_first[slot_n] = first; slot_count[slot_n] = (U32)(b - a); slot_color[slot_n] = col;
-      lnk_icf_map_put(&slot_of_color, col, slot_n + 1);
-      slot_n += 1;
-      a = b;
-    }
+  // initial slots: group the active set by current color. NO SORT NEEDED: the region's survivor emit
+  // hands over active[] already grouped -- colors are assigned in ascending sorted-position order and
+  // survivors are emitted in position order, so active[] is a sequence of equal-color runs with
+  // STRICTLY ascending colors across runs and ascending cand index within a run (the radix sort is
+  // stable and each round's gather feeds it in the previous round's order, ascending by induction).
+  // That is exactly the (color, cand-idx) order the old full radix sort produced -> identical slots.
+  // The strictly-ascending run check below asserts the precondition on every link. Active members are
+  // already only in classes of size>=2, so every produced slot has count>=2.
+  // `active_col` (optional) carries colors[active[i]] position-indexed (region final-round export) so
+  // this scan reads two sequential streams instead of a 10M+ random gather into colors[].
+#if defined(ICF_WORKLIST_SELFCHECK)
+  if (active_col != 0) { for EachIndex(i, active_count) { AssertAlways(active_col[i] == colors[active[i]]); } }
+#endif
+  for (U64 a = 0; a < active_count; ) {
+    U32 col = active_col ? active_col[a] : colors[active[a]];
+    U64 b = a + 1;
+    if (active_col) { while (b < active_count && active_col[b] == col) { b += 1; } }
+    else            { while (b < active_count && colors[active[b]] == col) { b += 1; } }
+    AssertAlways(slot_n == 0 || col > slot_color[slot_n - 1]); // grouped handoff precondition
+    slot_first[slot_n] = (U32)a; slot_count[slot_n] = (U32)(b - a); slot_color[slot_n] = col;
+    slot_n += 1;
+    a = b;
   }
 
-  // dirty worklist = slots to re-densify this round. Seed with all slots.
+  // dirty worklist = slots to re-densify this round. Seeded from seed_mem when given (referrers of the
+  // final region round's split members, mapped to their current class slot -- the identical expansion
+  // the loop below applies between rounds), else with all slots.
   U32 *dirty      = push_array_no_zero(t.arena, U32, cap);
   U32 *next_dirty = push_array_no_zero(t.arena, U32, cap);
   U8  *in_dirty   = push_array(t.arena, U8, cap); // dedup membership for next_dirty (cleared after swap)
   U64 dirty_n = 0;
-  for EachIndex(s, slot_n) { dirty[dirty_n++] = (U32)s; }
+  if (seed_mem != 0) {
+    for EachIndex(i, seed_n) {
+      U32 mem_ci = seed_mem[i];
+      for (U32 e = rev_off[mem_ci]; e < rev_off[mem_ci + 1]; e += 1) {
+        U32 ref = rev_adj[e];
+        U64 sc  = lnk_icf_wl_slot_from_color(slot_color, slot_n, colors[ref]);
+        if (sc) {
+          U32 rslot = (U32)(sc - 1);
+          if (slot_count[rslot] >= 2 && !in_dirty[rslot]) { in_dirty[rslot] = 1; dirty[dirty_n++] = rslot; }
+        }
+      }
+    }
+    for EachIndex(i, dirty_n) { in_dirty[dirty[i]] = 0; }
+  } else {
+    for EachIndex(s, slot_n) { dirty[dirty_n++] = (U32)s; }
+  }
 
   // staged this round (committed only at the round barrier so re-keying reads FROZEN colors[]):
   //   - new color assignments (ci -> color); applied to colors[] after the round
@@ -4321,6 +4497,7 @@ lnk_icf_worklist_refine(TP_Context *tp, Arena *arena, U64 cand_count, LNK_ICFCan
         U64 rn = r - run0;
         U32 run_first = (U32)(first + run0);
         U32 run_color;
+        B32 is_first = first_run;
         if (first_run) {
           run_color = slot_color[slot]; first_run = 0;
           // parent slot's count shrinks to the 1st sub-run; staged so dirty loop still sees old count.
@@ -4330,10 +4507,16 @@ lnk_icf_worklist_refine(TP_Context *tp, Arena *arena, U64 cand_count, LNK_ICFCan
           ns_slot[ns_n] = max_U32;  // allocate a fresh slot at commit
         }
         ns_first[ns_n] = run_first; ns_count[ns_n] = (U32)rn; ns_color[ns_n] = run_color; ns_n += 1;
-        for (U64 q = run0; q < r; q += 1) {
-          U32 ci = mem[first + q];
-          stage_ci[stage_n] = ci; stage_col[stage_n] = run_color; stage_n += 1;
-          split_mem[split_n++] = ci;
+        // 1st sub-run KEEPS the parent color: no member's color changes, so no referrer's key can
+        // change through these members -- skip both the (no-op) color staging and split_mem. Only
+        // members that actually RECEIVE a fresh color propagate dirtiness. (A split always has a
+        // non-first run, so the stage_n==0 fixpoint test below is unaffected.)
+        if (!is_first) {
+          for (U64 q = run0; q < r; q += 1) {
+            U32 ci = mem[first + q];
+            stage_ci[stage_n] = ci; stage_col[stage_n] = run_color; stage_n += 1;
+            split_mem[split_n++] = ci;
+          }
         }
         run0 = r;
       }
@@ -4348,7 +4531,8 @@ lnk_icf_worklist_refine(TP_Context *tp, Arena *arena, U64 cand_count, LNK_ICFCan
       U32 rslot = ns_slot[s];
       if (rslot == max_U32) { rslot = (U32)slot_n; slot_n += 1; }
       slot_first[rslot] = ns_first[s]; slot_count[rslot] = ns_count[s]; slot_color[rslot] = ns_color[s];
-      lnk_icf_map_put(&slot_of_color, (U64)ns_color[s], rslot + 1);
+      // no map registration: slot_color[] itself is the lookup structure (fresh ids append in
+      // strictly ascending order; parent-reuse keeps its color), see lnk_icf_wl_slot_from_color.
     }
     for EachIndex(i, stage_n) { colors[stage_ci[i]] = stage_col[i]; }
 
@@ -4358,7 +4542,7 @@ lnk_icf_worklist_refine(TP_Context *tp, Arena *arena, U64 cand_count, LNK_ICFCan
       U32 mem_ci = split_mem[i];
       for (U32 e = rev_off[mem_ci]; e < rev_off[mem_ci + 1]; e += 1) {
         U32 ref = rev_adj[e];
-        U64 sc  = lnk_icf_map_get(&slot_of_color, (U64)colors[ref], 0);
+        U64 sc  = lnk_icf_wl_slot_from_color(slot_color, slot_n, colors[ref]);
         if (sc) {
           U32 rslot = (U32)(sc - 1);
           if (slot_count[rslot] >= 2 && !in_dirty[rslot]) { in_dirty[rslot] = 1; next_dirty[next_n++] = rslot; }
@@ -4524,6 +4708,13 @@ lnk_opt_icf(TP_Context *tp, Arena *perm, LNK_SymbolTable *symtab, LNK_Config *co
     rs.chunk_max = push_array_no_zero(arena, U64, ((W > 3 ? W : 3) ? (W > 3 ? W : 3) : 1) * LNK_ICF_CL_STRIDE_U64);
     rs.refine_ranges = push_array_no_zero(arena, Rng1U64, W + 1);
     rs.work_ranges   = push_array_no_zero(arena, Rng1U64, W + 1);
+    // final-round handoff exports for the worklist tail (see LNK_ICFRegion decls): pre-scatter colors
+    // (dirty-seed class runs), post-round colors by pre-round position (seed scan), and post-round
+    // colors by survivor slot (worklist initial slot grouping). All written parallel inside the
+    // region on its final round only; all are read-only hints that never change the partition.
+    rs.final_oldcol  = push_array_no_zero(arena, U32, active_count ? active_count : 1);
+    rs.final_newcol  = push_array_no_zero(arena, U32, active_count ? active_count : 1);
+    rs.final_survcol = push_array_no_zero(arena, U32, active_count ? active_count : 1);
 
     rs.active_count       = active_count;
     rs.active_class_count = active_class_count;
@@ -4560,6 +4751,9 @@ lnk_opt_icf(TP_Context *tp, Arena *perm, LNK_SymbolTable *symtab, LNK_Config *co
       ref.active_count = active_count; ref.active_class_count = active_class_count;
       ref.color_base = color_base; ref.converged = 0;
       ref.max_rounds = 64;             // uncapped (true fixpoint)
+      ref.final_oldcol = 0;            // reference run must not clobber the real run's seed snapshot
+      ref.final_newcol = 0;
+      ref.final_survcol = 0;
       tp_for_parallel_reserve(tp, 0, tp->worker_count, lnk_icf_refine_region_task, &ref); // BARRIER pass (path B)
     }
     // colors[] was untouched (ref ran on ref_colors); active/active2 untouched (ref used clones).
@@ -4583,14 +4777,59 @@ lnk_opt_icf(TP_Context *tp, Arena *perm, LNK_SymbolTable *symtab, LNK_Config *co
 
     // hand off the tail to the dirty-class worklist if the region stopped at the cap (not yet converged)
     if (!rs.converged && active_count > 0) {
+      U64 tail_begin_us = now_time_us();
+      // PRE-final-round active set: the final round swapped, so rs.active2 holds the round's INPUT
+      // active list (untouched since) and rs.round_n its count. The reverse index is built over THIS
+      // set: it is a superset of the handoff active set (adds exactly the members the final round
+      // singletonized), and the dirty seed needs referrer rows for those dropped members too -- their
+      // color DID change in the final round, so their referrers must still be re-keyed once. Extra
+      // rows beyond that are only ever read via split_mem/seed_mem (never for inactive members) or
+      // dropped at the slot_of_color lookup, so a superset index changes nothing else.
+      U32 *active_prev = rs.active2;
+      U64  n_prev      = rs.round_n;
       U32 *rev_off = 0, *rev_adj = 0;
-      lnk_icf_build_reverse_index(arena, cand_count, cands, rt_iscand, rt_target, active, active_count, &rev_off, &rev_adj);
+      lnk_icf_build_reverse_index(tp, arena, cand_count, cands, rt_iscand, rt_target, active_prev, n_prev, &rev_off, &rev_adj);
+      U64 revidx_end_us = now_time_us();
+
+      // SEED: members of the classes that SPLIT in the region's final round. active_prev is grouped by
+      // pre-round color (region emit order), so the pre-round classes are exactly the equal-value runs
+      // of final_oldcol[]; a class split iff its members' POST-round colors (already committed in
+      // colors[]) are not all equal. Only these members changed color in the final round, so only
+      // their referrers can possibly split next -- the identical recurrence the worklist applies
+      // between its own rounds, just fed with the region's last round instead of a worklist round.
+      U32 *seed_mem = push_array_no_zero(arena, U32, n_prev ? n_prev : 1);
+      U64  seed_n   = 0;
+      for (U64 a = 0; a < n_prev; ) {
+        U32 oc  = rs.final_oldcol[a];
+        U32 nc0 = rs.final_newcol[a]; // == colors[active_prev[a]], exported sequentially by the region
+        B32 split = 0;
+        U64 b = a + 1;
+        while (b < n_prev && rs.final_oldcol[b] == oc) { if (rs.final_newcol[b] != nc0) { split = 1; } b += 1; }
+        if (split) {
+          // seed only members NOT in the first member's sub-cell: excluding exactly ONE sub-cell per
+          // split class is sound -- any referrer pair that diverges through this class must differ in
+          // sub-cell distribution, so at least one of them targets a NON-excluded sub-cell and its
+          // class still gets enqueued (mirrors the worklist's own first-sub-run skip).
+          for (U64 q = a; q < b; q += 1) { if (rs.final_newcol[q] != nc0) { seed_mem[seed_n++] = active_prev[q]; } }
+        }
+        a = b;
+      }
+      U64 seed_end_us = now_time_us();
+
       U64 wrounds = 0;
       B32 wl_ok = lnk_icf_worklist_refine(tp, arena, cand_count, cands, colors, rt_iscand, rt_target,
-                                          rev_off, rev_adj, active, active_count, color_base, &wrounds);
+                                          rev_off, rev_adj, active, active_count, color_base,
+                                          rs.final_survcol, seed_mem, seed_n, &wrounds);
       AssertAlways(wl_ok); // hang-guard tripped (round cap / non-progress) -> BUG, do not ship
+      U64 tail_end_us = now_time_us();
+      lnk_log(LNK_Log_Timers, "[icf] worklist tail: revidx %.2f ms, seed %.2f ms (seed_n=%llu), refine %.2f ms, total %.2f ms (%llu rounds, active=%llu at handoff)",
+              (F64)(revidx_end_us - tail_begin_us) / 1000.0,
+              (F64)(seed_end_us - revidx_end_us) / 1000.0, seed_n,
+              (F64)(tail_end_us - seed_end_us) / 1000.0,
+              (F64)(tail_end_us - tail_begin_us) / 1000.0,
+              wrounds, active_count);
       if (lnk_get_log_status(LNK_Log_Debug)) {
-        lnk_log(LNK_Log_Debug, "/OPT:ICF worklist tail: %llu rounds (active=%llu at handoff)", wrounds, active_count);
+        lnk_log(LNK_Log_Debug, "/OPT:ICF worklist tail: %llu rounds (active=%llu at handoff, seed=%llu)", wrounds, active_count, seed_n);
       }
     }
 
