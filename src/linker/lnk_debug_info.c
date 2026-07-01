@@ -115,7 +115,7 @@ THREAD_POOL_TASK_FUNC(lnk_parse_debug_h_task)
   if (obj->debug_h_sect_idx < obj->header.section_count_no_null) {
     LNK_ObjSection section = lnk_obj_section_from_sect_idx(obj, obj->debug_h_sect_idx);
 
-    String8    raw_debug_h     = str8_substr(obj->data, section.frange);
+    String8    raw_debug_h     = lnk_obj_get_sect_data(obj, obj->debug_h_sect_idx, section.frange);
     CV_DebugH *debug_h         = &task->debug_h_arr[obj_idx];
     LLVM_GHash ghash           = {0};
     U64        ghash_read_size = str8_deserial_read_struct(raw_debug_h, 0, &ghash);
@@ -1596,14 +1596,14 @@ lnk_make_code_view_input(TP_Context *tp, TP_Arena *tp_arena, LNK_Config *config,
         LNK_ObjSection debug_t_sect = lnk_obj_section_from_sect_idx(obj, obj->debug_t_sect_idx);
         raw_debug_t_arr[obj_idx].count = 1;
         raw_debug_t_arr[obj_idx].v     = push_array(scratch.arena, String8, 1);
-        raw_debug_t_arr[obj_idx].v[0]  = str8_substr(obj->data, debug_t_sect.frange);
+        raw_debug_t_arr[obj_idx].v[0]  = lnk_obj_get_sect_data(obj, obj->debug_t_sect_idx, debug_t_sect.frange);
       }
 
       if (obj->debug_p_sect_idx < obj->header.section_count_no_null) {
         LNK_ObjSection debug_p_sect = lnk_obj_section_from_sect_idx(obj, obj->debug_p_sect_idx);
         raw_debug_p_arr[obj_idx].count = 1;
         raw_debug_p_arr[obj_idx].v     = push_array(scratch.arena, String8, 1);
-        raw_debug_p_arr[obj_idx].v[0]  = str8_substr(obj->data, debug_p_sect.frange);
+        raw_debug_p_arr[obj_idx].v[0]  = lnk_obj_get_sect_data(obj, obj->debug_p_sect_idx, debug_p_sect.frange);
       }
     }
 
