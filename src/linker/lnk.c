@@ -3025,6 +3025,42 @@ typedef struct LNK_ICFCand
   // of times; an 8B dense array keeps them cache-dense vs pulling this whole 40B struct per access.
 } LNK_ICFCand;
 
+// Gather the non-debug associative children of (obj, sn) for ICF keying/verification. A COMDAT
+// function's exception data (.pdata/.xdata, funclets) rides along as associative sections; folding
+// two functions is only legal when that data is equivalent too (link.exe refuses to fold when the
+// follower's unwind/handler info differs -- folding anyway silently drops the follower's exception
+// handler via associative death). So the ICF content key and the fold-verify must cover the whole
+// associative group, not just the candidate's own bytes/relocs.
+// Children are collected recursively (children can have children), breadth-first in
+// associated_sections list order -- that list is built serially per obj from the symbol table
+// (lnk_obj.c), so the order is a pure function of the obj bytes -> deterministic.
+// Debug/discardable/info children are SKIPPED (and not descended into): differing .debug$S/$T/$P
+// must NOT block folds (MSVC folds across debug-info differences). Cycle-guarded by the
+// linear visited scan over out[] (groups are tiny, typically 1-3 children).
+#define LNK_ICF_MAX_ASSOC 64
+internal U64
+lnk_icf_gather_assoc(LNK_Obj *obj, U32 sn, U32 *out)
+{
+  U64 n = 0, q = 0;
+  U32 cur = sn;
+  for (;;) {
+    for EachNode(an, U32Node, obj->associated_sections[cur]) {
+      U32 csn = an->data;
+      if (csn == 0 || csn > obj->header.section_count_no_null) { continue; }
+      if (csn == sn) { continue; }
+      B32 seen = 0;
+      for EachIndex(i, n) { if (out[i] == csn) { seen = 1; break; } }
+      if (seen) { continue; }
+      COFF_SectionFlags flags = obj->section_flags[csn - 1];
+      if (flags & (COFF_SectionFlag_LnkRemove | COFF_SectionFlag_LnkInfo | COFF_SectionFlag_MemDiscardable | LNK_SECTION_FLAG_DEBUG)) { continue; }
+      if (n < LNK_ICF_MAX_ASSOC) { out[n++] = csn; }
+    }
+    if (q >= n) { break; }
+    cur = out[q++];
+  }
+  return n;
+}
+
 typedef struct LNK_ICFCandMapPutTask
 {
   Rng1U64     *ranges;
@@ -3055,6 +3091,84 @@ typedef struct LNK_ICFHashTask
   U64             *rt_target;
 } LNK_ICFHashTask;
 
+// Canonicalize one reloc's target for ICF keying and write its (iscand, target) slot at rt index
+// `idx`; hashes the reloc shape (type/apply_off) and, for non-candidate targets, the canonical
+// target id into `h`. Shared by the candidate's own relocs and its associative children's relocs
+// (kids[]/kid_count = the candidate's gathered associative group, see lnk_icf_gather_assoc).
+internal void
+lnk_icf_key_reloc(LNK_ICFHashTask *task, LNK_ICFCand *c, U32 *kids, U64 kid_count,
+                  COFF_Reloc *reloc, blake3_hasher *h, U64 idx)
+{
+  blake3_hasher_update(h, &reloc->type, sizeof(reloc->type));
+  blake3_hasher_update(h, &reloc->apply_off, sizeof(reloc->apply_off));
+
+  COFF_ParsedSymbol          tp   = lnk_parsed_symbol_from_coff_symbol_idx(c->obj, reloc->isymbol);
+  COFF_SymbolValueInterpType ti   = coff_interp_from_parsed_symbol(tp);
+  LNK_ObjSymbolRef           tref = { c->obj, reloc->isymbol };
+  if (ti == COFF_SymbolValueInterp_Undefined || ti == COFF_SymbolValueInterp_Weak) {
+    LNK_ObjSymbolRef resolved = {0};
+    if (lnk_resolve_symbol(task->symtab, tref, &resolved)) {
+      tref = resolved;
+      tp   = lnk_parsed_symbol_from_coff_symbol_idx(tref.obj, tref.symbol_idx);
+      ti   = coff_interp_from_parsed_symbol(tp);
+    }
+  }
+
+  U8  iscand = 0;
+  U64 target = 0;
+  if (ti == COFF_SymbolValueInterp_Regular && tref.obj != 0) {
+    // Canonicalize a COMDAT definition to its selected leader so the SAME logical symbol keys
+    // identically regardless of which obj's local copy this reloc happens to name. Two byte-
+    // identical functions that each reference their own copy of a shared COMDAT (writable
+    // static guards, vtables, selectany globals) must otherwise get distinct per-obj keys and
+    // never fold. The symlink leader is the post-resolution canonical definition (built before
+    // ICF, read-only here), so keying by it is strictly more correct than per-obj.
+    // Keep the reloc's own target offset (tp.value): canonicalize only the SECTION IDENTITY
+    // (obj,sn) to the leader, never the offset, so distinct offsets into the same section stay
+    // distinct. The leader symbol itself always has value 0 (the symlink picks the value==0
+    // definition), but a reloc may name an interior offset.
+    LNK_Obj *kobj = tref.obj;
+    U64      ksn  = tp.section_number;
+    if (ksn >= 1 && ksn <= kobj->header.section_count_no_null &&
+        (kobj->section_flags[ksn - 1] & COFF_SectionFlag_LnkCOMDAT)) {
+      LNK_Symbol *leader = lnk_obj_get_comdat_symlink(kobj, ksn);
+      if (leader) {
+        LNK_ObjSymbolRef  lref = lnk_ref_from_symbol(leader);
+        // only section_number is needed here; skip the string-table name decode that the
+        // full lnk_parsed_from_symbol does per COMDAT reloc (millions of relocs in this phase).
+        if (lref.obj != 0) {
+          COFF_ParsedSymbol lp = lnk_parsed_symbol_from_coff_symbol_idx_no_name(lref.obj, lref.symbol_idx);
+          kobj = lref.obj; ksn = lp.section_number;
+        }
+      }
+    }
+    U64 cv = lnk_icf_map_get(task->cand_map, Compose64Bit(kobj->input_idx, ksn), 0);
+    if (cv) { iscand = 1; target = cv - 1; }
+    else {
+      // Intra-associative-group target that is NOT itself a candidate (e.g. .pdata -> its own
+      // .xdata under plain /OPT:ICF): key it by the target's ORDINAL within the group + offset,
+      // not by per-obj section identity. The child's bytes/relocs are already part of this
+      // candidate's key/verify, so the ordinal is the canonical identity; per-obj identity would
+      // make every function with unwind data key uniquely and block ALL legal folds.
+      U64 ordinal = max_U64;
+      if (kobj == c->obj) {
+        if ((U32)ksn == c->sn) { ordinal = 0; }
+        else { for EachIndex(ki, kid_count) { if (kids[ki] == (U32)ksn) { ordinal = ki + 1; break; } } }
+      }
+      if (ordinal != max_U64) { target = lnk_icf_mix(lnk_icf_mix(0x9ae16a3b2f90404full, ordinal), tp.value); }
+      else                    { target = lnk_icf_mix(Compose64Bit(kobj->input_idx, ksn), tp.value); }
+    }
+  } else {
+    U64 nh = 14695981039346656037ull;
+    for (U64 i = 0; i < tp.name.size; i += 1) { nh = lnk_icf_mix(nh, tp.name.str[i]); }
+    target = lnk_icf_mix(nh, tp.value);
+  }
+
+  task->rt_iscand[idx] = iscand;
+  task->rt_target[idx] = target;
+  if (!iscand) { blake3_hasher_update(h, &target, sizeof(target)); }
+}
+
 // per-candidate content hash + relocation-target resolution (parallel; each candidate writes
 // its own disjoint reloc slice and key0, all reads are of immutable structures)
 internal
@@ -3067,71 +3181,34 @@ THREAD_POOL_TASK_FUNC(lnk_icf_hash_task)
     COFF_RelocArray     relocs = lnk_coff_relocs_from_section_header(c->obj, header);
     String8             data   = str8_substr(c->obj->data, rng_1u64(header->foff, header->foff + header->fsize));
 
+    U32 kids[LNK_ICF_MAX_ASSOC];
+    U64 kid_count = lnk_icf_gather_assoc(c->obj, c->sn, kids);
+
     blake3_hasher h; blake3_hasher_init(&h);
     U32 flags_for_hash = c->obj->section_flags[c->sn - 1] & ~(COFF_SectionFlag_LnkCOMDAT | COFF_SectionFlag_LnkRemove);
     blake3_hasher_update(&h, &flags_for_hash, sizeof(flags_for_hash));
     blake3_hasher_update(&h, &header->fsize, sizeof(header->fsize));
     blake3_hasher_update(&h, data.str, data.size);
 
-    for EachIndex(ri, relocs.count) {
-      COFF_Reloc *reloc = &relocs.v[ri];
-      blake3_hasher_update(&h, &reloc->type, sizeof(reloc->type));
-      blake3_hasher_update(&h, &reloc->apply_off, sizeof(reloc->apply_off));
+    U64 idx = c->reloc_first;
+    for EachIndex(ri, relocs.count) { lnk_icf_key_reloc(task, c, kids, kid_count, &relocs.v[ri], &h, idx); idx += 1; }
 
-      COFF_ParsedSymbol          tp   = lnk_parsed_symbol_from_coff_symbol_idx(c->obj, reloc->isymbol);
-      COFF_SymbolValueInterpType ti   = coff_interp_from_parsed_symbol(tp);
-      LNK_ObjSymbolRef           tref = { c->obj, reloc->isymbol };
-      if (ti == COFF_SymbolValueInterp_Undefined || ti == COFF_SymbolValueInterp_Weak) {
-        LNK_ObjSymbolRef resolved = {0};
-        if (lnk_resolve_symbol(task->symtab, tref, &resolved)) {
-          tref = resolved;
-          tp   = lnk_parsed_symbol_from_coff_symbol_idx(tref.obj, tref.symbol_idx);
-          ti   = coff_interp_from_parsed_symbol(tp);
-        }
-      }
-
-      U8  iscand = 0;
-      U64 target = 0;
-      if (ti == COFF_SymbolValueInterp_Regular && tref.obj != 0) {
-        // Canonicalize a COMDAT definition to its selected leader so the SAME logical symbol keys
-        // identically regardless of which obj's local copy this reloc happens to name. Two byte-
-        // identical functions that each reference their own copy of a shared COMDAT (writable
-        // static guards, vtables, selectany globals) must otherwise get distinct per-obj keys and
-        // never fold. The symlink leader is the post-resolution canonical definition (built before
-        // ICF, read-only here), so keying by it is strictly more correct than per-obj.
-        // Keep the reloc's own target offset (tp.value): canonicalize only the SECTION IDENTITY
-        // (obj,sn) to the leader, never the offset, so distinct offsets into the same section stay
-        // distinct. The leader symbol itself always has value 0 (the symlink picks the value==0
-        // definition), but a reloc may name an interior offset.
-        LNK_Obj *kobj = tref.obj;
-        U64      ksn  = tp.section_number;
-        if (ksn >= 1 && ksn <= kobj->header.section_count_no_null &&
-            (kobj->section_flags[ksn - 1] & COFF_SectionFlag_LnkCOMDAT)) {
-          LNK_Symbol *leader = lnk_obj_get_comdat_symlink(kobj, ksn);
-          if (leader) {
-            LNK_ObjSymbolRef  lref = lnk_ref_from_symbol(leader);
-            // only section_number is needed here; skip the string-table name decode that the
-            // full lnk_parsed_from_symbol does per COMDAT reloc (millions of relocs in this phase).
-            if (lref.obj != 0) {
-              COFF_ParsedSymbol lp = lnk_parsed_symbol_from_coff_symbol_idx_no_name(lref.obj, lref.symbol_idx);
-              kobj = lref.obj; ksn = lp.section_number;
-            }
-          }
-        }
-        U64 cv = lnk_icf_map_get(task->cand_map, Compose64Bit(kobj->input_idx, ksn), 0);
-        if (cv) { iscand = 1; target = cv - 1; }
-        else    { target = lnk_icf_mix(Compose64Bit(kobj->input_idx, ksn), tp.value); }
-      } else {
-        U64 nh = 14695981039346656037ull;
-        for (U64 i = 0; i < tp.name.size; i += 1) { nh = lnk_icf_mix(nh, tp.name.str[i]); }
-        target = lnk_icf_mix(nh, tp.value);
-      }
-
-      U64 idx = (U64)c->reloc_first + ri;
-      task->rt_iscand[idx] = iscand;
-      task->rt_target[idx] = target;
-      if (!iscand) { blake3_hasher_update(&h, &target, sizeof(target)); }
+    // associative children (.pdata/.xdata/funclets): hash their content and append their relocs
+    // into this candidate's rt slice, so unwind/handler differences split classes (a handler-RVA
+    // reloc difference splits via the refine loop; a scope-table byte difference splits key0).
+    // Deterministic order = lnk_icf_gather_assoc order. Slice sizing matches lnk_icf_fill_task,
+    // which counts the same children with the same helper.
+    for EachIndex(ki, kid_count) {
+      COFF_SectionHeader *kheader = lnk_coff_section_header_from_section_number(c->obj, kids[ki]);
+      COFF_RelocArray     krelocs = lnk_coff_relocs_from_section_header(c->obj, kheader);
+      String8             kdata   = str8_substr(c->obj->data, rng_1u64(kheader->foff, kheader->foff + kheader->fsize));
+      U32 kflags = c->obj->section_flags[kids[ki] - 1] & ~(COFF_SectionFlag_LnkCOMDAT | COFF_SectionFlag_LnkRemove);
+      blake3_hasher_update(&h, &kflags, sizeof(kflags));
+      blake3_hasher_update(&h, &kheader->fsize, sizeof(kheader->fsize));
+      blake3_hasher_update(&h, kdata.str, kdata.size);
+      for EachIndex(ri, krelocs.count) { lnk_icf_key_reloc(task, c, kids, kid_count, &krelocs.v[ri], &h, idx); idx += 1; }
     }
+    Assert(idx == (U64)c->reloc_first + c->reloc_count);
 
     U8 out[16]; blake3_hasher_finalize(&h, out, sizeof(out));
     U64 lo = *(U64 *)&out[0], hi = *(U64 *)&out[8];
@@ -3782,6 +3859,15 @@ THREAD_POOL_TASK_FUNC(lnk_icf_fill_task)
       COFF_SectionHeader *header = lnk_coff_section_header_from_section_number(obj, c->sn);
       c->reloc_first = 0;
       c->reloc_count = (U32)lnk_coff_relocs_from_section_header(obj, header).count;
+      // + the associative children's relocs (.pdata/.xdata/funclets): lnk_icf_hash_task appends
+      // them to this candidate's rt slice so unwind/handler differences block folds; reserve the
+      // slots here. Same helper + same order as the hash task -> counts always agree.
+      U32 kids[LNK_ICF_MAX_ASSOC];
+      U64 kid_count = lnk_icf_gather_assoc(obj, c->sn, kids);
+      for EachIndex(ki, kid_count) {
+        COFF_SectionHeader *kheader = lnk_coff_section_header_from_section_number(obj, kids[ki]);
+        c->reloc_count += (U32)lnk_coff_relocs_from_section_header(obj, kheader).count;
+      }
       c->key0 = 0;
     }
   }
@@ -3945,15 +4031,38 @@ THREAD_POOL_TASK_FUNC(lnk_icf_fold_verify_task)
     LNK_ICFCand        *L       = &task->cands[task->sci[leader_oi]];
     COFF_SectionHeader *Lheader = lnk_coff_section_header_from_section_number(L->obj, L->sn);
     String8             Ldata   = str8_substr(L->obj->data, rng_1u64(Lheader->foff, Lheader->foff + Lheader->fsize));
+    U32                 Lkids[LNK_ICF_MAX_ASSOC];
+    U64                 Lkid_count = lnk_icf_gather_assoc(L->obj, L->sn, Lkids);
 
     for (U64 k = i; k < j; k += 1) {
       if (k == leader_oi) { continue; }
       LNK_ICFCand        *F       = &task->cands[task->sci[k]];
       COFF_SectionHeader *Fheader = lnk_coff_section_header_from_section_number(F->obj, F->sn);
       if (Fheader->fsize != Lheader->fsize) { continue; }
-      if (F->reloc_count != L->reloc_count) { continue; }
+      if (F->reloc_count != L->reloc_count) { continue; } // total incl. associative children
       String8 Fdata = str8_substr(F->obj->data, rng_1u64(Fheader->foff, Fheader->foff + Fheader->fsize));
       if (!str8_match(Ldata, Fdata, 0)) { continue; }
+      // associative-group compare (unwind/handler data): identical code must NOT fold when the
+      // .pdata/.xdata group differs (link.exe refuses too -- folding would drop the follower's
+      // exception handler). Byte-compare child structure here; child reloc TARGETS are class-
+      // compared below via the appended rt slice. The per-child reloc-count check also keeps that
+      // slice pairwise-aligned child by child.
+      U32 Fkids[LNK_ICF_MAX_ASSOC];
+      U64 Fkid_count = lnk_icf_gather_assoc(F->obj, F->sn, Fkids);
+      if (Fkid_count != Lkid_count) { continue; }
+      B32 kids_match = 1;
+      for EachIndex(ki, Lkid_count) {
+        COFF_SectionHeader *lk  = lnk_coff_section_header_from_section_number(L->obj, Lkids[ki]);
+        COFF_SectionHeader *fk  = lnk_coff_section_header_from_section_number(F->obj, Fkids[ki]);
+        U32                 lkf = L->obj->section_flags[Lkids[ki] - 1] & ~(COFF_SectionFlag_LnkCOMDAT | COFF_SectionFlag_LnkRemove);
+        U32                 fkf = F->obj->section_flags[Fkids[ki] - 1] & ~(COFF_SectionFlag_LnkCOMDAT | COFF_SectionFlag_LnkRemove);
+        if (lkf != fkf || lk->fsize != fk->fsize) { kids_match = 0; break; }
+        if (lnk_coff_relocs_from_section_header(L->obj, lk).count != lnk_coff_relocs_from_section_header(F->obj, fk).count) { kids_match = 0; break; }
+        String8 lkd = str8_substr(L->obj->data, rng_1u64(lk->foff, lk->foff + lk->fsize));
+        String8 fkd = str8_substr(F->obj->data, rng_1u64(fk->foff, fk->foff + fk->fsize));
+        if (!str8_match(lkd, fkd, 0)) { kids_match = 0; break; }
+      }
+      if (!kids_match) { continue; }
       B32 relocs_match = 1;
       for EachIndex(t, L->reloc_count) {
         U64 li = L->reloc_first + t, fi = F->reloc_first + t;
