@@ -708,6 +708,18 @@ lnk_parsed_symbol_from_coff_symbol_idx(LNK_Obj *obj, U64 symbol_idx)
   return result;
 }
 
+// Fetch section bytes for a section of an obj. Debug sections that were reloc-patched have a
+// private post-fixup copy (made in lnk_obj_reloc_patcher so relocs never dirty the copy-on-write
+// input mapping); prefer that copy, otherwise read straight out of the mapped input.
+internal String8
+lnk_obj_get_sect_data(LNK_Obj *obj, U64 sect_idx, Rng1U64 frange)
+{
+  if (obj->sect_data_copies != 0 && obj->sect_data_copies[sect_idx].size != 0) {
+    return obj->sect_data_copies[sect_idx];
+  }
+  return str8_substr(obj->data, frange);
+}
+
 internal
 THREAD_POOL_TASK_FUNC(lnk_collect_obj_chunks_task)
 {
@@ -723,7 +735,7 @@ THREAD_POOL_TASK_FUNC(lnk_collect_obj_chunks_task)
 
     String8 section_name = lnk_obj_section_name_from_sect_idx(obj, sect_idx);
     if (str8_match(section_name, task->name, 0)) {
-      String8 section_data = str8_substr(obj->data, section.frange);
+      String8 section_data = lnk_obj_get_sect_data(obj, sect_idx, section.frange);
       str8_list_push(arena, &task->out_lists[task_id], section_data);
     }
   }

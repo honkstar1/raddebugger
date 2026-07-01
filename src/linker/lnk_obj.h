@@ -58,6 +58,12 @@ typedef struct LNK_Obj
   struct LNK_LibMemberRef *link_member;
   struct LNK_ObjNode      *self;
 
+  // Private (reloc-patched) copies of .debug$* section data, indexed by sect_idx; null when the
+  // obj has no reloc-patched debug sections. Populated in lnk_obj_reloc_patcher so debug relocs
+  // never dirty the copy-on-write input mapping; debug-section readers fetch bytes through
+  // lnk_obj_get_sect_data which prefers the copy when present.
+  String8 *sect_data_copies;
+
   // type info
   U32 debug_t_sect_idx;
   U32 debug_p_sect_idx;
@@ -182,6 +188,7 @@ internal String8              lnk_obj_section_name_from_section_number(LNK_Obj *
 internal String8              lnk_obj_section_name_from_sect_idx(LNK_Obj *obj, U64 sect_idx);
 internal LNK_ObjSection       lnk_obj_section_from_sect_idx(LNK_Obj *obj, U64 sect_idx);
 internal LNK_ObjSection       lnk_obj_section_from_sect_idx_no_name(LNK_Obj *obj, U64 sect_idx);
+internal String8              lnk_obj_get_sect_data(LNK_Obj *obj, U64 sect_idx, Rng1U64 frange);
 internal LNK_ObjSection       lnk_obj_section_from_section_number(LNK_Obj *obj, U64 section_number);
 internal COFF_RelocArray      lnk_coff_relocs_from_section_header(LNK_Obj *obj, COFF_SectionHeader *section_header);
 internal String8              lnk_coff_string_table_from_obj(LNK_Obj *obj);
