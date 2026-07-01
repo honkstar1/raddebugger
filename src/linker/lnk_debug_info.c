@@ -655,7 +655,9 @@ lnk_rrt_array_from_config(Arena *arena, LNK_Config *config)
 
 typedef struct LNK_IfcMapEntry
 {
-  String8 ifc_path; // absolute .ifc path
+  String8 ifc_path;  // absolute .ifc path
+  U64     blob_slot; // resolved blob slot + 1; 0 = not yet resolved (filled by the serial
+                     // discovery replay in lnk_apply_ifc_debug_records, memoizes path lookups)
 } LNK_IfcMapEntry;
 
 // Parse the trivial /ifcMap TOML by hand:
@@ -867,30 +869,32 @@ THREAD_POOL_TASK_FUNC(lnk_ifc_set_merge_task)
   }
 }
 
-// Parallel second-pass scan: each consuming obj's .debug$T is scanned independently for 0x1522
-// (LF_IFC_RECORD) leaves. A worker (a) rewrites every 0x1522 leaf to NOTYPE in-place (per-obj
-// disjoint, safe) and (b) for each leaf that resolves to a .ifc blob leaf, emits an ordered
-// redirect record. The shared redirect hash map / ref_bits seed / redirect_count are NOT touched
-// here; the serial merge replays the per-obj records in ascending obj_idx, then ascending leaf_idx
-// (exactly the original serial order) so the hash-map push order -- and thus byte-for-byte output --
-// is identical to the serial scan. All blob/.ifc state (ifc_map_hm, ifc_path_to_blobidx, ifc_files,
-// debug_t_arr blob ranges) is read-only after pass 1, so worker reads are race-free.
-typedef struct LNK_IfcRedirectRec
+// Fused discovery+redirect scan (passes 1+2 of lnk_apply_ifc_debug_records): each consuming
+// obj's .debug$T is swept ONCE, in parallel, for 0x1522 (LF_IFC_RECORD) leaves. The worker
+// parses each record, resolves its header-unit basename against the read-only ifc_map_hm, and
+// emits one raw record per 0x1522 leaf in ascending leaf_idx order. Workers write NOTHING
+// (no NOTYPE, no discovery, no redirects): every order-sensitive effect -- .ifc first-encounter
+// slot assignment, NOTYPE rewrites, redirect hash-map push order, ref_bits seeding -- is
+// replayed SERIALLY from these records in ascending obj_idx, then ascending leaf_idx: the exact
+// order of the original serial passes, so output is byte-for-byte identical.
+typedef struct LNK_IfcRawRec
 {
-  CV_TypeIndex K;             // consuming obj's local placeholder TI
-  U64          blob_obj_idx;  // injected blob obj index
-  U64          blob_leaf_idx; // leaf inside the blob
-  U64          blob_i;        // blob slot (for ref_bits seed)
-} LNK_IfcRedirectRec;
+  U64              leaf_idx;       // 0x1522 leaf index inside the consuming obj
+  CV_TypeIndex     K;              // consuming obj's local placeholder TI
+  U32              ifc_type_index; // X: TI into the .ifc blob (base 0x1000)
+  U8               guid[16];
+  U8               hash[16];
+  LNK_IfcMapEntry *entry;          // basename -> map entry (0: invalid record or no map hit)
+  U64              blob_i_plus1;   // resolved blob slot + 1 (serial replay fills; 0 = unresolved)
+  U64              blob_leaf_idx;  // resolved leaf inside the blob (serial replay fills)
+} LNK_IfcRawRec;
 
 typedef struct LNK_IfcScanTask
 {
-  LNK_CodeViewInput  *input;
-  HashMap            *ifc_map_hm;
-  HashMap            *ifc_path_to_blobidx;
-  IFC_File           *ifc_files;
-  LNK_IfcRedirectRec **out_recs;    // per-obj ordered redirect records (allocated by task)
-  U64                *out_counts;   // per-obj record count
+  LNK_CodeViewInput *input;
+  HashMap           *ifc_map_hm; // read-only in workers
+  LNK_IfcRawRec    **out_recs;   // per-obj ordered raw records (allocated by task)
+  U64               *out_counts; // per-obj record count
 } LNK_IfcScanTask;
 
 internal
@@ -909,8 +913,8 @@ THREAD_POOL_TASK_FUNC(lnk_ifc_scan_task)
   }
   if (ifc_leaf_count == 0) { task->out_recs[obj_idx] = 0; task->out_counts[obj_idx] = 0; return; }
 
-  LNK_IfcRedirectRec *recs = push_array_no_zero(arena, LNK_IfcRedirectRec, ifc_leaf_count);
-  U64                 n    = 0;
+  LNK_IfcRawRec *recs = push_array_no_zero(arena, LNK_IfcRawRec, ifc_leaf_count);
+  U64            n    = 0;
 
   for EachIndex(leaf_idx, debug_t->count) {
     CV_LeafHeader *hdr = cv_debug_t_get_leaf_header(debug_t, leaf_idx);
@@ -919,45 +923,113 @@ THREAD_POOL_TASK_FUNC(lnk_ifc_scan_task)
     CV_Leaf       leaf = cv_debug_t_get_leaf(debug_t, leaf_idx);
     LNK_IfcRecord rec  = lnk_parse_ifc_record(leaf.data);
 
-    CV_TypeIndex K = cv_ti_from_leaf_idx(debug_t, CV_TypeIndexSource_TPI, leaf_idx);
+    LNK_IfcRawRec *r  = &recs[n++];
+    r->leaf_idx       = leaf_idx;
+    r->K              = cv_ti_from_leaf_idx(debug_t, CV_TypeIndexSource_TPI, leaf_idx);
+    r->ifc_type_index = rec.ifc_type_index;
+    r->entry          = 0;
+    r->blob_i_plus1   = 0;
+    r->blob_leaf_idx  = 0;
 
     if (rec.is_valid) {
+      MemoryCopy(r->guid, rec.guid, 16);
+      MemoryCopy(r->hash, rec.hash, 16);
       String8 base = str8_skip_last_slash(rec.header_unit_path);
       U64 bs = str8_find_needle_reverse(base, 0, str8_lit("\\"), 0);
       if (bs) { base = str8_skip(base, bs); }
-      LNK_IfcMapEntry *e = hash_map_search_string_raw(task->ifc_map_hm, base);
-      if (e) {
-        U64 *slot = hash_map_search_string_u64(task->ifc_path_to_blobidx, e->ifc_path);
-        if (slot) {
-          U64        blob_i       = *slot - 1;
-          IFC_File  *f            = &task->ifc_files[blob_i];
-          U64        blob_obj_idx = input->ifc_obj_range.min + blob_i;
-          CV_DebugT *bdt          = &input->debug_t_arr[blob_obj_idx];
-
-          B32 hash_ok = MemoryMatch(rec.guid, f->content_hash, 16) &&
-                        MemoryMatch(rec.hash, f->content_hash + 16, 16);
-
-          if (f->is_valid && hash_ok) {
-            U64 blob_leaf_idx = cv_leaf_idx_from_ti(bdt, CV_TypeIndexSource_TPI, rec.ifc_type_index);
-            if (blob_leaf_idx < bdt->count) {
-              recs[n].K             = K;
-              recs[n].blob_obj_idx  = blob_obj_idx;
-              recs[n].blob_leaf_idx = blob_leaf_idx;
-              recs[n].blob_i        = blob_i;
-              n += 1;
-            }
-          }
-        }
-      }
+      r->entry = hash_map_search_string_raw(task->ifc_map_hm, base);
     }
-
-    // exclude the placeholder leaf from output regardless: rewrite to NOTYPE.
-    // per-obj disjoint write -- safe in parallel.
-    memory_write16(MemberFromPtr(CV_LeafHeader, hdr, kind), (U16)CV_LeafKind_NOTYPE);
   }
 
   task->out_recs[obj_idx]   = recs;
   task->out_counts[obj_idx] = n;
+}
+
+// Parallel per-obj record resolution + placeholder NOTYPE (runs after discovery/read/injection,
+// when entry->blob_slot, ifc_files, and the injected blob debug_t entries are all frozen/read-only).
+// Each worker fills its own obj's raw records in place (blob_i_plus1/blob_leaf_idx), rewrites its
+// own 0x1522 leaves to NOTYPE (per-obj disjoint, constant value -- order-free), and reports the
+// resolved count + K range. The serial replay below then only pushes redirects in the original
+// (obj_idx, leaf_idx) order, so hash-map push order and all outputs stay bit-identical.
+typedef struct LNK_IfcResolveTask
+{
+  LNK_CodeViewInput *input;
+  IFC_File          *ifc_files;
+  LNK_IfcRawRec    **recs;       // per-obj raw records from the scan
+  U64               *counts;     // per-obj record count
+  U64               *res_counts; // out: per-obj resolved record count
+  U64               *k_first;    // out: first resolved K (valid when res_counts != 0)
+  U64               *k_last;     // out: last resolved K (valid when res_counts != 0)
+} LNK_IfcResolveTask;
+
+internal
+THREAD_POOL_TASK_FUNC(lnk_ifc_resolve_task)
+{
+  LNK_IfcResolveTask *task    = raw_task;
+  U64                 obj_idx = task_id;
+  LNK_CodeViewInput  *input   = task->input;
+  LNK_IfcRawRec      *recs    = task->recs[obj_idx];
+  U64                 n       = task->counts[obj_idx];
+  if (n == 0) { task->res_counts[obj_idx] = 0; return; }
+  CV_DebugT *debug_t = &input->debug_t_arr[obj_idx];
+
+  U64 res_count = 0;
+  U64 k_first = 0, k_last = 0;
+  for EachIndex(t, n) {
+    LNK_IfcRawRec *r   = &recs[t];
+    CV_LeafHeader *hdr = cv_debug_t_get_leaf_header(debug_t, r->leaf_idx);
+    // exclude the placeholder leaf from output regardless: rewrite to NOTYPE
+    memory_write16(MemberFromPtr(CV_LeafHeader, hdr, kind), (U16)CV_LeafKind_NOTYPE);
+    if (r->entry == 0 || r->entry->blob_slot == 0) { continue; }
+    U64       blob_i = r->entry->blob_slot - 1;
+    IFC_File *f      = &task->ifc_files[blob_i];
+    B32 hash_ok = MemoryMatch(r->guid, f->content_hash, 16) &&
+                  MemoryMatch(r->hash, f->content_hash + 16, 16);
+    if (!f->is_valid || !hash_ok) { continue; }
+    CV_DebugT *bdt = &input->debug_t_arr[input->ifc_obj_range.min + blob_i];
+    U64 blob_leaf_idx = cv_leaf_idx_from_ti(bdt, CV_TypeIndexSource_TPI, r->ifc_type_index);
+    if (blob_leaf_idx >= bdt->count) { continue; }
+    r->blob_i_plus1  = blob_i + 1;
+    r->blob_leaf_idx = blob_leaf_idx;
+    if (res_count == 0) { k_first = r->K; }
+    k_last     = r->K;
+    res_count += 1;
+  }
+  task->res_counts[obj_idx] = res_count;
+  task->k_first[obj_idx]    = k_first;
+  task->k_last[obj_idx]     = k_last;
+}
+
+// Parallel .ifc read + `.msvc.trait.debug-records` parse into PRE-ASSIGNED slots. Slot order
+// (== blob obj order == output order) is fixed by the serial discovery replay before any file
+// is read, so going wide here cannot reorder anything. Workers do not call lnk_error: read
+// failures are collected per slot and reported serially in slot order afterward (identical
+// message order to the old serial read; LNK_Error_Cmdl stops the link either way). Worker-arena
+// allocations (file bytes + leaf offsets) are long-lived, same as the parallel .debug$T parse
+// (lnk_parse_debug_t_task pattern).
+typedef struct LNK_IfcReadTask
+{
+  String8   *paths;        // per-slot .ifc path
+  IFC_File  *ifc_files;    // per-slot output
+  CV_DebugT *blob_debug_t; // per-slot output
+  String8   *errors;       // per-slot read error (size 0 = ok)
+} LNK_IfcReadTask;
+
+internal
+THREAD_POOL_TASK_FUNC(lnk_ifc_read_task)
+{
+  LNK_IfcReadTask *task = raw_task;
+  U64              slot = task_id;
+  String8          err  = {0};
+  IFC_File         f    = ifc_file_read(arena, task->paths[slot], &err);
+  task->ifc_files[slot] = f;
+  task->errors[slot]    = err;
+  if (f.is_valid) {
+    // parse the raw CV leaf stream (no signature, TI base 0x1000)
+    task->blob_debug_t[slot] = cv_debug_t_from_data(arena, f.debug_records, 1);
+  } else {
+    MemoryZeroStruct(&task->blob_debug_t[slot]);
+  }
 }
 
 typedef struct LNK_IfcCloseTask
@@ -1048,61 +1120,73 @@ internal void
 lnk_apply_ifc_debug_records(TP_Context *tp, TP_Arena *tp_arena, LNK_CodeViewInput *input, LNK_Config *config)
 {
   ProfBeginFunction();
+  U64 apply_begin_us = now_time_us();
   Temp scratch = scratch_begin(&tp_arena->v[0], 1);
   Arena *arena = tp_arena->v[0];
 
   // basename -> .ifc path
   HashMap ifc_map_hm = lnk_build_ifc_map(scratch.arena, config);
+  U64 discover_begin_us = now_time_us();
 
-  // first pass: discover which .ifc files are actually referenced and by which records.
-  // de-dup .ifc reads by path; parse blob to a CV_DebugT once per .ifc.
+  // --- fused scan (old passes 1+2, parallel): ONE sweep of every consuming obj's .debug$T
+  // emits per-obj raw 0x1522 records in ascending leaf_idx order (record parse + basename ->
+  // ifc_map_hm entry resolution happen in the workers; nothing is written). Every
+  // order-sensitive effect is replayed serially from these records below. ---
+  LNK_IfcScanTask scan = {0};
+  scan.input      = input;
+  scan.ifc_map_hm = &ifc_map_hm;
+  scan.out_recs   = push_array(scratch.arena, LNK_IfcRawRec *, input->obj_count);
+  scan.out_counts = push_array(scratch.arena, U64,             input->obj_count);
+  tp_for_parallel(tp, tp_arena, input->obj_count, lnk_ifc_scan_task, &scan);
+  U64 scan_end_us = now_time_us();
+  lnk_log(LNK_Log_Timers, "[IFC] parallel scan in %.2f ms", (F64)(scan_end_us - discover_begin_us) / 1000.0);
+
+  // --- serial discovery replay: assign .ifc blob slots in first-encounter order (ascending
+  // obj_idx, then ascending leaf_idx -- identical to the old serial pass) WITHOUT reading any
+  // file, so the reads can go wide below. De-dup by path; entry->blob_slot memoizes the path
+  // lookup. 256-slot cap semantics preserved: on overflow the entry stays unresolved and its
+  // records never redirect. ---
   HashMap   ifc_path_to_blobidx = {0}; // path -> (blob slot index + 1)
   IFC_File *ifc_files           = push_array(scratch.arena, IFC_File, 256);
   U64       ifc_file_count      = 0;
   CV_DebugT blob_debug_t[256]   = {0};
-
-  // scan all consuming objs for 0x1522 leaves; collect the .ifc paths needed
+  String8   slot_paths[256]     = {0};
   for EachIndex(obj_idx, input->obj_count) {
-    CV_DebugT *debug_t = &input->debug_t_arr[obj_idx];
-    for EachIndex(leaf_idx, debug_t->count) {
-      CV_LeafHeader *hdr = cv_debug_t_get_leaf_header(debug_t, leaf_idx);
-      if (hdr->kind != 0x1522) { continue; }
-
-      CV_Leaf       leaf = cv_debug_t_get_leaf(debug_t, leaf_idx);
-      LNK_IfcRecord rec  = lnk_parse_ifc_record(leaf.data);
-      if (!rec.is_valid) { continue; }
-
-      String8 base = str8_skip_last_slash(rec.header_unit_path);
-      U64 bs = str8_find_needle_reverse(base, 0, str8_lit("\\"), 0);
-      if (bs) { base = str8_skip(base, bs); }
-
-      LNK_IfcMapEntry *e = hash_map_search_string_raw(&ifc_map_hm, base);
-      if (e == 0) { continue; }
-
-      if (hash_map_search_string_u64(&ifc_path_to_blobidx, e->ifc_path) == 0) {
+    LNK_IfcRawRec *recs = scan.out_recs[obj_idx];
+    U64            n    = scan.out_counts[obj_idx];
+    for EachIndex(t, n) {
+      LNK_IfcMapEntry *e = recs[t].entry;
+      if (e == 0 || e->blob_slot) { continue; }
+      U64 *slot = hash_map_search_string_u64(&ifc_path_to_blobidx, e->ifc_path);
+      if (slot == 0) {
         if (ifc_file_count >= 256) { continue; }
-        String8  err = {0};
-        IFC_File f   = ifc_file_read(arena, e->ifc_path, &err);
-        if (!f.is_valid) {
-          lnk_error(LNK_Error_Cmdl, "/ifcDebugRecords: %S", err);
-          // still reserve a slot so we don't retry
-          hash_map_push_string_u64(scratch.arena, &ifc_path_to_blobidx, e->ifc_path, ifc_file_count + 1);
-          ifc_files[ifc_file_count] = f;
-          blob_debug_t[ifc_file_count] = (CV_DebugT){0};
-          ifc_file_count += 1;
-          continue;
-        }
-        // parse the raw CV leaf stream (no signature, TI base 0x1000)
-        CV_DebugT dt = cv_debug_t_from_data(arena, f.debug_records, 1);
         hash_map_push_string_u64(scratch.arena, &ifc_path_to_blobidx, e->ifc_path, ifc_file_count + 1);
-        ifc_files[ifc_file_count]    = f;
-        blob_debug_t[ifc_file_count] = dt;
+        slot_paths[ifc_file_count] = e->ifc_path;
         ifc_file_count += 1;
+        slot = hash_map_search_string_u64(&ifc_path_to_blobidx, e->ifc_path);
       }
+      e->blob_slot = *slot;
     }
   }
 
   if (ifc_file_count == 0) { goto done; }
+  U64 discover_end_us = now_time_us();
+  lnk_log(LNK_Log_Timers, "[IFC] discover replay in %.2f ms", (F64)(discover_end_us - scan_end_us) / 1000.0);
+
+  // --- parallel .ifc read + debug-records parse into the pre-assigned slots; report read
+  // errors serially in slot order (identical message order to the old serial read). ---
+  {
+    LNK_IfcReadTask read = {0};
+    read.paths        = slot_paths;
+    read.ifc_files    = ifc_files;
+    read.blob_debug_t = blob_debug_t;
+    read.errors       = push_array(scratch.arena, String8, ifc_file_count);
+    tp_for_parallel(tp, tp_arena, ifc_file_count, lnk_ifc_read_task, &read);
+    for EachIndex(i, ifc_file_count) {
+      if (!ifc_files[i].is_valid) { lnk_error(LNK_Error_Cmdl, "/ifcDebugRecords: %S", read.errors[i]); }
+    }
+    lnk_log(LNK_Log_Timers, "[IFC] read+parse %llu blob(s) in %.2f ms", ifc_file_count, (F64)(now_time_us() - discover_end_us) / 1000.0);
+  }
 
   // --- inject blob objs into the parallel arrays (like type servers, but in ifc_obj_range) ---
   U64 prev_count = input->count;
@@ -1151,56 +1235,63 @@ lnk_apply_ifc_debug_records(TP_Context *tp, TP_Arena *tp_arena, LNK_CodeViewInpu
     ref_bits[i] = push_array(scratch.arena, U8, (c + 7) / 8); // zero-init -> nothing referenced yet
   }
 
-  // --- second pass: register redirects + NOTYPE the 0x1522 leaves + seed closure roots ---
-  // Parallel per-obj scan (the ~1.86s serial hotspot): each worker NOTYPE-rewrites its own 0x1522
-  // leaves and emits an ordered list of resolved redirects. A serial merge then replays them in
-  // ascending obj_idx, then ascending leaf_idx -- the exact original serial order -- so the redirect
-  // hash-map push order, ref_bits seeding, and redirect_count are bit-for-bit identical to serial.
+  // --- parallel record resolution + placeholder NOTYPE: per-obj disjoint, order-free (see
+  // lnk_ifc_resolve_task). All inputs (entry->blob_slot, ifc_files, blob debug_t) are frozen
+  // after the discovery/read/injection steps above. ---
   input->has_ifc_redirects   = 1;
   input->ifc_redirect_bits   = push_array(arena, U64 *,   input->count);
   input->ifc_redirect_ti_rng = push_array(arena, Rng1U64, input->count);
-  U64 redirect_count = 0;
-  {
-    LNK_IfcScanTask scan      = {0};
-    scan.input                = input;
-    scan.ifc_map_hm           = &ifc_map_hm;
-    scan.ifc_path_to_blobidx  = &ifc_path_to_blobidx;
-    scan.ifc_files            = ifc_files;
-    scan.out_recs             = push_array(scratch.arena, LNK_IfcRedirectRec *, input->obj_count);
-    scan.out_counts           = push_array(scratch.arena, U64,                  input->obj_count);
-    tp_for_parallel(tp, tp_arena, input->obj_count, lnk_ifc_scan_task, &scan);
+  U64 redirect_count  = 0;
+  U64 resolve_begin_us = now_time_us();
+  LNK_IfcResolveTask resolve = {0};
+  resolve.input      = input;
+  resolve.ifc_files  = ifc_files;
+  resolve.recs       = scan.out_recs;
+  resolve.counts     = scan.out_counts;
+  resolve.res_counts = push_array(scratch.arena, U64, input->obj_count);
+  resolve.k_first    = push_array(scratch.arena, U64, input->obj_count);
+  resolve.k_last     = push_array(scratch.arena, U64, input->obj_count);
+  tp_for_parallel(tp, 0, input->obj_count, lnk_ifc_resolve_task, &resolve);
+  lnk_log(LNK_Log_Timers, "[IFC] parallel resolve in %.2f ms", (F64)(now_time_us() - resolve_begin_us) / 1000.0);
 
-    // deterministic ordered merge: ascending obj_idx, and within an obj the records are already in
-    // ascending leaf_idx order (the worker scans leaf_idx ascending).
-    for EachIndex(obj_idx, input->obj_count) {
-      LNK_IfcRedirectRec *recs = scan.out_recs[obj_idx];
-      U64                 n    = scan.out_counts[obj_idx];
-      if (n) {
-        // exact key filter: records are K-ascending (worker scans leaf_idx ascending and
-        // cv_ti_from_leaf_idx is monotonic), so [recs[0].K, recs[n-1].K] spans all keys.
-        Rng1U64 krng = r1u64(recs[0].K, (U64)recs[n-1].K + 1);
-        input->ifc_redirect_ti_rng[obj_idx] = krng;
-        input->ifc_redirect_bits[obj_idx]   = push_array(arena, U64, (dim_1u64(krng) + 63) / 64);
-      }
-      for EachIndex(t, n) {
-        LNK_IfcRedirectRec *r = &recs[t];
-        hash_map_push_u64_u64(arena, &input->ifc_redirect_hm,
-                              Compose64Bit(obj_idx, r->K),
-                              Compose64Bit(r->blob_obj_idx, r->blob_leaf_idx));
-        U64 rel = r->K - input->ifc_redirect_ti_rng[obj_idx].min;
-        input->ifc_redirect_bits[obj_idx][rel >> 6] |= (1ull << (rel & 63));
-        redirect_count += 1;
-        // seed closure root: this blob leaf is referenced
-        ref_bits[r->blob_i][r->blob_leaf_idx >> 3] |= (U8)(1u << (r->blob_leaf_idx & 7));
-      }
+  // --- serial redirect replay: push redirects in ascending obj_idx, then ascending leaf_idx --
+  // the exact original serial order -- so the redirect hash-map push order, ref_bits seeding,
+  // and redirect_count are bit-for-bit identical to the serial code.
+  U64 merge_begin_us = now_time_us();
+  for EachIndex(obj_idx, input->obj_count) {
+    LNK_IfcRawRec *recs = scan.out_recs[obj_idx];
+    U64            n    = scan.out_counts[obj_idx];
+    if (n == 0 || resolve.res_counts[obj_idx] == 0) { continue; }
+
+    // exact key filter range: records are K-ascending (the scan emits leaf_idx ascending and
+    // cv_ti_from_leaf_idx is monotonic), so [k_first, k_last] spans all resolved keys.
+    Rng1U64 krng = r1u64(resolve.k_first[obj_idx], resolve.k_last[obj_idx] + 1);
+    input->ifc_redirect_ti_rng[obj_idx] = krng;
+    input->ifc_redirect_bits[obj_idx]   = push_array(arena, U64, (dim_1u64(krng) + 63) / 64);
+    for EachIndex(t, n) {
+      LNK_IfcRawRec *r = &recs[t];
+      if (r->blob_i_plus1 == 0) { continue; }
+      U64 blob_i       = r->blob_i_plus1 - 1;
+      U64 blob_obj_idx = input->ifc_obj_range.min + blob_i;
+      hash_map_push_u64_u64(arena, &input->ifc_redirect_hm,
+                            Compose64Bit(obj_idx, r->K),
+                            Compose64Bit(blob_obj_idx, r->blob_leaf_idx));
+      U64 rel = r->K - krng.min;
+      input->ifc_redirect_bits[obj_idx][rel >> 6] |= (1ull << (rel & 63));
+      redirect_count += 1;
+      // seed closure root: this blob leaf is referenced
+      ref_bits[blob_i][r->blob_leaf_idx >> 3] |= (U8)(1u << (r->blob_leaf_idx & 7));
     }
   }
+
+  lnk_log(LNK_Log_Timers, "[IFC] redirect replay in %.2f ms", (F64)(now_time_us() - merge_begin_us) / 1000.0);
 
   // --- third pass: per blob, close the referenced set over blob-internal sub-TIs, then
   // NOTYPE every leaf not in the closure. cv_leaf_idx_from_ti on a raw blob is source-agnostic
   // (source_offsets are 0, all ti_ranges == [0x1000, 0x1000+count)) so a sub-TI maps directly to
   // leaf_idx = ti - 0x1000 regardless of its CV_TypeIndexSource label. Walk is iterative (worklist).
   U64 total_blob_leaves = 0, total_closure_leaves = 0;
+  U64 closure_begin_us  = now_time_us();
   for EachIndex(blob_i, ifc_file_count) {
     total_blob_leaves += input->debug_t_arr[input->ifc_obj_range.min + blob_i].count;
   }
@@ -1246,6 +1337,7 @@ lnk_apply_ifc_debug_records(TP_Context *tp, TP_Arena *tp_arena, LNK_CodeViewInpu
     for EachIndex(blob_i, ifc_file_count) { total_closure_leaves += close_task.closure_leaves[blob_i]; }
   }
   (void)tp;
+  lnk_log(LNK_Log_Timers, "[IFC] closure pass in %.2f ms", (F64)(now_time_us() - closure_begin_us) / 1000.0);
 
   lnk_log(LNK_Log_Debug, "[IFC] injected %llu .ifc blob(s), %llu record redirect(s); on-demand closure %llu / %llu blob leaves (%.1f%%)",
           ifc_file_count, redirect_count, total_closure_leaves, total_blob_leaves,
@@ -1253,6 +1345,7 @@ lnk_apply_ifc_debug_records(TP_Context *tp, TP_Arena *tp_arena, LNK_CodeViewInpu
 
 done:
   scratch_end(scratch);
+  lnk_log(LNK_Log_Timers, "[IFC] apply total in %.2f ms", (F64)(now_time_us() - apply_begin_us) / 1000.0);
   ProfEnd();
 }
 
