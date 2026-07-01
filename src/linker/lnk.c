@@ -4172,69 +4172,154 @@ lnk_icf_small_sort(U64 *keys, U32 *vals, U64 n)
 // provably-redundant re-key requests (the worklist dirties CLASSES, set semantics), so it visits the
 // same dirty sets -> identical partition -> byte-identical output.
 //
-// Duplicate (C,T) edges (multiple relocs from C to the same T) are deduped: cands are iterated in
-// ascending index and each cand's relocs are drained before the next, so per-target appends arrive in
-// non-decreasing C -- a duplicate is exactly "tail of T's bucket == C" (last_ref[] in the count pass,
-// bucket-tail check in the fill pass; identical predicates under identical iteration order).
-// Filtering/dedup only removes provably-redundant re-key requests (the worklist dirties CLASSES, set
-// semantics), so it visits the same dirty sets -> identical partition -> byte-identical output.
+// PARALLEL BUILD: the old serial builder (two full scans over every active cand's relocs + a per-target
+// last_ref/cursor dedup) was the dominant serial cost of the whole worklist tail (~0.4-0.9s wall at
+// editor scale). Instead: parallel count/fill of the filtered (target, referrer) edge list over
+// reloc-weighted cand ranges (dups kept), one parallel stable radix sort by target, then a serial
+// compaction pass. Identical result:
+//   - per-target referrer order: edges are emitted in ascending referrer ci (workers own contiguous
+//     cand ranges, concatenated in order), and the radix sort is stable -> per-target ascending ci,
+//     exactly the old iteration order;
+//   - dedup: duplicate (C,T) pairs only arise within one cand's reloc list (C is unique per cand), so
+//     they are adjacent after the stable sort; dropping equal-neighbor pairs removes exactly the pairs
+//     last_ref/cursor dropped.
+typedef struct LNK_ICFRevIdxTask
+{
+  LNK_ICFCand *cands;
+  U8          *rt_iscand;
+  U64         *rt_target;
+  U8          *is_active;
+  U32         *active;
+  Rng1U64     *act_ranges;  // [W+1] even split over active_count (is_active scatter)
+  Rng1U64     *cand_ranges; // [W+1] reloc-weighted split over cand_count (count/fill)
+  U64         *counts;      // [W] per-worker filtered edge counts
+  U64         *offsets;     // [W] exclusive prefix of counts
+  U64         *ek;          // [edge] key: target cand idx
+  U32         *ev;          // [edge] val: referrer cand idx
+} LNK_ICFRevIdxTask;
+
+internal
+THREAD_POOL_TASK_FUNC(lnk_icf_revidx_active_task)
+{
+  LNK_ICFRevIdxTask *t = raw_task;
+  Rng1U64 r = t->act_ranges[task_id];
+  for EachInRange(i, r) { t->is_active[t->active[i]] = 1; }
+}
+
+internal
+THREAD_POOL_TASK_FUNC(lnk_icf_revidx_count_task)
+{
+  LNK_ICFRevIdxTask *t = raw_task;
+  Rng1U64 r = t->cand_ranges[task_id];
+  U64 n = 0;
+  for EachInRange(ci, r) {
+    if (!t->is_active[ci]) { continue; }
+    LNK_ICFCand *c = &t->cands[ci];
+    for EachIndex(j, c->reloc_count) {
+      U64 idx = (U64)c->reloc_first + j;
+      if (!t->rt_iscand[idx]) { continue; }
+      if (!t->is_active[t->rt_target[idx]]) { continue; }
+      n += 1;
+    }
+  }
+  t->counts[task_id] = n;
+}
+
+internal
+THREAD_POOL_TASK_FUNC(lnk_icf_revidx_fill_task)
+{
+  LNK_ICFRevIdxTask *t = raw_task;
+  Rng1U64 r = t->cand_ranges[task_id];
+  U64 out = t->offsets[task_id];
+  for EachInRange(ci, r) {
+    if (!t->is_active[ci]) { continue; }
+    LNK_ICFCand *c = &t->cands[ci];
+    for EachIndex(j, c->reloc_count) {
+      U64 idx = (U64)c->reloc_first + j;
+      if (!t->rt_iscand[idx]) { continue; }
+      U64 tg = t->rt_target[idx];
+      if (!t->is_active[tg]) { continue; }
+      t->ek[out] = tg; t->ev[out] = (U32)ci; out += 1;
+    }
+  }
+}
+
 internal void
-lnk_icf_build_reverse_index(Arena *arena, U64 cand_count, LNK_ICFCand *cands, U8 *rt_iscand, U64 *rt_target,
+lnk_icf_build_reverse_index(TP_Context *tp, Arena *arena, U64 cand_count, LNK_ICFCand *cands, U8 *rt_iscand, U64 *rt_target,
                             U32 *active, U64 active_count,
                             U32 **out_rev_off, U32 **out_rev_adj)
 {
   Temp scratch = scratch_begin(&arena, 1);
-  U8  *is_active = push_array(scratch.arena, U8, cand_count ? cand_count : 1);
-  for EachIndex(i, active_count) { is_active[active[i]] = 1; }
-  U32 *last_ref = push_array(scratch.arena, U32, cand_count ? cand_count : 1); // ci+1 of last referrer counted per target; 0 = none
+  U64 W = tp->worker_count ? tp->worker_count : 1;
+  U64 total_relocs = cand_count ? ((U64)cands[cand_count - 1].reloc_first + cands[cand_count - 1].reloc_count) : 0;
 
-  U32 *rev_off = push_array(arena, U32, cand_count + 1);
-  U64 raw_iscand = 0; // instrumentation: unfiltered edge count (old rev_adj size); debug-log only, so
-                      // it is counted in a separate debug-gated pass -- the hot count pass skips
-                      // inactive referrer rows at the CAND level (no per-reloc rt_iscand loads at all
-                      // for the ~vast majority of cands that are already inactive at handoff).
-  if (lnk_get_log_status(LNK_Log_Debug)) {
-    for EachIndex(ci, cand_count) {
-      LNK_ICFCand *c = &cands[ci];
-      for EachIndex(j, c->reloc_count) { raw_iscand += rt_iscand[(U64)c->reloc_first + j]; }
+  LNK_ICFRevIdxTask task = {0};
+  task.cands     = cands;
+  task.rt_iscand = rt_iscand;
+  task.rt_target = rt_target;
+  task.active    = active;
+  task.is_active = push_array(scratch.arena, U8, cand_count ? cand_count : 1);
+
+  // active-bit scatter (disjoint ranges; all stores are the constant 1)
+  task.act_ranges = tp_divide_work(scratch.arena, active_count, W);
+  tp_for_parallel(tp, 0, W, lnk_icf_revidx_active_task, &task);
+
+  // reloc-weighted cand ranges: split at the cand whose reloc_first crosses w/W of total_relocs
+  // (reloc_first is monotone). Splitting at cand boundaries keeps each cand's (potentially
+  // duplicated) targets inside ONE worker's contiguous, in-order output range.
+  task.cand_ranges = push_array_no_zero(scratch.arena, Rng1U64, W + 1);
+  {
+    U64 prev = 0;
+    for (U64 w = 1; w <= W; w += 1) {
+      U64 goal = (total_relocs * w) / W;
+      U64 lo = prev, hi = cand_count;
+      while (lo < hi) { U64 mid = (lo + hi) >> 1; if ((U64)cands[mid].reloc_first < goal) { lo = mid + 1; } else { hi = mid; } }
+      task.cand_ranges[w - 1] = rng_1u64(prev, lo);
+      prev = lo;
     }
+    task.cand_ranges[W - 1].max = cand_count; // last range absorbs the tail
+    task.cand_ranges[W] = rng_1u64(cand_count, cand_count);
   }
-  for EachIndex(ci, cand_count) {
-    if (!is_active[ci]) { continue; }
-    LNK_ICFCand *c = &cands[ci];
-    for EachIndex(j, c->reloc_count) {
-      U64 idx = (U64)c->reloc_first + j;
-      if (!rt_iscand[idx]) { continue; }
-      U32 tg = (U32)rt_target[idx];
-      if (!is_active[tg]) { continue; }
-      if (last_ref[tg] == (U32)ci + 1) { continue; } // duplicate (C,T)
-      last_ref[tg] = (U32)ci + 1;
-      rev_off[tg + 1] += 1;
-    }
+
+  task.counts = push_array(scratch.arena, U64, W);
+  tp_for_parallel(tp, 0, W, lnk_icf_revidx_count_task, &task);
+  task.offsets = offsets_from_counts_array_u64(scratch.arena, task.counts, W);
+  U64 edge_raw = task.offsets[W - 1] + task.counts[W - 1];
+
+  task.ek = push_array_no_zero(scratch.arena, U64, edge_raw ? edge_raw : 1);
+  task.ev = push_array_no_zero(scratch.arena, U32, edge_raw ? edge_raw : 1);
+  tp_for_parallel(tp, 0, W, lnk_icf_revidx_fill_task, &task);
+
+  // stable parallel radix sort by target (ties keep input order = ascending referrer ci)
+  lnk_radix_sort_u64_pairs(tp, scratch.arena, edge_raw, task.ek, task.ev);
+
+  // serial compaction: drop adjacent duplicate (target, referrer) pairs, count per target, emit CSR.
+  // rev_adj is written strictly sequentially (edges are sorted by target).
+  U32 *rev_off = push_array(arena, U32, cand_count + 1);
+  U64  edge_count = 0;
+  for (U64 e = 0; e < edge_raw; e += 1) {
+    if (e > 0 && task.ek[e] == task.ek[e - 1] && task.ev[e] == task.ev[e - 1]) { continue; } // duplicate (C,T)
+    rev_off[task.ek[e] + 1] += 1;
+    edge_count += 1;
   }
   for EachIndex(t, cand_count) { rev_off[t + 1] += rev_off[t]; }
-  U64 edge_count = rev_off[cand_count];
   U32 *rev_adj = push_array_no_zero(arena, U32, edge_count ? edge_count : 1);
-  U32 *cursor = push_array(scratch.arena, U32, cand_count ? cand_count : 1);
-  for EachIndex(ci, cand_count) {
-    if (!is_active[ci]) { continue; }
-    LNK_ICFCand *c = &cands[ci];
-    for EachIndex(j, c->reloc_count) {
-      U64 idx = (U64)c->reloc_first + j;
-      if (!rt_iscand[idx]) { continue; }
-      U32 tg = (U32)rt_target[idx];
-      if (!is_active[tg]) { continue; }
-      U32 n = cursor[tg];
-      if (n > 0 && rev_adj[rev_off[tg] + n - 1] == (U32)ci) { continue; } // duplicate (C,T)
-      rev_adj[rev_off[tg] + n] = (U32)ci;
-      cursor[tg] = n + 1;
+  {
+    U64 out = 0;
+    for (U64 e = 0; e < edge_raw; e += 1) {
+      if (e > 0 && task.ek[e] == task.ek[e - 1] && task.ev[e] == task.ev[e - 1]) { continue; }
+      rev_adj[out++] = task.ev[e];
     }
   }
   scratch_end(scratch);
   if (lnk_get_log_status(LNK_Log_Debug)) {
-    U64 total_relocs = cand_count ? ((U64)cands[cand_count - 1].reloc_first + cands[cand_count - 1].reloc_count) : 0;
-    lnk_log(LNK_Log_Debug, "/OPT:ICF worklist rev-index: relocs=%llu iscand=%llu kept=%llu (active-rows+dedup); rev_adj %llu -> %llu bytes",
-            total_relocs, raw_iscand, edge_count, raw_iscand * sizeof(U32), edge_count * sizeof(U32));
+    U64 raw_iscand = 0; // instrumentation: unfiltered edge count (old rev_adj size); debug-log only
+    for EachIndex(ci, cand_count) {
+      LNK_ICFCand *c = &cands[ci];
+      for EachIndex(j, c->reloc_count) { raw_iscand += rt_iscand[(U64)c->reloc_first + j]; }
+    }
+    lnk_log(LNK_Log_Debug, "/OPT:ICF worklist rev-index: relocs=%llu iscand=%llu filtered=%llu kept=%llu (active-rows+dedup); rev_adj %llu -> %llu bytes",
+            total_relocs, raw_iscand, edge_raw, edge_count, raw_iscand * sizeof(U32), edge_count * sizeof(U32));
   }
   *out_rev_off = rev_off;
   *out_rev_adj = rev_adj;
@@ -4703,7 +4788,7 @@ lnk_opt_icf(TP_Context *tp, Arena *perm, LNK_SymbolTable *symtab, LNK_Config *co
       U32 *active_prev = rs.active2;
       U64  n_prev      = rs.round_n;
       U32 *rev_off = 0, *rev_adj = 0;
-      lnk_icf_build_reverse_index(arena, cand_count, cands, rt_iscand, rt_target, active_prev, n_prev, &rev_off, &rev_adj);
+      lnk_icf_build_reverse_index(tp, arena, cand_count, cands, rt_iscand, rt_target, active_prev, n_prev, &rev_off, &rev_adj);
       U64 revidx_end_us = now_time_us();
 
       // SEED: members of the classes that SPLIT in the region's final round. active_prev is grouped by
