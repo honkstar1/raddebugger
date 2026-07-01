@@ -1048,11 +1048,13 @@ internal void
 lnk_apply_ifc_debug_records(TP_Context *tp, TP_Arena *tp_arena, LNK_CodeViewInput *input, LNK_Config *config)
 {
   ProfBeginFunction();
+  U64 apply_begin_us = now_time_us();
   Temp scratch = scratch_begin(&tp_arena->v[0], 1);
   Arena *arena = tp_arena->v[0];
 
   // basename -> .ifc path
   HashMap ifc_map_hm = lnk_build_ifc_map(scratch.arena, config);
+  U64 discover_begin_us = now_time_us();
 
   // first pass: discover which .ifc files are actually referenced and by which records.
   // de-dup .ifc reads by path; parse blob to a CV_DebugT once per .ifc.
@@ -1103,6 +1105,8 @@ lnk_apply_ifc_debug_records(TP_Context *tp, TP_Arena *tp_arena, LNK_CodeViewInpu
   }
 
   if (ifc_file_count == 0) { goto done; }
+  U64 discover_end_us = now_time_us();
+  lnk_log(LNK_Log_Timers, "[IFC] discover pass in %.2f ms", (F64)(discover_end_us - discover_begin_us) / 1000.0);
 
   // --- inject blob objs into the parallel arrays (like type servers, but in ifc_obj_range) ---
   U64 prev_count = input->count;
@@ -1160,6 +1164,7 @@ lnk_apply_ifc_debug_records(TP_Context *tp, TP_Arena *tp_arena, LNK_CodeViewInpu
   input->ifc_redirect_bits   = push_array(arena, U64 *,   input->count);
   input->ifc_redirect_ti_rng = push_array(arena, Rng1U64, input->count);
   U64 redirect_count = 0;
+  U64 scan_begin_us  = now_time_us();
   {
     LNK_IfcScanTask scan      = {0};
     scan.input                = input;
@@ -1196,11 +1201,14 @@ lnk_apply_ifc_debug_records(TP_Context *tp, TP_Arena *tp_arena, LNK_CodeViewInpu
     }
   }
 
+  lnk_log(LNK_Log_Timers, "[IFC] scan+merge pass in %.2f ms", (F64)(now_time_us() - scan_begin_us) / 1000.0);
+
   // --- third pass: per blob, close the referenced set over blob-internal sub-TIs, then
   // NOTYPE every leaf not in the closure. cv_leaf_idx_from_ti on a raw blob is source-agnostic
   // (source_offsets are 0, all ti_ranges == [0x1000, 0x1000+count)) so a sub-TI maps directly to
   // leaf_idx = ti - 0x1000 regardless of its CV_TypeIndexSource label. Walk is iterative (worklist).
   U64 total_blob_leaves = 0, total_closure_leaves = 0;
+  U64 closure_begin_us  = now_time_us();
   for EachIndex(blob_i, ifc_file_count) {
     total_blob_leaves += input->debug_t_arr[input->ifc_obj_range.min + blob_i].count;
   }
@@ -1246,6 +1254,7 @@ lnk_apply_ifc_debug_records(TP_Context *tp, TP_Arena *tp_arena, LNK_CodeViewInpu
     for EachIndex(blob_i, ifc_file_count) { total_closure_leaves += close_task.closure_leaves[blob_i]; }
   }
   (void)tp;
+  lnk_log(LNK_Log_Timers, "[IFC] closure pass in %.2f ms", (F64)(now_time_us() - closure_begin_us) / 1000.0);
 
   lnk_log(LNK_Log_Debug, "[IFC] injected %llu .ifc blob(s), %llu record redirect(s); on-demand closure %llu / %llu blob leaves (%.1f%%)",
           ifc_file_count, redirect_count, total_closure_leaves, total_blob_leaves,
@@ -1253,6 +1262,7 @@ lnk_apply_ifc_debug_records(TP_Context *tp, TP_Arena *tp_arena, LNK_CodeViewInpu
 
 done:
   scratch_end(scratch);
+  lnk_log(LNK_Log_Timers, "[IFC] apply total in %.2f ms", (F64)(now_time_us() - apply_begin_us) / 1000.0);
   ProfEnd();
 }
 
