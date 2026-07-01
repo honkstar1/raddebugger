@@ -4022,35 +4022,68 @@ lnk_icf_small_sort(U64 *keys, U32 *vals, U64 n)
   }
 }
 
+// The index is built ONLY over the still-active candidate set at worklist handoff; a reloc edge C->T is
+// stored iff BOTH endpoints can still matter to the worklist:
+//   - T active: an inactive T's class is final and can never split, so T never appears in split_mem and
+//     its referrer row is never read.
+//   - C active: an inactive C's class is final; its color is never registered in slot_of_color, so the
+//     worklist drops it at the lookup (lnk_icf_map_get -> 0) anyway.
+// Duplicate (C,T) edges (multiple relocs from C to the same T) are deduped: cands are iterated in
+// ascending index and each cand's relocs are drained before the next, so per-target appends arrive in
+// non-decreasing C -- a duplicate is exactly "tail of T's bucket == C" (last_ref[] in the count pass,
+// bucket-tail check in the fill pass; identical predicates under identical iteration order).
+// Filtering/dedup only removes provably-redundant re-key requests (the worklist dirties CLASSES, set
+// semantics), so it visits the same dirty sets -> identical partition -> byte-identical output.
 internal void
 lnk_icf_build_reverse_index(Arena *arena, U64 cand_count, LNK_ICFCand *cands, U8 *rt_iscand, U64 *rt_target,
+                            U32 *active, U64 active_count,
                             U32 **out_rev_off, U32 **out_rev_adj)
 {
+  Temp scratch = scratch_begin(&arena, 1);
+  U8  *is_active = push_array(scratch.arena, U8, cand_count ? cand_count : 1);
+  for EachIndex(i, active_count) { is_active[active[i]] = 1; }
+  U32 *last_ref = push_array(scratch.arena, U32, cand_count ? cand_count : 1); // ci+1 of last referrer counted per target; 0 = none
+
   U32 *rev_off = push_array(arena, U32, cand_count + 1);
+  U64 raw_iscand = 0; // instrumentation: unfiltered edge count (old rev_adj size)
   for EachIndex(ci, cand_count) {
     LNK_ICFCand *c = &cands[ci];
     for EachIndex(j, c->reloc_count) {
       U64 idx = (U64)c->reloc_first + j;
-      if (rt_iscand[idx]) { rev_off[(U32)rt_target[idx] + 1] += 1; }
+      if (!rt_iscand[idx]) { continue; }
+      raw_iscand += 1;
+      if (!is_active[ci]) { continue; }
+      U32 tg = (U32)rt_target[idx];
+      if (!is_active[tg]) { continue; }
+      if (last_ref[tg] == (U32)ci + 1) { continue; } // duplicate (C,T)
+      last_ref[tg] = (U32)ci + 1;
+      rev_off[tg + 1] += 1;
     }
   }
   for EachIndex(t, cand_count) { rev_off[t + 1] += rev_off[t]; }
   U64 edge_count = rev_off[cand_count];
   U32 *rev_adj = push_array_no_zero(arena, U32, edge_count ? edge_count : 1);
-  Temp t = temp_begin(arena);
-  U32 *cursor = push_array(t.arena, U32, cand_count ? cand_count : 1);
+  U32 *cursor = push_array(scratch.arena, U32, cand_count ? cand_count : 1);
   for EachIndex(ci, cand_count) {
+    if (!is_active[ci]) { continue; }
     LNK_ICFCand *c = &cands[ci];
     for EachIndex(j, c->reloc_count) {
       U64 idx = (U64)c->reloc_first + j;
-      if (rt_iscand[idx]) {
-        U32 tg = (U32)rt_target[idx];
-        rev_adj[rev_off[tg] + cursor[tg]] = (U32)ci;
-        cursor[tg] += 1;
-      }
+      if (!rt_iscand[idx]) { continue; }
+      U32 tg = (U32)rt_target[idx];
+      if (!is_active[tg]) { continue; }
+      U32 n = cursor[tg];
+      if (n > 0 && rev_adj[rev_off[tg] + n - 1] == (U32)ci) { continue; } // duplicate (C,T)
+      rev_adj[rev_off[tg] + n] = (U32)ci;
+      cursor[tg] = n + 1;
     }
   }
-  temp_end(t);
+  scratch_end(scratch);
+  if (lnk_get_log_status(LNK_Log_Debug)) {
+    U64 total_relocs = cand_count ? ((U64)cands[cand_count - 1].reloc_first + cands[cand_count - 1].reloc_count) : 0;
+    lnk_log(LNK_Log_Debug, "/OPT:ICF worklist rev-index: relocs=%llu iscand=%llu kept=%llu (active-rows+dedup); rev_adj %llu -> %llu bytes",
+            total_relocs, raw_iscand, edge_count, raw_iscand * sizeof(U32), edge_count * sizeof(U32));
+  }
   *out_rev_off = rev_off;
   *out_rev_adj = rev_adj;
 }
@@ -4393,12 +4426,13 @@ lnk_opt_icf(TP_Context *tp, Arena *perm, LNK_SymbolTable *symtab, LNK_Config *co
     // the long near-converged tail (rounds 8..18 re-sort ~10.65M to resolve a few hundred splits). Both
     // compute the unique coarsest stable partition, so the final colors[] partition is identical; the
     // worklist just reaches it in tail work ~= churn instead of ~= active_count.
-    // Worklist tail DISABLED by default: its CSR reverse-index (rev_adj = U32 x candidate-edge-count)
-    // costs ~10GB peak on the UE link, which hurts the page-fault-bound critical path more than the
-    // ~3-4s of tail re-sorts it saves. region_cap=64 lets the persistent region run to the true fixpoint
-    // (~19 rounds), so `converged` is set and the worklist handoff below is skipped (no reverse-index).
-    // Lower this back to 8 to re-enable the worklist on memory-rich machines.
-    U64 region_cap = 64; // was 8 (worklist warm-up)
+    // Worklist tail RE-ENABLED: the CSR reverse-index used to store one U32 edge per iscand reloc
+    // (measured 98.7M edges / 394.7MB rev_adj on the FN editor Engine.dll link), which hurt the
+    // page-fault-bound critical path more than the ~3-4s of tail re-sorts it saves.
+    // lnk_icf_build_reverse_index now keeps only active-row, deduped (referrer,target) edges (measured
+    // 10.6M edges / 42.5MB, 9.3x smaller -- see its LNK_Log_Debug line), flipping the trade: same link
+    // measures region exclusive 68.2s -> 28.1s thread-time with no peak-working-set regression.
+    U64 region_cap = 8; // worklist warm-up (64 = run region to fixpoint, worklist skipped)
 
 #if defined(ICF_WORKLIST_SELFCHECK)
     // REFERENCE: clone pre-region state and run the region UNCAPPED to the true fixpoint into shadow
@@ -4441,7 +4475,7 @@ lnk_opt_icf(TP_Context *tp, Arena *perm, LNK_SymbolTable *symtab, LNK_Config *co
     // hand off the tail to the dirty-class worklist if the region stopped at the cap (not yet converged)
     if (!rs.converged && active_count > 0) {
       U32 *rev_off = 0, *rev_adj = 0;
-      lnk_icf_build_reverse_index(arena, cand_count, cands, rt_iscand, rt_target, &rev_off, &rev_adj);
+      lnk_icf_build_reverse_index(arena, cand_count, cands, rt_iscand, rt_target, active, active_count, &rev_off, &rev_adj);
       U64 wrounds = 0;
       B32 wl_ok = lnk_icf_worklist_refine(tp, arena, cand_count, cands, colors, rt_iscand, rt_target,
                                           rev_off, rev_adj, active, active_count, color_base, &wrounds);
