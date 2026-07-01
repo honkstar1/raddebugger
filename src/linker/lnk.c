@@ -7553,7 +7553,13 @@ lnk_run_linker(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
   // instead of in single-threaded process rundown at exit. Only safe for the CoW
   // (read-only) mapping mode; read-write-shared would flush dirty pages back to the
   // input files on unmap.
-  if ((config->io_flags & LNK_IO_Flags_MemoryMapFilesReadOnly) &&
+  //
+  // Only worth it when the process stays alive after the link (shared thread pool
+  // serving multiple links). When we exit right after this, the views are mostly
+  // clean now (debug relocs/TI fixups are patched-on-copy) and bulk process-exit
+  // teardown reclaims them cheaper than an explicit unmap pass.
+  if (lnk_is_thread_pool_shared(config) &&
+      (config->io_flags & LNK_IO_Flags_MemoryMapFilesReadOnly) &&
       !(config->io_flags & LNK_IO_Flags_MemoryMapFilesReadWrite)) {
     lnk_release_input_views(tp, inputer);
   }
