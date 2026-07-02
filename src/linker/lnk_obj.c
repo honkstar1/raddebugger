@@ -418,8 +418,10 @@ THREAD_POOL_TASK_FUNC(lnk_input_coff_symbol_table)
   LNK_InputCoffSymbolTable *task = raw_task;
   LNK_Obj                  *obj  = task->objs[task_id];
   COFF_ParsedSymbol symbol = {0};
+  // _no_name + branch-local name fetch: only symbols actually inserted into the symbol table pay
+  // the (memoizing) name decode; Regular-static/debug symbols (the bulk) skip it entirely.
   for (U64 symbol_idx = 0; symbol_idx < obj->header.symbol_count; symbol_idx += (1 + symbol.aux_symbol_count)) {
-    symbol = lnk_parsed_symbol_from_coff_symbol_idx(obj, symbol_idx);
+    symbol = lnk_parsed_symbol_from_coff_symbol_idx_no_name(obj, symbol_idx);
     COFF_SymbolValueInterpType interp = coff_interp_from_parsed_symbol(symbol);
     switch (interp) {
     case COFF_SymbolValueInterp_Regular: {
@@ -428,27 +430,27 @@ THREAD_POOL_TASK_FUNC(lnk_input_coff_symbol_table)
         if (*section.flags & COFF_SectionFlag_LnkRemove) {
           break;
         }
-        LNK_Symbol *defn = lnk_make_symbol(arena, symbol.name, obj, symbol_idx);
+        LNK_Symbol *defn = lnk_make_symbol(arena, lnk_symbol_name_from_coff_symbol_idx(obj, symbol_idx), obj, symbol_idx);
         lnk_symbol_table_push_(task->symtab, arena, worker_id, defn);
       }
     } break;
     case COFF_SymbolValueInterp_Weak: {
-      LNK_Symbol *defn = lnk_make_symbol(arena, symbol.name, obj, symbol_idx);
+      LNK_Symbol *defn = lnk_make_symbol(arena, lnk_symbol_name_from_coff_symbol_idx(obj, symbol_idx), obj, symbol_idx);
       lnk_symbol_table_push_(task->symtab, arena, worker_id, defn);
     } break;
     case COFF_SymbolValueInterp_Undefined: {
       if (symbol.storage_class == COFF_SymStorageClass_External) {
-        LNK_Symbol *defn = lnk_make_symbol(arena, symbol.name, obj, symbol_idx);
+        LNK_Symbol *defn = lnk_make_symbol(arena, lnk_symbol_name_from_coff_symbol_idx(obj, symbol_idx), obj, symbol_idx);
         lnk_symbol_table_push_(task->symtab, arena, worker_id, defn);
       }
     } break;
     case COFF_SymbolValueInterp_Common: {
-      LNK_Symbol *defn = lnk_make_symbol(arena, symbol.name, obj, symbol_idx);
+      LNK_Symbol *defn = lnk_make_symbol(arena, lnk_symbol_name_from_coff_symbol_idx(obj, symbol_idx), obj, symbol_idx);
       lnk_symbol_table_push_(task->symtab, arena, worker_id, defn);
     } break;
     case COFF_SymbolValueInterp_Abs: {
       if (symbol.storage_class == COFF_SymStorageClass_External) {
-        LNK_Symbol *defn = lnk_make_symbol(arena, symbol.name, obj, symbol_idx);
+        LNK_Symbol *defn = lnk_make_symbol(arena, lnk_symbol_name_from_coff_symbol_idx(obj, symbol_idx), obj, symbol_idx);
         lnk_symbol_table_push_(task->symtab, arena, worker_id, defn);
       }
     } break;
@@ -466,13 +468,13 @@ lnk_symlinks_from_obj(Arena *arena, LNK_SymbolTable *symtab, LNK_Obj *obj)
   LNK_SymbolHashTrie **symlinks = push_array(arena, LNK_SymbolHashTrie *, obj->header.section_count_no_null+1);
   COFF_ParsedSymbol symbol;
   for (U64 symbol_idx = 0; symbol_idx < obj->header.symbol_count; symbol_idx += (1 + symbol.aux_symbol_count)) {
-    symbol = lnk_parsed_symbol_from_coff_symbol_idx(obj, symbol_idx);
+    symbol = lnk_parsed_symbol_from_coff_symbol_idx_no_name(obj, symbol_idx);
     COFF_SymbolValueInterpType interp = coff_interp_symbol(symbol.section_number, symbol.value, symbol.storage_class);
     if (interp == COFF_SymbolValueInterp_Regular && symbol.aux_symbol_count == 0 && symbol.storage_class == COFF_SymStorageClass_External) {
       LNK_ObjSection section = lnk_obj_section_from_section_number(obj, symbol.section_number);
       if (*section.flags & COFF_SectionFlag_LnkCOMDAT) {
         if (symlinks[symbol.section_number] == 0 || symbol.value == 0) {
-          symlinks[symbol.section_number] = lnk_symbol_table_search_(symtab, symbol.name);
+          symlinks[symbol.section_number] = lnk_symbol_table_search_(symtab, lnk_symbol_name_from_coff_symbol_idx(obj, symbol_idx));
         }
       }
     }
@@ -665,7 +667,8 @@ lnk_try_comdat_props_from_section_number(LNK_Obj *obj, U32 section_number, COFF_
   Assert(section_number > 0);
   U32 symbol_idx = obj->comdats[section_number-1];
   if (symbol_idx != max_U32) {
-    COFF_ParsedSymbol secdef = lnk_parsed_symbol_from_coff_symbol_idx(obj, symbol_idx);
+    // coff_parse_secdef only reads scalar fields + aux records; skip the name decode
+    COFF_ParsedSymbol secdef = lnk_parsed_symbol_from_coff_symbol_idx_no_name(obj, symbol_idx);
     coff_parse_secdef(secdef, obj->header.is_big_obj, select_out, section_number_out, section_length_out, check_sum_out);
     return 1;
   }
@@ -699,17 +702,43 @@ lnk_parsed_symbol_from_coff_symbol_idx_no_name(LNK_Obj *obj, U64 symbol_idx)
   return result;
 }
 
+// Decode a symbol's name on demand, memoizing its LENGTH in the lite parse so only the FIRST
+// fetch pays the string-table cstr scan; later fetches reconstruct str8(ptr, size) directly.
+// The name bytes live in the read-only obj->data mapping (patching only touches scalar fields),
+// so both the pointer and the memoized size stay valid for the obj's lifetime.
+internal String8
+lnk_symbol_name_from_coff_symbol_idx(LNK_Obj *obj, U64 symbol_idx)
+{
+  String8               result = {0};
+  LNK_ParsedSymbolLite *lite   = &obj->parsed_symbols[symbol_idx];
+  if (lite->raw_symbol_off) {
+    // COFF_SymbolName is the leading field of both COFF_Symbol16 and COFF_Symbol32
+    COFF_SymbolName *name      = (COFF_SymbolName *)(obj->data.str + lite->raw_symbol_off);
+    U32              name_size = lite->name_size;
+    if (name_size) {
+      // memo hit: rebuild the exact String8 the scan path would produce, without rescanning.
+      // long_name reconstruction is safe because a nonzero memo implies the first scan saw
+      // string_table_offset in bounds (out-of-bounds decodes produce size 0 and never memoize).
+      U8 *name_ptr = (name->long_name.zeroes == 0)
+                     ? obj->data.str + obj->header.string_table_range.min + name->long_name.string_table_offset
+                     : name->short_name;
+      result = str8(name_ptr, name_size);
+    } else {
+      String8 string_table = str8_substr(obj->data, obj->header.string_table_range);
+      result = coff_read_symbol_name(string_table, name);
+      lite->name_size = (U32)result.size; // idempotent cross-worker write; 0 stays "unknown"
+    }
+  }
+  return result;
+}
+
 internal COFF_ParsedSymbol
 lnk_parsed_symbol_from_coff_symbol_idx(LNK_Obj *obj, U64 symbol_idx)
 {
   COFF_ParsedSymbol result = lnk_parsed_symbol_from_coff_symbol_idx_no_name(obj, symbol_idx);
   // name is excluded from the memo -- decode it from the (read-only) symbol record on demand. Patching
   // never touches the name, so re-deriving from raw_symbol stays correct after value/section patches.
-  if (result.raw_symbol) {
-    String8 string_table = str8_substr(obj->data, obj->header.string_table_range);
-    if (obj->header.is_big_obj) { result.name = coff_parse_symbol32(string_table, (COFF_Symbol32 *)result.raw_symbol).name; }
-    else                        { result.name = coff_parse_symbol16(string_table, (COFF_Symbol16 *)result.raw_symbol).name; }
-  }
+  result.name = lnk_symbol_name_from_coff_symbol_idx(obj, symbol_idx);
   return result;
 }
 

@@ -12,12 +12,18 @@
 typedef struct LNK_ParsedSymbolLite
 {
   U32                  raw_symbol_off;   // byte offset of the COFF symbol record within obj->data (0 = none).
-                                         // stored as an offset, not a pointer, to keep this struct 16B.
+                                         // stored as an offset, not a pointer, to keep this struct small.
   U32                  value;            // COFF symbol value is U32 (section-relative offset / size / etc.)
   U32                  section_number;
   COFF_SymbolType      type;             // U16
   COFF_SymStorageClass storage_class;    // U8
   U8                   aux_symbol_count;
+  U32                  name_size;        // memoized symbol-name length; 0 = not yet computed (empty names just
+                                         // rescan, which is trivially cheap). Filled lazily on first name decode
+                                         // in lnk_symbol_name_from_coff_symbol_idx so later fetches skip the
+                                         // string-table cstr scan (long mangled C++ names are 60-300B). Writes
+                                         // are idempotent (value derived from immutable obj->data), so the
+                                         // multi-worker fill race is benign.
 } LNK_ParsedSymbolLite;
 
 // /OPT:ICF static-COMDAT fold record (one per section, indexed by section_number-1). A static
@@ -182,6 +188,7 @@ internal LNK_Symbol *     lnk_obj_get_comdat_symlink(LNK_Obj *obj, U64 section_n
 internal COFF_SectionHeader * lnk_coff_section_header_from_section_number(LNK_Obj *obj, U64 section_number);
 internal COFF_ParsedSymbol    lnk_parsed_symbol_from_coff_symbol_idx(LNK_Obj *obj, U64 symbol_idx);
 internal COFF_ParsedSymbol    lnk_parsed_symbol_from_coff_symbol_idx_no_name(LNK_Obj *obj, U64 symbol_idx);
+internal String8              lnk_symbol_name_from_coff_symbol_idx(LNK_Obj *obj, U64 symbol_idx);
 internal U64                  lnk_obj_sect_idx_from_section_number(LNK_Obj *obj, U64 section_number);
 internal U64                  lnk_obj_section_number_from_sect_idx(LNK_Obj *obj, U64 sect_idx);
 internal String8              lnk_obj_section_name_from_section_number(LNK_Obj *obj, U64 section_number);
