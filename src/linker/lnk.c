@@ -3091,17 +3091,28 @@ typedef struct LNK_ICFHashTask
   U64             *rt_target;
 } LNK_ICFHashTask;
 
+// Packed per-reloc key0 contribution: one 16B fixed-size entry per reloc instead of 2-3 tiny
+// hasher updates. Fixed size + explicit iscand flag keeps the encoding injective (the old
+// variable-length 6B/14B concatenation was only injective by luck); every byte is explicitly
+// written (no padding) so the hash input is deterministic.
+typedef struct LNK_ICFRelocKeyEntry
+{
+  U16 type;      // COFF_RelocType
+  U16 iscand;    // 1 = target is an ICF candidate (identity refined via colors, NOT keyed here)
+  U32 apply_off;
+  U64 target;    // canonical non-candidate target id; 0 when iscand
+} LNK_ICFRelocKeyEntry;
+StaticAssert(sizeof(LNK_ICFRelocKeyEntry) == 16, lnk_icf_reloc_key_entry_size);
+
 // Canonicalize one reloc's target for ICF keying and write its (iscand, target) slot at rt index
 // `idx`; hashes the reloc shape (type/apply_off) and, for non-candidate targets, the canonical
-// target id into `h`. Shared by the candidate's own relocs and its associative children's relocs
-// (kids[]/kid_count = the candidate's gathered associative group, see lnk_icf_gather_assoc).
+// target id into `h` as one packed LNK_ICFRelocKeyEntry. Shared by the candidate's own relocs and
+// its associative children's relocs (kids[]/kid_count = the candidate's gathered associative
+// group, see lnk_icf_gather_assoc).
 internal void
 lnk_icf_key_reloc(LNK_ICFHashTask *task, LNK_ICFCand *c, U32 *kids, U64 kid_count,
-                  COFF_Reloc *reloc, blake3_hasher *h, U64 idx)
+                  COFF_Reloc *reloc, XXH3_state_t *h, U64 idx)
 {
-  blake3_hasher_update(h, &reloc->type, sizeof(reloc->type));
-  blake3_hasher_update(h, &reloc->apply_off, sizeof(reloc->apply_off));
-
   COFF_ParsedSymbol          tp   = lnk_parsed_symbol_from_coff_symbol_idx(c->obj, reloc->isymbol);
   COFF_SymbolValueInterpType ti   = coff_interp_from_parsed_symbol(tp);
   LNK_ObjSymbolRef           tref = { c->obj, reloc->isymbol };
@@ -3166,7 +3177,13 @@ lnk_icf_key_reloc(LNK_ICFHashTask *task, LNK_ICFCand *c, U32 *kids, U64 kid_coun
 
   task->rt_iscand[idx] = iscand;
   task->rt_target[idx] = target;
-  if (!iscand) { blake3_hasher_update(h, &target, sizeof(target)); }
+
+  LNK_ICFRelocKeyEntry e;
+  e.type      = reloc->type;
+  e.iscand    = iscand;
+  e.apply_off = reloc->apply_off;
+  e.target    = iscand ? 0 : target;
+  XXH3_128bits_update(h, &e, sizeof(e));
 }
 
 // per-candidate content hash + relocation-target resolution (parallel; each candidate writes
@@ -3184,11 +3201,15 @@ THREAD_POOL_TASK_FUNC(lnk_icf_hash_task)
     U32 kids[LNK_ICF_MAX_ASSOC];
     U64 kid_count = lnk_icf_gather_assoc(c->obj, c->sn, kids);
 
-    blake3_hasher h; blake3_hasher_init(&h);
+    // XXH3-128 (not blake3): key0 is truncated/mixed to 64 bits below anyway, so crypto strength
+    // buys nothing -- the design already accepts 64-bit birthday collisions, and the fold path is
+    // guarded by lnk_icf_fold_verify_task's byte-compare. Same input fields in the same order;
+    // reloc shape goes in as packed 16B entries (see LNK_ICFRelocKeyEntry).
+    XXH3_state_t h; XXH3_128bits_reset(&h);
     U32 flags_for_hash = c->obj->section_flags[c->sn - 1] & ~(COFF_SectionFlag_LnkCOMDAT | COFF_SectionFlag_LnkRemove);
-    blake3_hasher_update(&h, &flags_for_hash, sizeof(flags_for_hash));
-    blake3_hasher_update(&h, &header->fsize, sizeof(header->fsize));
-    blake3_hasher_update(&h, data.str, data.size);
+    XXH3_128bits_update(&h, &flags_for_hash, sizeof(flags_for_hash));
+    XXH3_128bits_update(&h, &header->fsize, sizeof(header->fsize));
+    XXH3_128bits_update(&h, data.str, data.size);
 
     U64 idx = c->reloc_first;
     for EachIndex(ri, relocs.count) { lnk_icf_key_reloc(task, c, kids, kid_count, &relocs.v[ri], &h, idx); idx += 1; }
@@ -3203,16 +3224,15 @@ THREAD_POOL_TASK_FUNC(lnk_icf_hash_task)
       COFF_RelocArray     krelocs = lnk_coff_relocs_from_section_header(c->obj, kheader);
       String8             kdata   = str8_substr(c->obj->data, rng_1u64(kheader->foff, kheader->foff + kheader->fsize));
       U32 kflags = c->obj->section_flags[kids[ki] - 1] & ~(COFF_SectionFlag_LnkCOMDAT | COFF_SectionFlag_LnkRemove);
-      blake3_hasher_update(&h, &kflags, sizeof(kflags));
-      blake3_hasher_update(&h, &kheader->fsize, sizeof(kheader->fsize));
-      blake3_hasher_update(&h, kdata.str, kdata.size);
+      XXH3_128bits_update(&h, &kflags, sizeof(kflags));
+      XXH3_128bits_update(&h, &kheader->fsize, sizeof(kheader->fsize));
+      XXH3_128bits_update(&h, kdata.str, kdata.size);
       for EachIndex(ri, krelocs.count) { lnk_icf_key_reloc(task, c, kids, kid_count, &krelocs.v[ri], &h, idx); idx += 1; }
     }
     Assert(idx == (U64)c->reloc_first + c->reloc_count);
 
-    U8 out[16]; blake3_hasher_finalize(&h, out, sizeof(out));
-    U64 lo = *(U64 *)&out[0], hi = *(U64 *)&out[8];
-    c->key0 = lnk_icf_mix(lo, hi);
+    XXH128_hash_t out = XXH3_128bits_digest(&h);
+    c->key0 = lnk_icf_mix(out.low64, out.high64);
   }
 }
 
