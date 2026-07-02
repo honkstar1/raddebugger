@@ -101,23 +101,26 @@ THREAD_POOL_TASK_FUNC(lnk_obj_initer)
   for (U64 sect_idx = 0; sect_idx < header.section_count_no_null; sect_idx += 1) {
     COFF_SectionHeader *coff_sect_header = &coff_section_table[sect_idx];
     section_flags[sect_idx]              = coff_sect_header->flags;
-    String8             sect_name        = coff_name_from_section_header(raw_coff_string_table, coff_sect_header);
     if (~section_flags[sect_idx] & COFF_SectionFlag_CntUninitializedData) {
       if (coff_sect_header->fsize > 0) {
         Rng1U64 sect_range = rng_1u64(coff_sect_header->foff, coff_sect_header->foff + coff_sect_header->fsize);
         if (contains_1u64(header.header_range, coff_sect_header->foff) ||
             (coff_sect_header->fsize > 0 && contains_1u64(header.header_range, sect_range.max-1))) {
+          String8 sect_name = coff_name_from_section_header(raw_coff_string_table, coff_sect_header);
           lnk_error_input_obj(LNK_Error_IllData, input, "header (%S No. %#llx) defines out of bounds section data (file offsets point into file header)", sect_name, sect_idx+1);
         }
         if (contains_1u64(header.section_table_range, coff_sect_header->foff) ||
             (coff_sect_header->fsize > 0 && contains_1u64(header.section_table_range, sect_range.max-1))) {
+          String8 sect_name = coff_name_from_section_header(raw_coff_string_table, coff_sect_header);
           lnk_error_input_obj(LNK_Error_IllData, input, "header (%S No. %#llx) defines out of bounds section data (file offsets point into section header table)", sect_name, sect_idx+1);
         }
         if (contains_1u64(header.symbol_table_range, coff_sect_header->foff) ||
             (coff_sect_header->fsize > 0 && contains_1u64(header.symbol_table_range, sect_range.max-1))) {
+          String8 sect_name = coff_name_from_section_header(raw_coff_string_table, coff_sect_header);
           lnk_error_input_obj(LNK_Error_IllData, input, "header (%S No. %#llx) defines out of bounds section data (file offsets point into symbol table)", sect_name, sect_idx+1);
         }
         if (dim_1u64(sect_range) != coff_sect_header->fsize) {
+          String8 sect_name = coff_name_from_section_header(raw_coff_string_table, coff_sect_header);
           lnk_error_input_obj(LNK_Error_IllData, input, "header (%S No. %#llx) defines out of bounds section data", sect_name, sect_idx+1);
         }
       }
@@ -132,13 +135,14 @@ THREAD_POOL_TASK_FUNC(lnk_obj_initer)
     COFF_SectionHeader *section_table = (COFF_SectionHeader *)str8_substr(input->data, header.section_table_range).str;
     COFF_ParsedSymbol symbol;
     for (U64 symbol_idx = 0; symbol_idx < header.symbol_count; symbol_idx += (1 + symbol.aux_symbol_count)) {
-      symbol = coff_parse_symbol(header, raw_coff_string_table, raw_coff_symbol_table, symbol_idx);
+      symbol = coff_parse_symbol_no_name(header, raw_coff_symbol_table, symbol_idx);
       U32 raw_off = symbol.raw_symbol ? safe_cast_u32((U8 *)symbol.raw_symbol - input->data.str) : 0;
       parsed_symbols[symbol_idx] = (LNK_ParsedSymbolLite){ raw_off, safe_cast_u32(symbol.value), symbol.section_number, symbol.type, symbol.storage_class, symbol.aux_symbol_count };
       COFF_SymbolValueInterpType interp = coff_interp_symbol(symbol.section_number, symbol.value, symbol.storage_class);
       if (interp == COFF_SymbolValueInterp_Regular) {
         if (symbol.section_number == 0 || symbol.section_number > header.section_count_no_null) {
-          lnk_error_input_obj(LNK_Error_IllData, input, "symbol %S (No. 0x%x) points to an out of bounds section 0x%x", symbol.name, symbol_idx, symbol.section_number);
+          String8 symbol_name = coff_parse_symbol(header, raw_coff_string_table, raw_coff_symbol_table, symbol_idx).name;
+          lnk_error_input_obj(LNK_Error_IllData, input, "symbol %S (No. 0x%x) points to an out of bounds section 0x%x", symbol_name, symbol_idx, symbol.section_number);
         }
         if (symbol.storage_class == COFF_SymStorageClass_Static && symbol.aux_symbol_count > 0) {
           COFF_ComdatSelectType select;
@@ -146,7 +150,8 @@ THREAD_POOL_TASK_FUNC(lnk_obj_initer)
           coff_parse_secdef(symbol, header.is_big_obj, &select, &section_number, 0, 0);
           if (select == COFF_ComdatSelect_Associative) {
             if (section_number == 0 || section_number > header.section_count_no_null) {
-              lnk_error_input_obj(LNK_Error_IllData, input, "section definition symbol %S (No. 0x%x) associates with an out of bounds section 0x%x", symbol.name, symbol_idx, symbol.section_number);
+              String8 symbol_name = coff_parse_symbol(header, raw_coff_string_table, raw_coff_symbol_table, symbol_idx).name;
+              lnk_error_input_obj(LNK_Error_IllData, input, "section definition symbol %S (No. 0x%x) associates with an out of bounds section 0x%x", symbol_name, symbol_idx, symbol.section_number);
             }
           }
         }
@@ -164,7 +169,7 @@ THREAD_POOL_TASK_FUNC(lnk_obj_initer)
 
     COFF_ParsedSymbol symbol;
     for (U64 symbol_idx = 0; symbol_idx < header.symbol_count; symbol_idx += (1 + symbol.aux_symbol_count)) {
-      symbol = coff_parse_symbol(header, raw_coff_string_table, raw_coff_symbol_table, symbol_idx);
+      symbol = coff_parse_symbol_no_name(header, raw_coff_symbol_table, symbol_idx);
 
       COFF_SymbolValueInterpType interp = coff_interp_symbol(symbol.section_number, symbol.value, symbol.storage_class);
       if (interp == COFF_SymbolValueInterp_Regular) {
@@ -211,7 +216,7 @@ THREAD_POOL_TASK_FUNC(lnk_obj_initer)
         }
 
         // extract COMDAT info for current section
-        COFF_ParsedSymbol     symbol         = coff_parse_symbol(header, raw_coff_string_table, raw_coff_symbol_table, symbol_idx);
+        COFF_ParsedSymbol     symbol         = coff_parse_symbol_no_name(header, raw_coff_symbol_table, symbol_idx);
         COFF_ComdatSelectType select         = COFF_ComdatSelect_Null;
         U32                   section_number = 0;
         coff_parse_secdef(symbol, header.is_big_obj, &select, &section_number, 0, 0);
@@ -250,7 +255,7 @@ THREAD_POOL_TASK_FUNC(lnk_obj_initer)
   {
     COFF_ParsedSymbol symbol;
     for (U32 symbol_idx = 0; symbol_idx < header.symbol_count; symbol_idx += (1 + symbol.aux_symbol_count)) {
-      symbol = coff_parse_symbol(header, raw_coff_string_table, raw_coff_symbol_table, symbol_idx);
+      symbol = coff_parse_symbol_no_name(header, raw_coff_symbol_table, symbol_idx);
       COFF_SymbolValueInterpType interp = coff_interp_from_parsed_symbol(symbol);
       if (interp == COFF_SymbolValueInterp_Regular && symbol.storage_class == COFF_SymStorageClass_Static && symbol.aux_symbol_count > 0) {
         COFF_ComdatSelectType selection      = COFF_ComdatSelect_Null;
