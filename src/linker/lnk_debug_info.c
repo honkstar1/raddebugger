@@ -2282,6 +2282,32 @@ THREAD_POOL_TASK_FUNC(lnk_hash_debug_t_deep_task)
 }
 
 internal
+THREAD_POOL_TASK_FUNC(lnk_estimate_unique_leaves_task)
+{
+  ProfBeginFunction();
+  LNK_MergeTypes *task    = raw_task;
+  U64             obj_idx = task->indices.v[task_id];
+  CV_DebugT      *debug_t = &task->input->debug_t_arr[obj_idx];
+  CV_DebugH      *debug_h = &task->input->debug_h_arr[obj_idx];
+  // same prune rule as lnk_leaf_dedup_task: NOTYPE'd IFC blob leaves were never hashed and are
+  // never inserted, so they must not contribute to the estimate either
+  B32 is_ifc_blob = task->input->has_ifc_redirects && contains_1u64(task->input->ifc_obj_range, obj_idx);
+  for EachIndex(leaf_idx, debug_t->count) {
+    CV_LeafHeader *header = cv_debug_t_get_leaf_header(debug_t, leaf_idx);
+    CV_LeafKind    kind   = memory_read16(MemberFromPtr(CV_LeafHeader, header, kind));
+    if (is_ifc_blob && kind == CV_LeafKind_NOTYPE) { continue; }
+    CV_TypeIndexSource leaf_source = cv_type_index_source_from_leaf_kind(kind);
+    U64                bit_idx     = debug_h->v[leaf_idx] & (task->estimate_bitmap_bits[leaf_source] - 1);
+    U32               *word        = &task->estimate_bitmap[leaf_source][bit_idx / 32];
+    U32                bit         = 1u << (bit_idx % 32);
+    // atomic OR is commutative -> final bitmap contents are schedule-independent (deterministic);
+    // pre-check skips the interlocked op for already-set bits (the common case on dup-heavy input)
+    if ((ins_atomic_u32_eval(word) & bit) == 0) { ins_atomic_u32_or(word, bit); }
+  }
+  ProfEnd();
+}
+
+internal
 THREAD_POOL_TASK_FUNC(lnk_populate_leaf_ht)
 {
   LNK_MergeTypes *task = raw_task;
@@ -2291,6 +2317,10 @@ THREAD_POOL_TASK_FUNC(lnk_populate_leaf_ht)
   CV_DebugH *debug_h = &task->input->debug_h_arr[task->pop_obj_idx];
 
   for EachInRange(leaf_idx, task->pop_range[task_id]) {
+    // another worker overflowed an estimate-sized table -- the whole dedup result is discarded
+    // and retried with the total-based caps, so bail out early
+    if (ins_atomic_u32_eval(&task->leaf_ht_overflow) != 0) { break; }
+
     LNK_LeafRef *bucket = 0;
 
     // alloc new bucket and assign type ref
@@ -2333,7 +2363,13 @@ THREAD_POOL_TASK_FUNC(lnk_populate_leaf_ht)
     } while (idx != best_idx);
     is_inserted_or_updated = 0;
     exit:;
-    Assert(is_inserted_or_updated);
+    if (!is_inserted_or_updated && leaf_source != CV_TypeIndexSource_NULL) {
+      // TPI/IPI table is full (estimate undershot) -- flag for a deterministic retry with the
+      // total-based caps. the NULL-source table is deliberately undersized and silently drops
+      // leaves that do not fit (pre-existing behavior; they are never emitted).
+      ins_atomic_u32_eval_assign(&task->leaf_ht_overflow, 1);
+      break;
+    }
   }
 }
 
@@ -2353,6 +2389,9 @@ THREAD_POOL_TASK_FUNC(lnk_leaf_dedup_task)
 
   LNK_LeafRef *bucket = 0;
   for EachIndex(leaf_idx, debug_t->count) {
+    // another worker overflowed an estimate-sized table -- the whole dedup result is discarded
+    // and retried with the total-based caps, so bail out early
+    if (ins_atomic_u32_eval(&task->leaf_ht_overflow) != 0) { break; }
     if (is_ifc_blob && cv_debug_t_get_leaf_header(debug_t, leaf_idx)->kind == CV_LeafKind_NOTYPE) { continue; }
     // alloc new bucket and assign type ref
     if (bucket == 0) { bucket = push_array_no_zero(arena, LNK_LeafRef, 1); }
@@ -2394,7 +2433,13 @@ THREAD_POOL_TASK_FUNC(lnk_leaf_dedup_task)
     } while (idx != best_idx);
     is_inserted_or_updated = 0;
     exit:;
-    Assert(is_inserted_or_updated);
+    if (!is_inserted_or_updated && leaf_source != CV_TypeIndexSource_NULL) {
+      // TPI/IPI table is full (estimate undershot) -- flag for a deterministic retry with the
+      // total-based caps. the NULL-source table is deliberately undersized and silently drops
+      // leaves that do not fit (pre-existing behavior; they are never emitted).
+      ins_atomic_u32_eval_assign(&task->leaf_ht_overflow, 1);
+      break;
+    }
   }
 
   ProfEnd();
@@ -2942,27 +2987,91 @@ lnk_merge_types(TP_Context *tp, TP_Arena *tp_temp, LNK_CodeViewInput *input, LNK
   Arena *bucket_arena = arena_alloc(.name = "LEAF_BUCKETS");
 
   ProfBegin("Leaf Hash Table Init");
-  for EachIndex(ti_source, CV_TypeIndexSource_COUNT) {
-    U64 total_count = 0;
-    for EachIndex(obj_idx, input->count) { total_count += input->debug_t_arr[obj_idx].source_counts[ti_source]; }
+  // fallback caps derived from TOTAL (pre-dedup, pre-prune) leaf counts. total >= unique always, so
+  // these caps can never overflow; they are also the caps the estimate-based sizing clamps against
+  // and retries with. NOTE: the NULL-source cap is deliberately derived from the pre-prune
+  // source_counts (see the IFC pruning comment in lnk_leaf_dedup_task) -- pruned NOTYPE leaves are
+  // never inserted, so pre-prune totals always cover the insert set with slack.
+  U64 leaf_ht_cap_fallback[CV_TypeIndexSource_COUNT] = {0};
+  {
+    U64 total_counts[CV_TypeIndexSource_COUNT] = {0};
+    for EachIndex(ti_source, CV_TypeIndexSource_COUNT) {
+      for EachIndex(obj_idx, input->count) { total_counts[ti_source] += input->debug_t_arr[obj_idx].source_counts[ti_source]; }
+      // pow2 cap so bucket index is hash & (cap-1) (mask) instead of hash % cap (a 64-bit DIV in the
+      // densest dedup probe loop). u64_up_to_pow2(1.3*count) keeps load factor <= ~0.65.
+      leaf_ht_cap_fallback[ti_source] = u64_up_to_pow2(1 + ((total_counts[ti_source] * 13) / 10)); // * 1.3, pow2
+    }
 
-    task.leaf_ht_arr[ti_source].cap = total_count;
-    // pow2 cap so bucket index is hash & (cap-1) (mask) instead of hash % cap (a 64-bit DIV in the
-    // densest dedup probe loop). u64_up_to_pow2(1.3*count) keeps load factor <= ~0.65.
-    task.leaf_ht_arr[ti_source].cap = u64_up_to_pow2(1 + ((task.leaf_ht_arr[ti_source].cap * 13) / 10)); // * 1.3, pow2
-    task.leaf_ht_arr[ti_source].bucket_arr = push_array(bucket_arena, LNK_LeafRef *, task.leaf_ht_arr[ti_source].cap);
+    // On dup-heavy input (PCH/type-server fan-out) unique count is a small fraction of total, and a
+    // total-sized probe table wastes multi-GB of demand-zero page faults on 64B-apart random probes.
+    // Estimate the distinct-hash count from the already-produced debug_h hashes (Produce Hashes
+    // completes above) with a per-source presence bitmap + linear counting, and size the tables from
+    // that instead. Everything here is a pure function of the input hashes, so the caps -- and the
+    // overflow/retry decision below -- are identical run to run.
+    ProfBegin("Estimate Unique Leaves");
+    {
+      // sweep exactly the objs whose leaves get inserted: prepopulate + the four dedup passes
+      U32Array sweep_arrs[] = { input->debug_p_indices, input->int_obj_indices, input->type_server_indices, input->ifc_indices };
+      U32Array sweep_indices = {0};
+      for EachElement(i, sweep_arrs) { sweep_indices.count += sweep_arrs[i].count; }
+      sweep_indices.v     = push_array_no_zero(scratch.arena, U32, sweep_indices.count);
+      sweep_indices.count = 0;
+      for EachElement(i, sweep_arrs) {
+        MemoryCopy(sweep_indices.v + sweep_indices.count, sweep_arrs[i].v, sizeof(U32) * sweep_arrs[i].count);
+        sweep_indices.count += sweep_arrs[i].count;
+      }
+
+      for EachIndex(ti_source, CV_TypeIndexSource_COUNT) {
+        // bits >= total >= unique keeps the bitmap load < 1, where linear counting is accurate;
+        // clamp keeps the transient bitmap allocation bounded (16MB per source at the top end)
+        task.estimate_bitmap_bits[ti_source] = u64_up_to_pow2(Clamp(1ull << 16, total_counts[ti_source], 1ull << 27));
+        task.estimate_bitmap     [ti_source] = push_array(scratch.arena, U32, task.estimate_bitmap_bits[ti_source] / 32);
+      }
+
+      task.indices = sweep_indices;
+      tp_for_parallel(tp, 0, task.indices.count, lnk_estimate_unique_leaves_task, &task);
+
+      for EachIndex(ti_source, CV_TypeIndexSource_COUNT) {
+        U64 bit_count  = task.estimate_bitmap_bits[ti_source];
+        U64 word_count = bit_count / 32;
+        U64 set_count  = 0;
+        for EachIndex(word_idx, word_count) { set_count += count_bits_set32(task.estimate_bitmap[ti_source][word_idx]); }
+
+        U64 cap = leaf_ht_cap_fallback[ti_source];
+        U64 zero_count = bit_count - set_count;
+        // the NULL-source table keeps the historic total-based cap: objs synthesized outside the
+        // parse path never populate source_counts, so its cap can be far below the number of
+        // NULL-source leaves thrown at it. that has always been tolerated -- NULL-source leaves are
+        // never emitted, the table just drops what does not fit (see the fall-through handling in
+        // lnk_leaf_dedup_task) -- so it must not participate in estimate sizing or overflow retry.
+        if (ti_source != CV_TypeIndexSource_NULL && set_count > 0 && zero_count > 0) {
+          // linear counting: distinct ~= m * ln(m / zeros)
+          F64 estimate = (F64)bit_count * log((F64)bit_count / (F64)zero_count);
+          if (estimate < (F64)set_count) { estimate = (F64)set_count; }
+          // 1.9x safety keeps the load factor <= ~0.55 even before pow2 rounding; overflow (only
+          // possible if the estimate undershoots by >1.8x) is caught and retried deterministically
+          U64 target = (U64)(estimate * 1.9) + 4096;
+          cap = Min(u64_up_to_pow2(target), leaf_ht_cap_fallback[ti_source]);
+        }
+        task.leaf_ht_arr[ti_source].cap = cap;
+      }
+    }
+    ProfEnd();
+
+    for EachIndex(ti_source, CV_TypeIndexSource_COUNT) {
+      task.leaf_ht_arr[ti_source].bucket_arr = push_array(bucket_arena, LNK_LeafRef *, task.leaf_ht_arr[ti_source].cap);
 
 #if PROFILE_TELEMETRY
-    tmMessage(0, TMMF_ICON_NOTE, "%.*s Bucket Count: %.*s", str8_varg(cv_string_from_type_index_source(ti_source)), str8_varg(str8_from_count(scratch.arena, task.leaf_ht_arr[ti_source].cap)));
+      tmMessage(0, TMMF_ICON_NOTE, "%.*s Bucket Count: %.*s", str8_varg(cv_string_from_type_index_source(ti_source)), str8_varg(str8_from_count(scratch.arena, task.leaf_ht_arr[ti_source].cap)));
 #endif
+    }
   }
   ProfEnd();
 
   U32Array dedup_type_server_indices = input->type_server_indices;
 
-  ProfBegin("Prepopulate hash table with largest type-set");
+  LNK_TypeServer *largest_ts = 0;
   {
-    LNK_TypeServer *largest_ts = 0;
     for EachIndex(i, input->ts_arr.count) {
       LNK_TypeServer *ts = &input->ts_arr.v[i];
       if (ts->rrt == 0) { continue; }
@@ -2974,7 +3083,6 @@ lnk_merge_types(TP_Context *tp, TP_Arena *tp_temp, LNK_CodeViewInput *input, LNK
     if (largest_ts) {
       task.pop_obj_idx = input->ts_obj_range.min + largest_ts->ts_idx;
       task.pop_range   = tp_divide_work(scratch.arena, task.input->debug_t_arr[task.pop_obj_idx].count, tp->worker_count);
-      tp_for_parallel(tp, tp_temp, tp->worker_count, lnk_populate_leaf_ht, &task);
 
       U32Array new_dedup_type_server_indices = { .v = push_array(scratch.arena, U32, input->type_server_indices.count) };
       for EachIndex(i, input->type_server_indices.count) {
@@ -2984,21 +3092,42 @@ lnk_merge_types(TP_Context *tp, TP_Arena *tp_temp, LNK_CodeViewInput *input, LNK
       dedup_type_server_indices = new_dedup_type_server_indices;
     }
   }
-  ProfEnd();
 
-  ProfBegin("Leaf Dedup");
-  task.indices = input->debug_p_indices;
-  tp_for_parallel_prof(tp, tp_temp, task.indices.count, lnk_leaf_dedup_task, &task, ".debug$P");
+  for (U64 attempt = 0; ; attempt += 1) {
+    ProfBegin("Prepopulate hash table with largest type-set");
+    if (largest_ts) {
+      tp_for_parallel(tp, tp_temp, tp->worker_count, lnk_populate_leaf_ht, &task);
+    }
+    ProfEnd();
 
-  task.indices = input->int_obj_indices;
-  tp_for_parallel_prof(tp, tp_temp, task.indices.count, lnk_leaf_dedup_task, &task, ".debug$T");
+    ProfBegin("Leaf Dedup");
+    task.indices = input->debug_p_indices;
+    tp_for_parallel_prof(tp, tp_temp, task.indices.count, lnk_leaf_dedup_task, &task, ".debug$P");
 
-  task.indices = dedup_type_server_indices;
-  tp_for_parallel_prof(tp, tp_temp, task.indices.count, lnk_leaf_dedup_task, &task, "Type Servers");
+    task.indices = input->int_obj_indices;
+    tp_for_parallel_prof(tp, tp_temp, task.indices.count, lnk_leaf_dedup_task, &task, ".debug$T");
 
-  task.indices = input->ifc_indices;
-  tp_for_parallel_prof(tp, tp_temp, task.indices.count, lnk_leaf_dedup_task, &task, "IFC Blobs");
-  ProfEnd();
+    task.indices = dedup_type_server_indices;
+    tp_for_parallel_prof(tp, tp_temp, task.indices.count, lnk_leaf_dedup_task, &task, "Type Servers");
+
+    task.indices = input->ifc_indices;
+    tp_for_parallel_prof(tp, tp_temp, task.indices.count, lnk_leaf_dedup_task, &task, "IFC Blobs");
+    ProfEnd();
+
+    if (ins_atomic_u32_eval(&task.leaf_ht_overflow) == 0) { break; }
+
+    // an estimate-sized table overflowed: rebuild every probe table at the always-sufficient
+    // total-based caps and redo the passes. the input hashes are deterministic, so this branch is
+    // taken (or not) identically every run, and the retried result is what the total-based sizing
+    // would have produced in the first place. the fallback caps cannot overflow, so at most one retry.
+    AssertAlways(attempt == 0);
+    lnk_log(LNK_Log_Debug, "leaf dedup: unique-count estimate overflowed, retrying with total-based table caps");
+    ins_atomic_u32_eval_assign(&task.leaf_ht_overflow, 0);
+    for EachIndex(ti_source, CV_TypeIndexSource_COUNT) {
+      task.leaf_ht_arr[ti_source].cap        = leaf_ht_cap_fallback[ti_source];
+      task.leaf_ht_arr[ti_source].bucket_arr = push_array(bucket_arena, LNK_LeafRef *, leaf_ht_cap_fallback[ti_source]);
+    }
+  }
 
   ProfBegin("Extract present buckets from the leaf hash tables");
 
@@ -3500,17 +3629,31 @@ THREAD_POOL_TASK_FUNC(lnk_move_global_symbols_to_gsi)
     }
     barrier_wait(tp->barrier);
 
-    // push global symbols
+    // push global symbols, sharded by bucket range: worker i owns buckets [i*B/W, (i+1)*B/W) and
+    // walks the FULL symbol sequence in global order, inserting only symbols whose bucket lands in
+    // its range. each bucket has a single owner and receives its inserts in global sequence order,
+    // so per-chain order (which is serialized into the PDB) is byte-identical to a serial loop, for
+    // any worker count -- no locks, no atomics.
+    CV_SymbolNode *global_nodes = 0;
     if (task_id == 0) {
-      CV_SymbolNode *nodes = push_array_no_zero(gsi->arena, CV_SymbolNode, symbol_count);
+      global_nodes = push_array_no_zero(gsi->arena, CV_SymbolNode, symbol_count);
+    }
+    tp_broadcast(&global_nodes);
+    {
+      U64 shard_min = (task_id * gsi->bucket_count) / tp->worker_count;
+      U64 shard_max = ((task_id + 1) * gsi->bucket_count) / tp->worker_count;
       for EachIndex(i, symbol_count) {
-        CV_SymbolNode *n = &nodes[i];
+        U64 bucket_idx = symbol_hashes[i] % gsi->bucket_count;
+        if (bucket_idx < shard_min || bucket_idx >= shard_max) { continue; }
+        CV_SymbolNode *n = &global_nodes[i];
         n->prev = n->next = 0;
         n->data = cv_symbol_from_ptr(symbol_arr[i]);
         n->data.offset = i;
-        gsi_push_(gsi, symbol_hashes[i], n);
+        cv_symbol_list_push_node(&gsi->bucket_arr[bucket_idx], n);
       }
     }
+    barrier_wait(tp->barrier);
+    if (task_id == 0) { gsi->symbol_count += symbol_count; }
   }
   ProfEnd();
 
@@ -3602,12 +3745,19 @@ THREAD_POOL_TASK_FUNC(lnk_move_global_symbols_to_gsi)
     }
     barrier_wait(tp->barrier);
 
-    // push proc refs
-    if (task_id == 0) {
-      U64 total_proc_ref_count = sum_array_u64(tp->worker_count, proc_ref_counts);
-      for EachIndex(i, total_proc_ref_count) { gsi_push_(gsi, proc_ref_hashes[i], &proc_ref_nodes[i]); }
+    // push proc refs, sharded by bucket range (single owner per bucket, inserts in global node
+    // order -> per-chain order identical to a serial loop for any worker count)
+    {
+      U64 shard_min = (task_id * gsi->bucket_count) / tp->worker_count;
+      U64 shard_max = ((task_id + 1) * gsi->bucket_count) / tp->worker_count;
+      for EachIndex(i, total_proc_ref_count) {
+        U64 bucket_idx = (U32)proc_ref_hashes[i] % gsi->bucket_count;
+        if (bucket_idx < shard_min || bucket_idx >= shard_max) { continue; }
+        cv_symbol_list_push_node(&gsi->bucket_arr[bucket_idx], &proc_ref_nodes[i]);
+      }
     }
     barrier_wait(tp->barrier);
+    if (task_id == 0) { gsi->symbol_count += total_proc_ref_count; }
   }
   ProfEnd();
 
@@ -3696,18 +3846,50 @@ THREAD_POOL_TASK_FUNC(lnk_move_global_symbols_to_gsi)
     }
     barrier_wait(tp->barrier);
 
-    // insert public symbols into PSI
+    // flatten the per-worker symbol lists (in worker order, matching the old serial walk) into one
+    // global-order node/hash array, so the sharded insert below can walk it without racing on the
+    // list links
+    U64             public_symbol_total_count = 0;
+    U64            *public_symbol_offsets     = 0; // [worker_count]
+    CV_SymbolNode **public_symbol_flat_nodes  = 0; // [public_symbol_total_count]
+    U32            *public_symbol_flat_hashes = 0; // [public_symbol_total_count]
     if (task_id == 0) {
-      for EachIndex(i, tp->worker_count) {
-        U64 k = 0;
-        for (CV_SymbolNode *curr = public_symbols[i].first, *next = 0; curr != 0; curr = next, k += 1) {
-          next = curr->next;
-          curr->next = 0;
-          gsi_push_(psi->gsi, public_symbol_hashes[i][k], curr);
-        }
+      U64 *list_counts = push_array_no_zero(scratch.arena, U64, tp->worker_count);
+      for EachIndex(i, tp->worker_count) { list_counts[i] = public_symbols[i].count; }
+      public_symbol_offsets     = offsets_from_counts_array_u64(scratch.arena, list_counts, tp->worker_count);
+      public_symbol_total_count = sum_array_u64(tp->worker_count, list_counts);
+      public_symbol_flat_nodes  = push_array_no_zero(scratch.arena, CV_SymbolNode *, public_symbol_total_count);
+      public_symbol_flat_hashes = push_array_no_zero(scratch.arena, U32, public_symbol_total_count);
+    }
+    tp_broadcast(&public_symbol_total_count);
+    tp_broadcast(&public_symbol_offsets);
+    tp_broadcast(&public_symbol_flat_nodes);
+    tp_broadcast(&public_symbol_flat_hashes);
+    {
+      U64 cursor = public_symbol_offsets[task_id];
+      U64 k      = 0;
+      for (CV_SymbolNode *curr = public_symbols[task_id].first; curr != 0; curr = curr->next, k += 1) {
+        public_symbol_flat_nodes [cursor] = curr;
+        public_symbol_flat_hashes[cursor] = public_symbol_hashes[task_id][k];
+        cursor += 1;
       }
     }
     barrier_wait(tp->barrier);
+
+    // insert public symbols into PSI, sharded by bucket range (single owner per bucket, inserts in
+    // global order -> per-chain order identical to a serial loop for any worker count)
+    {
+      PDB_GsiContext *pub_gsi   = psi->gsi;
+      U64             shard_min = (task_id * pub_gsi->bucket_count) / tp->worker_count;
+      U64             shard_max = ((task_id + 1) * pub_gsi->bucket_count) / tp->worker_count;
+      for EachIndex(i, public_symbol_total_count) {
+        U64 bucket_idx = public_symbol_flat_hashes[i] % pub_gsi->bucket_count;
+        if (bucket_idx < shard_min || bucket_idx >= shard_max) { continue; }
+        cv_symbol_list_push_node(&pub_gsi->bucket_arr[bucket_idx], public_symbol_flat_nodes[i]);
+      }
+    }
+    barrier_wait(tp->barrier);
+    if (task_id == 0) { psi->gsi->symbol_count += public_symbol_total_count; }
   }
   ProfEnd();
 
