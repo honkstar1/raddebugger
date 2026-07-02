@@ -81,6 +81,14 @@ typedef struct
   U64          obj_count;
   B32          is_stripped;
   B32          type_hash_xxh3; // internal type-leaf hashing uses XXH3-128 (low64); forced off when precomputed blake3 hashes are in play (accepted .debug$H sections or RRT type servers) -- see selection at the end of lnk_make_code_view_input
+  // parse-time leaf hashing ("touch once"): plain /Z7 objs (no .debug$P section, no LF_PRECOMP,
+  // no type-server ref, no LF_IFC_RECORD, no RRT in the link) have fully self-contained leaf
+  // hashes, so lnk_parse_debug_t_task hashes them right after the header sweep while the pages
+  // are still resident, instead of re-faulting the whole .debug$T input in lnk_merge_types.
+  // Enabled only when the hash algorithm is decidable up front (no RRT input; no .debug$H
+  // section on any obj when /DEBUG:GHASH) which pins type_hash_xxh3 = 1. Hash values, per-leaf
+  // input order and per-obj leaf order are identical to the lnk_hash_debug_t_task path.
+  B32          leaf_prehash;
 
   LNK_RRT_Array rrt_input;
 
@@ -132,6 +140,7 @@ typedef struct
   LNK_CodeViewInput *input;
   String8Array      *raw_types; // [obj_count]
   CV_DebugT         *out_types; // [obj_count]
+  B32                prehash;   // set only for the .debug$T pass when input->leaf_prehash
 } LNK_ParseCvTypes;
 
 ////////////////////////////////

@@ -1147,24 +1147,51 @@ cv_debug_t_from_data(Arena *arena, String8 data, U64 align)
 {
   CV_DebugT debug_t = { .data = data };
 
-  ProfBegin("Upfront parse for counts");
-  for (U64 cursor = 0, prev_cursor = 0, ti = CV_MinComplexTypeIndex; cursor < data.size; ti += 1) {
-    CV_Leaf leaf = {0};
-    TryRead(cv_read_leaf(data, cursor, align, &leaf), cursor, count_stop);
-    debug_t.source_counts[cv_type_index_source_from_leaf_kind(leaf.kind)] += 1;
-  }
+  ProfBegin("Parse leaf offsets");
+  // fused header sweep: previously this always ran TWO identical sweeps (count leaves, then
+  // store offsets). For typical sections, over-allocate offsets to the worst-case leaf count
+  // (every leaf minimal: AlignPow2(sizeof(CV_LeafHeader), align) bytes), fill offsets +
+  // per-source counts in one walk, then pop the unused tail off the arena. The over-allocation
+  // is capped (CV_DEBUG_T_FUSED_SWEEP_CAP leaves ~ 4MB of U32 offsets): beyond that the
+  // transient arena high-water/commit churn costs more than the second header walk, so giant
+  // sections keep the exact-size two-sweep form (the sweeps are adjacent, pages stay hot).
+#define CV_DEBUG_T_FUSED_SWEEP_CAP (1ull << 20)
+  U64 min_leaf_size = AlignPow2(sizeof(CV_LeafHeader), Max(1, align));
+  U64 max_count     = data.size / min_leaf_size;
+  if (max_count <= CV_DEBUG_T_FUSED_SWEEP_CAP) {
+    U32 *offsets = push_array_no_zero(arena, U32, max_count);
+    for (U64 cursor = 0; cursor < data.size && debug_t.count < max_count; ) {
+      CV_Leaf leaf = {0};
+      offsets[debug_t.count] = (U32)cursor;
+      TryRead(cv_read_leaf(data, cursor, align, &leaf), cursor, sweep_stop);
+      debug_t.source_counts[cv_type_index_source_from_leaf_kind(leaf.kind)] += 1;
+      if (leaf.kind == 0x1522) { debug_t.has_ifc_record = 1; } // LF_IFC_RECORD
+      debug_t.count += 1;
+    }
+sweep_stop:
+    arena_pop(arena, (max_count - debug_t.count) * sizeof(U32));
+    debug_t.offsets = offsets;
+  } else {
+    for (U64 cursor = 0; cursor < data.size; ) {
+      CV_Leaf leaf = {0};
+      TryRead(cv_read_leaf(data, cursor, align, &leaf), cursor, count_stop);
+      debug_t.source_counts[cv_type_index_source_from_leaf_kind(leaf.kind)] += 1;
+      if (leaf.kind == 0x1522) { debug_t.has_ifc_record = 1; } // LF_IFC_RECORD
+    }
 count_stop:
+    for EachElement(i, debug_t.source_counts) { debug_t.count += debug_t.source_counts[i]; }
+
+    debug_t.offsets = push_array_no_zero(arena, U32, debug_t.count);
+    for (U64 cursor = 0, idx = 0; cursor < data.size && idx < debug_t.count; idx += 1) {
+      debug_t.offsets[idx] = (U32)cursor;
+      TryRead(cv_read_leaf(data, cursor, align, &(CV_Leaf){0}), cursor, store_stop);
+    }
+store_stop:;
+  }
+#undef CV_DEBUG_T_FUSED_SWEEP_CAP
   ProfEnd();
 
-  for EachElement(i, debug_t.source_counts) { debug_t.count += debug_t.source_counts[i]; }
-
   ProfBegin("store leaf offsets");
-  debug_t.offsets = push_array_no_zero(arena, U32, debug_t.count);
-  for (U64 cursor = 0, idx = 0; cursor < data.size && idx < debug_t.count; idx += 1) {
-    debug_t.offsets[idx] = cursor;
-    TryRead(cv_read_leaf(data, cursor, align, &(CV_Leaf){0}), cursor, store_stop);
-  }
-store_stop:
 
   for EachElement(i, debug_t.ti_ranges) { debug_t.ti_ranges[i] = r1u64(CV_MinComplexTypeIndex, CV_MinComplexTypeIndex + debug_t.count); }
 
