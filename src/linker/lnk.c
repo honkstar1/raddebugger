@@ -4326,6 +4326,22 @@ typedef struct LNK_ICFFoldVerifyTask
   U32         *colors;
   U32         *leader_sci;  // out: per sorted position -> leader's sci index, or max_U32
   U32         *group_leader_oi; // out: per group -> elected leader sorted-position (for apply)
+
+  // Staged fold-apply inputs, gathered here IN PARALLEL so the serial apply pass doesn't pay the
+  // 4-5 dependent cache-miss chain (sci -> cand -> obj -> symlinks[sn] -> node) per follower
+  // (measured 778ms serial on the FN editor Engine.dll link). These are all PURE READS of state
+  // the apply pass does not mutate: apply writes node->symbol fields and icf_fold[] entries, never
+  // the obj->symlinks[] pointer arrays, so the staged pointers are identical to what the serial
+  // pass would have loaded. The order-sensitive part -- reading Lnode->symbol and committing the
+  // writes -- STAYS SERIAL in group order (cross-class symlink chains: an earlier group's follower
+  // node can be a later group's leader node, so value reads must observe earlier commits).
+  LNK_SymbolHashTrie **group_lnode;     // out: per group -> leader's symlink node (may be 0); valid only for groups of size >= 2
+  U32                 *group_leader_ii; // out: per group -> leader obj input_idx
+  U32                 *group_leader_sn; // out: per group -> leader section number
+  // per sorted position k (valid iff leader_sci[k] != max_U32): the follower's symlink node, or,
+  // when the follower has NO symlink (static COMDAT icf_fold path), the tagged (low bit set)
+  // address of its icf_fold slot. LNK_ICFFold is 4-byte aligned so bit 0 is free for the tag.
+  void               **fold_ptr;
 } LNK_ICFFoldVerifyTask;
 
 internal
@@ -4350,6 +4366,9 @@ THREAD_POOL_TASK_FUNC(lnk_icf_fold_verify_task)
     task->group_leader_oi[gi] = (U32)leader_oi;
 
     LNK_ICFCand        *L       = &task->cands[task->sci[leader_oi]];
+    task->group_lnode[gi]     = L->obj->symlinks[L->sn];
+    task->group_leader_ii[gi] = L->obj->input_idx;
+    task->group_leader_sn[gi] = L->sn;
     COFF_SectionHeader *Lheader = lnk_coff_section_header_from_section_number(L->obj, L->sn);
     String8             Ldata   = str8_substr(L->obj->data, rng_1u64(Lheader->foff, Lheader->foff + Lheader->fsize));
     U32                 Lkids[LNK_ICF_MAX_ASSOC];
@@ -4393,6 +4412,8 @@ THREAD_POOL_TASK_FUNC(lnk_icf_fold_verify_task)
       }
       if (!relocs_match) { continue; }
       task->leader_sci[k] = task->sci[leader_oi]; // verified fold
+      LNK_SymbolHashTrie *Fnode = F->obj->symlinks[F->sn];
+      task->fold_ptr[k] = Fnode ? (void *)Fnode : (void *)((U64)&F->obj->icf_fold[F->sn - 1] | 1);
     }
   }
 }
@@ -5277,6 +5298,10 @@ lnk_opt_icf(TP_Context *tp, Arena *perm, LNK_SymbolTable *symtab, LNK_Config *co
   U32 *leader_sci      = push_array_no_zero(arena, U32, cand_count ? cand_count : 1);
   for EachIndex(k, cand_count) { leader_sci[k] = max_U32; }
   U32 *group_leader_oi = push_array_no_zero(arena, U32, group_count ? group_count : 1);
+  LNK_SymbolHashTrie **group_lnode     = push_array_no_zero(arena, LNK_SymbolHashTrie *, group_count ? group_count : 1);
+  U32                 *group_leader_ii = push_array_no_zero(arena, U32, group_count ? group_count : 1);
+  U32                 *group_leader_sn = push_array_no_zero(arena, U32, group_count ? group_count : 1);
+  void               **fold_ptr        = push_array_no_zero(arena, void *, cand_count ? cand_count : 1);
   if (group_count) {
     LNK_ICFFoldVerifyTask vt = {0};
     vt.ranges          = tp_divide_work(arena, group_count, tp->worker_count);
@@ -5288,27 +5313,35 @@ lnk_opt_icf(TP_Context *tp, Arena *perm, LNK_SymbolTable *symtab, LNK_Config *co
     vt.colors          = colors;
     vt.leader_sci      = leader_sci;
     vt.group_leader_oi = group_leader_oi;
+    vt.group_lnode     = group_lnode;
+    vt.group_leader_ii = group_leader_ii;
+    vt.group_leader_sn = group_leader_sn;
+    vt.fold_ptr        = fold_ptr;
     tp_for_parallel(tp, 0, tp->worker_count, lnk_icf_fold_verify_task, &vt);
   }
 
+  // SERIAL apply, in group order, consuming the pointers staged in parallel by the verify task.
+  // Order-sensitive: Lnode->symbol reads must observe earlier groups' Fnode->symbol writes (an
+  // earlier group's follower node can be a later group's leader node), so the value reads and all
+  // writes stay serial, exactly as before -- only the address computation moved to the verify task.
+  // Byte-identical: same groups, same order, same values written.
   U64 fold_count = 0;
   for EachIndex(gi, group_count) {
     U64 i = group_first[gi];
     U64 j = group_first[gi + 1];
     if (j - i < 2) { continue; }
-    U64                 leader_oi = group_leader_oi[gi];
-    LNK_ICFCand        *L         = &cands[sci[leader_oi]];
-    LNK_SymbolHashTrie *Lnode     = L->obj->symlinks[L->sn];
+    LNK_SymbolHashTrie *Lnode = group_lnode[gi];
     for (U64 k = i; k < j; k += 1) {
       if (leader_sci[k] == max_U32) { continue; } // not a verified follower
-      LNK_ICFCand        *F     = &cands[sci[k]];
-      LNK_SymbolHashTrie *Fnode = F->obj->symlinks[F->sn];
-      if (Fnode) {
+      void *fp = fold_ptr[k];
+      if (((U64)fp & 1) == 0) {
+        LNK_SymbolHashTrie *Fnode = (LNK_SymbolHashTrie *)fp;
         if (Lnode && Fnode != Lnode) { Fnode->symbol = Lnode->symbol; fold_count += 1; }
       } else {
-        F->obj->icf_fold[F->sn - 1].leader_obj_idx = L->obj->input_idx;
-        F->obj->icf_fold[F->sn - 1].leader_sn      = L->sn;
-        F->obj->icf_fold[F->sn - 1].set            = 1;
+        LNK_ICFFold *slot = (LNK_ICFFold *)((U64)fp & ~(U64)1);
+        slot->leader_obj_idx = group_leader_ii[gi];
+        slot->leader_sn      = group_leader_sn[gi];
+        slot->set            = 1;
         fold_count += 1;
       }
     }
