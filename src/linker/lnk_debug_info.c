@@ -7,7 +7,11 @@ internal Arena *
 lnk_get_huge_arena(void)
 {
   if (g_huge_arena == 0) {
-    g_huge_arena = arena_alloc(.name = "HUGE");
+    // 2MB commit quantum (vs the 64KB default): this arena backs multi-GB debug
+    // info merges; the larger quantum cuts VirtualAlloc(MEM_COMMIT) syscalls
+    // (all serialized on the process address-space lock) ~32x for at most 2MB
+    // of slack past the high-water mark.
+    g_huge_arena = arena_alloc(.commit_size = MB(2), .name = "HUGE");
   }
   return g_huge_arena;
 }
@@ -2807,18 +2811,11 @@ THREAD_POOL_TASK_FUNC(lnk_cv_patcher_leaves_task)
   Arena          *fixed_arena = task->fixed_arenas[task_id];
   for EachInRange(leaf_ref_idx, range) {
     Temp temp = temp_begin(fixed_arena);
-<<<<<<< HEAD
-    LNK_LeafRef          *patch        = task->unique_leaf_refs_arr[task->ti_source].v[leaf_ref_idx];
-    CV_DebugT            *debug_t      = &task->input->debug_t_arr[patch->obj_idx];
-    CV_Leaf               leaf         = cv_debug_t_get_leaf(debug_t, patch->leaf_idx);
-    CV_TypeIndexInfoList  ti_info_list = cv_get_leaf_type_index_offsets(temp.arena, leaf.kind, leaf.data);
-    lnk_fixup_cv_type_indices(task, patch->obj_idx, leaf.data, ti_info_list);
-=======
-    CV_Leaf leaf = {0};
-    cv_read_leaf(str8(task->result.v[task->ti_source][i], raw_leaf.size), 0, 1, &leaf);
-    CV_TiOffsets ti_offs = cv_leaf_ti_offsets(temp.arena, leaf.kind, leaf.data);
-    lnk_fixup_cv_type_indices(task, leaf_ref.obj_idx, leaf.data, ti_offs);
->>>>>>> ddeb145e (codeview: replace per-TI linked-list type-index offsets with static descriptor tables)
+    LNK_LeafRef  *patch   = task->unique_leaf_refs_arr[task->ti_source].v[leaf_ref_idx];
+    CV_DebugT    *debug_t = &task->input->debug_t_arr[patch->obj_idx];
+    CV_Leaf       leaf    = cv_debug_t_get_leaf(debug_t, patch->leaf_idx);
+    CV_TiOffsets  ti_offs = cv_leaf_ti_offsets(temp.arena, leaf.kind, leaf.data);
+    lnk_fixup_cv_type_indices(task, patch->obj_idx, leaf.data, ti_offs);
     temp_end(temp);
   }
   ProfEnd();
