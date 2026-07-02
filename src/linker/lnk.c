@@ -3639,6 +3639,21 @@ lnk_tp_divide_work_into(Rng1U64 *ranges, U64 item_count, U32 worker_count)
   ranges[worker_count] = rng_1u64(item_count, item_count);
 }
 
+// Serial refine fold over relocs [j0, n) of one cand: EXACT per-reloc math and order of the
+// original scalar loop (epilogue/tail helper for the interleaved refine phase).
+internal U64
+lnk_icf_refine_fold(LNK_ICFRegion *rs, U64 k, U64 f, U64 j0, U64 n, U64 *isc)
+{
+  for (U64 j = j0; j < n; j += 1) {
+    U64 idx = f + j;
+    U64 ic  = rs->rt_iscand[idx];
+    U64 t   = ic ? rs->colors[rs->rt_target[idx]] : rs->rt_target[idx];
+    *isc   += ic;
+    k = lnk_icf_mix(k, t);
+  }
+  return k;
+}
+
 // One persistent parallel region spanning ALL refine rounds. worker_count participants; phase
 // boundaries are barriers; serial glue runs on worker 0. Each worker owns ranges[worker_id].
 internal
@@ -3672,22 +3687,77 @@ THREAD_POOL_TASK_FUNC(lnk_icf_refine_region_task)
     U64 n = rs->round_n;
 
     // -------- PHASE: refine (reloc-weighted ranges) --------
+    // 4-way candidate interleave: per-cand key math is a serial lnk_icf_mix chain (~7 cycle
+    // xor/mul/xor latency per reloc) while the reloc loads are chain-independent, so four
+    // INDEPENDENT cands' chains are advanced in lockstep to overlap the mix latency. Each
+    // cand's own fold order is untouched (lockstep over min(count), then per-cand epilogues
+    // via lnk_icf_refine_fold) => every newkey[ci] is bit-identical to the scalar loop by
+    // construction.
     {
       Rng1U64 r = rs->refine_ranges[wid];
       U64 inert_loc = 0;
-      for EachInRange(ai, r) {
+      U64 ai = r.min;
+      for (; ai + 4 <= r.max; ai += 4) {
+        U64          ci0 = rs->active[ai + 0];
+        U64          ci1 = rs->active[ai + 1];
+        U64          ci2 = rs->active[ai + 2];
+        U64          ci3 = rs->active[ai + 3];
+        LNK_ICFCand *c0  = &rs->cands[ci0];
+        LNK_ICFCand *c1  = &rs->cands[ci1];
+        LNK_ICFCand *c2  = &rs->cands[ci2];
+        LNK_ICFCand *c3  = &rs->cands[ci3];
+        U64 k0 = lnk_icf_mix(0x9e3779b97f4a7c15ull, rs->colors[ci0]);
+        U64 k1 = lnk_icf_mix(0x9e3779b97f4a7c15ull, rs->colors[ci1]);
+        U64 k2 = lnk_icf_mix(0x9e3779b97f4a7c15ull, rs->colors[ci2]);
+        U64 k3 = lnk_icf_mix(0x9e3779b97f4a7c15ull, rs->colors[ci3]);
+        U64 isc0 = 0, isc1 = 0, isc2 = 0, isc3 = 0;
+        U64 f0 = c0->reloc_first, n0 = c0->reloc_count;
+        U64 f1 = c1->reloc_first, n1 = c1->reloc_count;
+        U64 f2 = c2->reloc_first, n2 = c2->reloc_count;
+        U64 f3 = c3->reloc_first, n3 = c3->reloc_count;
+        U64 nmin = Min(Min(n0, n1), Min(n2, n3));
+        for (U64 j = 0; j < nmin; j += 1) {
+          U64 idx0 = f0 + j;
+          U64 idx1 = f1 + j;
+          U64 idx2 = f2 + j;
+          U64 idx3 = f3 + j;
+          U64 ic0  = rs->rt_iscand[idx0];
+          U64 ic1  = rs->rt_iscand[idx1];
+          U64 ic2  = rs->rt_iscand[idx2];
+          U64 ic3  = rs->rt_iscand[idx3];
+          U64 t0   = ic0 ? rs->colors[rs->rt_target[idx0]] : rs->rt_target[idx0];
+          U64 t1   = ic1 ? rs->colors[rs->rt_target[idx1]] : rs->rt_target[idx1];
+          U64 t2   = ic2 ? rs->colors[rs->rt_target[idx2]] : rs->rt_target[idx2];
+          U64 t3   = ic3 ? rs->colors[rs->rt_target[idx3]] : rs->rt_target[idx3];
+          isc0    += ic0;
+          isc1    += ic1;
+          isc2    += ic2;
+          isc3    += ic3;
+          k0 = lnk_icf_mix(k0, t0);
+          k1 = lnk_icf_mix(k1, t1);
+          k2 = lnk_icf_mix(k2, t2);
+          k3 = lnk_icf_mix(k3, t3);
+        }
+        k0 = lnk_icf_refine_fold(rs, k0, f0, nmin, n0, &isc0);
+        k1 = lnk_icf_refine_fold(rs, k1, f1, nmin, n1, &isc1);
+        k2 = lnk_icf_refine_fold(rs, k2, f2, nmin, n2, &isc2);
+        k3 = lnk_icf_refine_fold(rs, k3, f3, nmin, n3, &isc3);
+        if (isc0 == 0) { inert_loc += 1; } // key depends only on own color -> inert (see lane_inert)
+        if (isc1 == 0) { inert_loc += 1; }
+        if (isc2 == 0) { inert_loc += 1; }
+        if (isc3 == 0) { inert_loc += 1; }
+        rs->newkey[ci0] = k0;
+        rs->newkey[ci1] = k1;
+        rs->newkey[ci2] = k2;
+        rs->newkey[ci3] = k3;
+      }
+      for (; ai < r.max; ai += 1) {
         U64          ci = rs->active[ai];
         LNK_ICFCand *c  = &rs->cands[ci];
-        U64 k = lnk_icf_mix(0x9e3779b97f4a7c15ull, rs->colors[ci]);
         U64 isc = 0;
-        for EachIndex(j, c->reloc_count) {
-          U64 idx = (U64)c->reloc_first + j;
-          U64 ic  = rs->rt_iscand[idx];
-          U64 t   = ic ? rs->colors[rs->rt_target[idx]] : rs->rt_target[idx];
-          isc    += ic;
-          k = lnk_icf_mix(k, t);
-        }
-        if (isc == 0) { inert_loc += 1; } // key depends only on own color -> inert (see lane_inert)
+        U64 k = lnk_icf_mix(0x9e3779b97f4a7c15ull, rs->colors[ci]);
+        k = lnk_icf_refine_fold(rs, k, c->reloc_first, 0, c->reloc_count, &isc);
+        if (isc == 0) { inert_loc += 1; }
         rs->newkey[ci] = k;
       }
       rs->lane_inert[wid * LNK_ICF_CL_STRIDE_U64] = inert_loc;
