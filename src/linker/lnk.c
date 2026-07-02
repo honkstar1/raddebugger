@@ -8423,6 +8423,9 @@ lnk_run_type_server(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
 
     // copy pointers to type hashes
     MemoryCopyArray(rrt.type_hashes_unpacked, cv_types.hashes);
+
+    // record which algorithm produced the hashes (consumer must select the same one)
+    rrt.hash_alg = cv.type_hash_xxh3 ? LNK_RRT_HashAlg_XXH3_128LOW64 : LNK_RRT_HashAlg_BLAKE3;
   }
 
   rrt.obj_count = include_objs.count;
