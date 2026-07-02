@@ -4577,18 +4577,20 @@ lnk_icf_worklist_refine(TP_Context *tp, Arena *arena, U64 cand_count, LNK_ICFCan
   U64 *wl_base     = push_array_no_zero(t.arena, U64, W);
   U64 *wl_out_n    = push_array_no_zero(t.arena, U64, W);
 
-  // hang-guard: hard round cap AND non-progress detection. The worklist tail converges in <~20 cheap
-  // rounds; if dirty_n fails to strictly shrink for too many consecutive rounds, it is a re-dirty bug.
-  enum { LNK_ICF_WL_MAX_ROUNDS = 40, LNK_ICF_WL_STALL_LIMIT = 8 };
-  U64 rounds = 0, stall = 0, prev_dirty_n = max_U64;
+  // hang-guard: hard round cap only. Every round either splits at least one class (fresh_n > 0, which
+  // strictly grows the total class count, bounded by active_count) or breaks at the fixpoint test, so
+  // the worklist provably terminates; the cap exists to catch re-dirty BUGS (a broken recurrence
+  // enqueueing forever). The old "dirty_n must shrink" stall counter is gone: at an earlier
+  // region->worklist handoff the dirty set legitimately GROWS for several early rounds while real
+  // splits propagate outward through the referrer graph.
+  enum { LNK_ICF_WL_MAX_ROUNDS = 128 };
+  U64 rounds = 0;
   B32 ok = 1;
   B32 log_timers = lnk_get_log_status(LNK_Log_Timers);
 
   while (dirty_n > 0) {
     if (rounds >= LNK_ICF_WL_MAX_ROUNDS) { ok = 0; break; }
-    if (dirty_n >= prev_dirty_n) { stall += 1; if (stall >= LNK_ICF_WL_STALL_LIMIT) { ok = 0; break; } }
-    else { stall = 0; }
-    prev_dirty_n = dirty_n;
+    U64 dirty_in = dirty_n; // this round's dirty count (stats)
     rounds += 1;
     U64 round_begin_us = log_timers ? now_time_us() : 0;
 
@@ -4657,7 +4659,7 @@ lnk_icf_worklist_refine(TP_Context *tp, Arena *arena, U64 cand_count, LNK_ICFCan
     if (fresh_n == 0) { // no staged records at all (a split always has a non-first run) -> fixpoint
       if (log_timers) {
         lnk_log(LNK_Log_Timers, "[icf] worklist round %llu: dirty=%llu members=%llu split_members=0 (fixpoint) %.2f ms",
-                rounds, prev_dirty_n, round_mem, (F64)(now_time_us() - round_begin_us) / 1000.0);
+                rounds, dirty_in, round_mem, (F64)(now_time_us() - round_begin_us) / 1000.0);
       }
       break; // nothing split -> fixpoint
     }
@@ -4681,7 +4683,7 @@ lnk_icf_worklist_refine(TP_Context *tp, Arena *arena, U64 cand_count, LNK_ICFCan
 
     if (log_timers) {
       lnk_log(LNK_Log_Timers, "[icf] worklist round %llu: dirty=%llu members=%llu split_members=%llu new_slots=%llu next_dirty=%llu slots=%llu %.2f ms",
-              rounds, prev_dirty_n, round_mem, split_n, ns_n, dirty_n, slot_n, (F64)(now_time_us() - round_begin_us) / 1000.0);
+              rounds, dirty_in, round_mem, split_n, ns_n, dirty_n, slot_n, (F64)(now_time_us() - round_begin_us) / 1000.0);
     }
     if (lnk_get_log_status(LNK_Log_Debug)) {
       lnk_log(LNK_Log_Debug, "/OPT:ICF worklist round %llu: split_members=%llu next_dirty=%llu slots=%llu",
@@ -4864,7 +4866,7 @@ lnk_opt_icf(TP_Context *tp, Arena *perm, LNK_SymbolTable *symtab, LNK_Config *co
     // lnk_icf_build_reverse_index now keeps only active-row, deduped (referrer,target) edges (measured
     // 10.6M edges / 42.5MB, 9.3x smaller -- see its LNK_Log_Debug line), flipping the trade: same link
     // measures region exclusive 68.2s -> 28.1s thread-time with no peak-working-set regression.
-    U64 region_cap = 8; // worklist warm-up (64 = run region to fixpoint, worklist skipped)
+    U64 region_cap = 4; // worklist warm-up (64 = run region to fixpoint, worklist skipped)
 
 #if defined(ICF_WORKLIST_SELFCHECK)
     // REFERENCE: clone pre-region state and run the region UNCAPPED to the true fixpoint into shadow
