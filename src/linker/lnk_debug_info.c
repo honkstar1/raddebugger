@@ -3629,17 +3629,31 @@ THREAD_POOL_TASK_FUNC(lnk_move_global_symbols_to_gsi)
     }
     barrier_wait(tp->barrier);
 
-    // push global symbols
+    // push global symbols, sharded by bucket range: worker i owns buckets [i*B/W, (i+1)*B/W) and
+    // walks the FULL symbol sequence in global order, inserting only symbols whose bucket lands in
+    // its range. each bucket has a single owner and receives its inserts in global sequence order,
+    // so per-chain order (which is serialized into the PDB) is byte-identical to a serial loop, for
+    // any worker count -- no locks, no atomics.
+    CV_SymbolNode *global_nodes = 0;
     if (task_id == 0) {
-      CV_SymbolNode *nodes = push_array_no_zero(gsi->arena, CV_SymbolNode, symbol_count);
+      global_nodes = push_array_no_zero(gsi->arena, CV_SymbolNode, symbol_count);
+    }
+    tp_broadcast(&global_nodes);
+    {
+      U64 shard_min = (task_id * gsi->bucket_count) / tp->worker_count;
+      U64 shard_max = ((task_id + 1) * gsi->bucket_count) / tp->worker_count;
       for EachIndex(i, symbol_count) {
-        CV_SymbolNode *n = &nodes[i];
+        U64 bucket_idx = symbol_hashes[i] % gsi->bucket_count;
+        if (bucket_idx < shard_min || bucket_idx >= shard_max) { continue; }
+        CV_SymbolNode *n = &global_nodes[i];
         n->prev = n->next = 0;
         n->data = cv_symbol_from_ptr(symbol_arr[i]);
         n->data.offset = i;
-        gsi_push_(gsi, symbol_hashes[i], n);
+        cv_symbol_list_push_node(&gsi->bucket_arr[bucket_idx], n);
       }
     }
+    barrier_wait(tp->barrier);
+    if (task_id == 0) { gsi->symbol_count += symbol_count; }
   }
   ProfEnd();
 
@@ -3731,12 +3745,19 @@ THREAD_POOL_TASK_FUNC(lnk_move_global_symbols_to_gsi)
     }
     barrier_wait(tp->barrier);
 
-    // push proc refs
-    if (task_id == 0) {
-      U64 total_proc_ref_count = sum_array_u64(tp->worker_count, proc_ref_counts);
-      for EachIndex(i, total_proc_ref_count) { gsi_push_(gsi, proc_ref_hashes[i], &proc_ref_nodes[i]); }
+    // push proc refs, sharded by bucket range (single owner per bucket, inserts in global node
+    // order -> per-chain order identical to a serial loop for any worker count)
+    {
+      U64 shard_min = (task_id * gsi->bucket_count) / tp->worker_count;
+      U64 shard_max = ((task_id + 1) * gsi->bucket_count) / tp->worker_count;
+      for EachIndex(i, total_proc_ref_count) {
+        U64 bucket_idx = (U32)proc_ref_hashes[i] % gsi->bucket_count;
+        if (bucket_idx < shard_min || bucket_idx >= shard_max) { continue; }
+        cv_symbol_list_push_node(&gsi->bucket_arr[bucket_idx], &proc_ref_nodes[i]);
+      }
     }
     barrier_wait(tp->barrier);
+    if (task_id == 0) { gsi->symbol_count += total_proc_ref_count; }
   }
   ProfEnd();
 
@@ -3825,18 +3846,50 @@ THREAD_POOL_TASK_FUNC(lnk_move_global_symbols_to_gsi)
     }
     barrier_wait(tp->barrier);
 
-    // insert public symbols into PSI
+    // flatten the per-worker symbol lists (in worker order, matching the old serial walk) into one
+    // global-order node/hash array, so the sharded insert below can walk it without racing on the
+    // list links
+    U64             public_symbol_total_count = 0;
+    U64            *public_symbol_offsets     = 0; // [worker_count]
+    CV_SymbolNode **public_symbol_flat_nodes  = 0; // [public_symbol_total_count]
+    U32            *public_symbol_flat_hashes = 0; // [public_symbol_total_count]
     if (task_id == 0) {
-      for EachIndex(i, tp->worker_count) {
-        U64 k = 0;
-        for (CV_SymbolNode *curr = public_symbols[i].first, *next = 0; curr != 0; curr = next, k += 1) {
-          next = curr->next;
-          curr->next = 0;
-          gsi_push_(psi->gsi, public_symbol_hashes[i][k], curr);
-        }
+      U64 *list_counts = push_array_no_zero(scratch.arena, U64, tp->worker_count);
+      for EachIndex(i, tp->worker_count) { list_counts[i] = public_symbols[i].count; }
+      public_symbol_offsets     = offsets_from_counts_array_u64(scratch.arena, list_counts, tp->worker_count);
+      public_symbol_total_count = sum_array_u64(tp->worker_count, list_counts);
+      public_symbol_flat_nodes  = push_array_no_zero(scratch.arena, CV_SymbolNode *, public_symbol_total_count);
+      public_symbol_flat_hashes = push_array_no_zero(scratch.arena, U32, public_symbol_total_count);
+    }
+    tp_broadcast(&public_symbol_total_count);
+    tp_broadcast(&public_symbol_offsets);
+    tp_broadcast(&public_symbol_flat_nodes);
+    tp_broadcast(&public_symbol_flat_hashes);
+    {
+      U64 cursor = public_symbol_offsets[task_id];
+      U64 k      = 0;
+      for (CV_SymbolNode *curr = public_symbols[task_id].first; curr != 0; curr = curr->next, k += 1) {
+        public_symbol_flat_nodes [cursor] = curr;
+        public_symbol_flat_hashes[cursor] = public_symbol_hashes[task_id][k];
+        cursor += 1;
       }
     }
     barrier_wait(tp->barrier);
+
+    // insert public symbols into PSI, sharded by bucket range (single owner per bucket, inserts in
+    // global order -> per-chain order identical to a serial loop for any worker count)
+    {
+      PDB_GsiContext *pub_gsi   = psi->gsi;
+      U64             shard_min = (task_id * pub_gsi->bucket_count) / tp->worker_count;
+      U64             shard_max = ((task_id + 1) * pub_gsi->bucket_count) / tp->worker_count;
+      for EachIndex(i, public_symbol_total_count) {
+        U64 bucket_idx = public_symbol_flat_hashes[i] % pub_gsi->bucket_count;
+        if (bucket_idx < shard_min || bucket_idx >= shard_max) { continue; }
+        cv_symbol_list_push_node(&pub_gsi->bucket_arr[bucket_idx], public_symbol_flat_nodes[i]);
+      }
+    }
+    barrier_wait(tp->barrier);
+    if (task_id == 0) { psi->gsi->symbol_count += public_symbol_total_count; }
   }
   ProfEnd();
 
