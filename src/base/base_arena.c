@@ -47,16 +47,32 @@ arena_alloc_(ArenaParams *params)
       commit_size  = AlignPow2(commit_size,  get_system_info()->page_size);
     }
     
+    B32 commit_ok = 0;
     if(params->flags & ArenaFlag_LargePages)
     {
       base = reserve_memory_large(reserve_size);
-      commit_memory_large(base, commit_size);
+      commit_ok = (base != 0) && (commit_size == 0 || commit_memory_large(base, commit_size));
     }
     else
     {
       base = reserve_memory(reserve_size);
-      commit_memory(base, commit_size);
+      commit_ok = (base != 0) && (commit_size == 0 || commit_memory(base, commit_size));
     }
+
+    // rjf: panic on arena creation failure (previously unchecked in
+    // non-graphical builds: writing the arena header into an unreserved or
+    // uncommitted base address turned an out-of-memory condition into an
+    // access violation)
+    if(Unlikely(base == 0 || !commit_ok))
+    {
+#if OS_FEATURE_GRAPHICAL
+      wm_graphical_message(1, str8_lit("Fatal Allocation Failure"), str8_lit("Unexpected memory allocation failure."));
+#else
+      fprintf(stderr, "fatal: out of memory: unable to allocate a memory block (reserve %llu bytes, commit %llu bytes)\n", (unsigned long long)reserve_size, (unsigned long long)commit_size);
+#endif
+      abort_self(1);
+    }
+
     AsanPoisonMemoryRegion(base, commit_size);
     // TODO(rjf): we need to reintroduce this later when we have the ability to remove annotations...
     // raddbg_annotate_vaddr_range(base, reserve_size, "arena %s:%i", params->allocation_site_file, params->allocation_site_line);
@@ -65,15 +81,6 @@ arena_alloc_(ArenaParams *params)
   {
     AsanPoisonMemoryRegion(base, params->reserve_size);
   }
-  
-  // rjf: panic on arena creation failure
-#if OS_FEATURE_GRAPHICAL
-  if(Unlikely(base == 0))
-  {
-    wm_graphical_message(1, str8_lit("Fatal Allocation Failure"), str8_lit("Unexpected memory allocation failure."));
-    abort_self(1);
-  }
-#endif
   
   // rjf: extract arena header & fill
   AsanUnpoisonMemoryRegion(base, ARENA_HEADER_SIZE);
@@ -256,16 +263,23 @@ arena_push(Arena *arena, U64 size, U64 align, B32 zero)
     U64 cmt_pst_clamped = ClampTop(cmt_pst_aligned, current->res);
     U64 cmt_size = cmt_pst_clamped - current->cmt;
     U8 *cmt_ptr = (U8 *)current + current->cmt;
+    B32 commit_ok;
     if(current->flags & ArenaFlag_LargePages)
     {
-      commit_memory_large(cmt_ptr, cmt_size);
+      commit_ok = commit_memory_large(cmt_ptr, cmt_size);
     }
     else
     {
-      commit_memory(cmt_ptr, cmt_size);
+      commit_ok = commit_memory(cmt_ptr, cmt_size);
     }
-    AsanPoisonMemoryRegion(cmt_ptr, cmt_size);
-    current->cmt = cmt_pst_clamped;
+    // rjf: a failed commit must not advance current->cmt: the pages are not
+    // backed, and pretending they are turns out-of-memory into an access
+    // violation on first touch (the result == 0 panic below reports it cleanly)
+    if(Likely(commit_ok))
+    {
+      AsanPoisonMemoryRegion(cmt_ptr, cmt_size);
+      current->cmt = cmt_pst_clamped;
+    }
   }
   
   // rjf: push onto current block
@@ -287,15 +301,18 @@ arena_push(Arena *arena, U64 size, U64 align, B32 zero)
   }
 #endif
   
-  // rjf: panic on failure
-#if OS_FEATURE_GRAPHICAL
+  // rjf: panic on failure (a failed commit above leaves result == 0; returning
+  // it would turn out-of-memory into an access violation at the use site)
   if(Unlikely(result == 0))
   {
+#if OS_FEATURE_GRAPHICAL
     wm_graphical_message(1, str8_lit("Fatal Allocation Failure"), str8_lit("Unexpected memory allocation failure."));
+#else
+    fprintf(stderr, "fatal: out of memory: unable to allocate %llu bytes\n", (unsigned long long)size);
+#endif
     abort_self(1);
   }
-#endif
-  
+
   return result;
 }
 
