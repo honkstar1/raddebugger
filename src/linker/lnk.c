@@ -3089,6 +3089,8 @@ typedef struct LNK_ICFHashTask
   LNK_SymbolTable *symtab;
   U8              *rt_iscand;
   U64             *rt_target;
+  U8              *inert;     // [cand] 1 = no iscand reloc in the cand's rt slice: its refine key
+                              // depends only on its own color + constants (see inert-class freeze)
 } LNK_ICFHashTask;
 
 // Canonicalize one reloc's target for ICF keying and write its (iscand, target) slot at rt index
@@ -3209,6 +3211,15 @@ THREAD_POOL_TASK_FUNC(lnk_icf_hash_task)
       for EachIndex(ri, krelocs.count) { lnk_icf_key_reloc(task, c, kids, kid_count, &krelocs.v[ri], &h, idx); idx += 1; }
     }
     Assert(idx == (U64)c->reloc_first + c->reloc_count);
+
+    // inert byte: no iscand reloc in the slice we just filled (cache-hot). An inert cand's refine
+    // key is a pure function of its own color + reloc constants, so two inert cands in one class
+    // can never diverge -- the basis for the all-inert run freeze in the refine region.
+    {
+      U8 iz = 1;
+      for EachIndex(j, c->reloc_count) { if (task->rt_iscand[(U64)c->reloc_first + j]) { iz = 0; break; } }
+      task->inert[ci] = iz;
+    }
 
     U8 out[16]; blake3_hasher_finalize(&h, out, sizeof(out));
     U64 lo = *(U64 *)&out[0], hi = *(U64 *)&out[8];
@@ -3567,6 +3578,19 @@ typedef struct LNK_ICFRegion
   // fails to split once can never split; logged as the go/no-go for the inert-class freeze).
   B32          log_timers;
   U64         *lane_inert;       // [worker_count * LNK_ICF_CL_STRIDE_U64]
+
+  // INERT-CLASS FREEZE: an inert cand (inert[ci], no iscand relocs) has a refine key that is a pure
+  // function of its own color + reloc constants. Colors are renumbered consistently per class, so two
+  // inert members of one class produce equal keys EVERY round -- an equal-key run whose members are
+  // ALL inert can never split internally, and (having no iscand out-edges) can never make anything
+  // else split. Freeze it: emit keep=0 for the whole surviving run (members leave the active set) but
+  // KEEP the colors just assigned (the class remains a fold group). Downstream is partition-only
+  // (documented at the worklist header), so output is byte-identical; the region simply stops
+  // re-sorting ~30% of the active set (measured inert fraction at editor scale) every round.
+  U8          *inert;            // [cand_count] from lnk_icf_hash_task
+  U8          *inert_pos;        // [cand_count] per-round: inert byte by sorted position
+  U8          *veto;             // [cand_count] per-round: 1 = position's run is all-inert (freeze)
+  U64         *lane_frozen;      // [worker_count * LNK_ICF_CL_STRIDE_U64] frozen members (log only)
 } LNK_ICFRegion;
 
 // in-place reloc-weighted division (mirrors lnk_icf_divide_by_reloc; writes into preallocated ranges)
@@ -3615,7 +3639,7 @@ THREAD_POOL_TASK_FUNC(lnk_icf_refine_region_task)
   for (U64 round = 0; round < rs->max_rounds; round += 1) {
     // per-round phase stamps (worker 0 only; all other lanes leave these untouched). A stamp taken
     // right after a barrier_wait returns marks "every lane finished the preceding phase".
-    U64 t_begin = 0, t_refine = 0, t_gather = 0, t_radix = 0, t_mark = 0, t_apply = 0, t_scatter = 0, t_emit = 0;
+    U64 t_begin = 0, t_refine = 0, t_gather = 0, t_radix = 0, t_veto = 0, t_mark = 0, t_apply = 0, t_scatter = 0, t_emit = 0;
     U64 round_inert = 0;
 
     // -------- round setup (worker 0): build ranges, snapshot active_count --------
@@ -3757,21 +3781,51 @@ THREAD_POOL_TASK_FUNC(lnk_icf_refine_region_task)
     }
     if (wid == 0 && rs->log_timers) { t_radix = now_time_us(); }
 
+    // -------- PHASE: inert-run veto (see LNK_ICFRegion freeze notes) --------
+    // 1) gather the per-sorted-position inert byte
+    {
+      Rng1U64 r = rs->work_ranges[wid];
+      for EachInRange(k, r) { rs->inert_pos[k] = rs->inert[rs->active[rs->sv[k]]]; }
+    }
+    barrier_wait(rs->tp->barrier);
+    // 2) run-owner walk: a run (equal-key group) is OWNED by the chunk containing its first position.
+    // The owner walks the whole run -- possibly past its own range end (reads of sk/inert_pos are
+    // shared; veto writes are disjoint because only the owner writes a run) -- ANDs the inert bytes,
+    // and stamps veto for every position of the run. Every position belongs to exactly one run and
+    // every run has exactly one owner, so veto[0,n) is fully (re)written each round.
+    {
+      Rng1U64 r = rs->work_ranges[wid];
+      U64 N = n;
+      U64 k = r.min;
+      if (k != 0) { while (k < r.max && rs->sk[k] == rs->sk[k - 1]) { k += 1; } } // skip leading partial run (earlier chunk owns it)
+      while (k < r.max) {
+        U64 e = k + 1;
+        U8 all_inert = rs->inert_pos[k];
+        while (e < N && rs->sk[e] == rs->sk[k]) { all_inert &= rs->inert_pos[e]; e += 1; }
+        for (U64 q = k; q < e; q += 1) { rs->veto[q] = all_inert; }
+        k = e;
+      }
+    }
+    barrier_wait(rs->tp->barrier);
+    if (wid == 0 && rs->log_timers) { t_veto = now_time_us(); }
+
     // -------- PHASE: scan mark (per-position keep bit + per-chunk local counts) --------
     {
       Rng1U64 r = rs->work_ranges[wid];
       U64 N = n;
-      U64 nloc = 0, kloc = 0, sloc = 0;
+      U64 nloc = 0, kloc = 0, sloc = 0, floc = 0;
       for (U64 k = r.min; k < r.max; k += 1) {
         B32 boundary      = (k == 0     || rs->sk[k] != rs->sk[k - 1]);
         B32 next_boundary = (k + 1 == N || rs->sk[k + 1] != rs->sk[k]);
-        U8  survive       = (U8)!(boundary && next_boundary);
+        U8  survive       = (U8)(!(boundary && next_boundary) && !rs->veto[k]); // freeze all-inert runs
         rs->keep[k] = survive;
         if (boundary)            { nloc += 1; }
         if (survive)             { kloc += 1; }
         if (boundary && survive) { sloc += 1; }
+        if (!(boundary && next_boundary) && rs->veto[k]) { floc += 1; } // would have survived; frozen
       }
       rs->chunk_nc[wid * LNK_ICF_CL_STRIDE_U64] = nloc; rs->chunk_kp[wid * LNK_ICF_CL_STRIDE_U64] = kloc; rs->chunk_sc[wid * LNK_ICF_CL_STRIDE_U64] = sloc;
+      rs->lane_frozen[wid * LNK_ICF_CL_STRIDE_U64] = floc;
     }
     barrier_wait(rs->tp->barrier);
     if (wid == 0 && rs->log_timers) { t_mark = now_time_us(); }
@@ -3845,11 +3899,13 @@ THREAD_POOL_TASK_FUNC(lnk_icf_refine_region_task)
         // split classes this round = classes whose members did not all land under one key: survivors'
         // classes that changed (next_class_count counts surviving classes; nc - active_class_count is
         // the net class growth = number of extra sub-cells created).
+        U64 round_frozen = 0;
+        for EachIndex(w, W) { round_frozen += rs->lane_frozen[w * LNK_ICF_CL_STRIDE_U64]; }
         lnk_log(LNK_Log_Timers,
-                "[icf] region round %llu: n=%llu classes %llu -> %llu (survivors=%llu in %llu classes, inert=%llu) | us: refine %llu, gather %llu, radix %llu (%llu passes), mark %llu, apply %llu, scatter %llu, emit %llu, total %llu",
-                round + 1, n, rs->active_class_count, nc, next_count, next_class_count, round_inert,
+                "[icf] region round %llu: n=%llu classes %llu -> %llu (survivors=%llu in %llu classes, inert=%llu, frozen=%llu) | us: refine %llu, gather %llu, radix %llu (%llu passes), veto %llu, mark %llu, apply %llu, scatter %llu, emit %llu, total %llu",
+                round + 1, n, rs->active_class_count, nc, next_count, next_class_count, round_inert, round_frozen,
                 t_refine - t_begin, t_gather - t_refine, t_radix - t_gather, rs->radix_pass_count,
-                t_mark - t_radix, t_apply - t_mark, t_scatter - t_apply, t_emit - t_scatter,
+                t_veto - t_radix, t_mark - t_veto, t_apply - t_mark, t_scatter - t_apply, t_emit - t_scatter,
                 t_emit - t_begin);
       }
       rs->color_base += nc;
@@ -4753,6 +4809,7 @@ lnk_opt_icf(TP_Context *tp, Arena *perm, LNK_SymbolTable *symtab, LNK_Config *co
   }
   U8  *rt_iscand = push_array_no_zero(arena, U8,  total_relocs ? total_relocs : 1);
   U64 *rt_target = push_array_no_zero(arena, U64, total_relocs ? total_relocs : 1);
+  U8  *cand_inert = push_array_no_zero(arena, U8, cand_count ? cand_count : 1); // see inert-class freeze
 
   {
     LNK_ICFHashTask hash_task = {0};
@@ -4762,6 +4819,7 @@ lnk_opt_icf(TP_Context *tp, Arena *perm, LNK_SymbolTable *symtab, LNK_Config *co
     hash_task.symtab    = symtab;
     hash_task.rt_iscand = rt_iscand;
     hash_task.rt_target = rt_target;
+    hash_task.inert     = cand_inert;
     tp_for_parallel(tp, 0, tp->worker_count, lnk_icf_hash_task, &hash_task);
   }
 
@@ -4849,6 +4907,10 @@ lnk_opt_icf(TP_Context *tp, Arena *perm, LNK_SymbolTable *symtab, LNK_Config *co
     rs.final_survcol = push_array_no_zero(arena, U32, active_count ? active_count : 1);
     rs.log_timers    = lnk_get_log_status(LNK_Log_Timers);
     rs.lane_inert    = push_array_no_zero(arena, U64, (W ? W : 1) * LNK_ICF_CL_STRIDE_U64);
+    rs.inert         = cand_inert;
+    rs.inert_pos     = push_array_no_zero(arena, U8, cand_count ? cand_count : 1);
+    rs.veto          = push_array_no_zero(arena, U8, cand_count ? cand_count : 1);
+    rs.lane_frozen   = push_array_no_zero(arena, U64, (W ? W : 1) * LNK_ICF_CL_STRIDE_U64);
 
     rs.active_count       = active_count;
     rs.active_class_count = active_class_count;
