@@ -2378,6 +2378,25 @@ THREAD_POOL_TASK_FUNC(lnk_hash_debug_t_deep_task)
   ProfEnd();
 }
 
+// Deterministic sampling for the unique-leaf estimator: process every K-th leaf POSITION per obj.
+// Position-based (leaf_idx % K), never value-based, so the sampled set -- and therefore the
+// estimate and the table caps -- is a pure function of the input, schedule-independent. The
+// dominant duplication pattern is whole-stream duplication (the same PCH/type-server leaf sequence
+// repeated across objs), where a unique hash sits at the SAME position in every copy: the sampled
+// distinct count then scales ~1/K, which LNK_ESTIMATE_SAMPLE_SCALE compensates for. The scale is
+// calibrated (see the estimate block in lnk_merge_types); an undershoot is caught by the existing
+// deterministic overflow-retry at total-based caps, an overshoot is clamped by Min(fallback cap).
+//
+// SCALE calibration: sampled-distinct is between distinct (fully position-scattered duplication)
+// and distinct/K (whole-stream duplication or unique-heavy input), so the true ratio is in [1, K].
+// SCALE * 1.9 (the downstream safety factor) must cover the worst-case ratio K to keep the
+// overflow-retry off for every duplication pattern: SCALE = 5.0 gives 5.0*1.9 = 9.5 >= K = 8
+// (1.19x margin over the bound, which also absorbs linear-counting noise). Measured on the FN
+// editor-scale link: ratio 3.99 (TPI) / 6.13 (IPI); SCALE = 5.0 reproduces the unsampled
+// estimator's caps exactly (64M/16M) at load factors 0.35/0.39.
+#define LNK_ESTIMATE_SAMPLE_STRIDE 8
+#define LNK_ESTIMATE_SAMPLE_SCALE  5.0
+
 internal
 THREAD_POOL_TASK_FUNC(lnk_estimate_unique_leaves_task)
 {
@@ -2389,7 +2408,7 @@ THREAD_POOL_TASK_FUNC(lnk_estimate_unique_leaves_task)
   // same prune rule as lnk_leaf_dedup_task: NOTYPE'd IFC blob leaves were never hashed and are
   // never inserted, so they must not contribute to the estimate either
   B32 is_ifc_blob = task->input->has_ifc_redirects && contains_1u64(task->input->ifc_obj_range, obj_idx);
-  for EachIndex(leaf_idx, debug_t->count) {
+  for (U64 leaf_idx = 0; leaf_idx < debug_t->count; leaf_idx += LNK_ESTIMATE_SAMPLE_STRIDE) {
     CV_LeafHeader *header = cv_debug_t_get_leaf_header(debug_t, leaf_idx);
     CV_LeafKind    kind   = memory_read16(MemberFromPtr(CV_LeafHeader, header, kind));
     if (is_ifc_blob && kind == CV_LeafKind_NOTYPE) { continue; }
@@ -3106,6 +3125,7 @@ lnk_merge_types(TP_Context *tp, TP_Arena *tp_temp, LNK_CodeViewInput *input, LNK
     // that instead. Everything here is a pure function of the input hashes, so the caps -- and the
     // overflow/retry decision below -- are identical run to run.
     ProfBegin("Estimate Unique Leaves");
+    U64 estimate_begin_us = now_time_us();
     {
       // sweep exactly the objs whose leaves get inserted: prepopulate + the four dedup passes
       U32Array sweep_arrs[] = { input->debug_p_indices, input->int_obj_indices, input->type_server_indices, input->ifc_indices };
@@ -3119,9 +3139,11 @@ lnk_merge_types(TP_Context *tp, TP_Arena *tp_temp, LNK_CodeViewInput *input, LNK
       }
 
       for EachIndex(ti_source, CV_TypeIndexSource_COUNT) {
-        // bits >= total >= unique keeps the bitmap load < 1, where linear counting is accurate;
+        // at most ceil(total/K) hashes are inserted under K-th-position sampling, so bits >=
+        // total/K >= sampled-unique keeps the bitmap load < 1, where linear counting is accurate;
         // clamp keeps the transient bitmap allocation bounded (16MB per source at the top end)
-        task.estimate_bitmap_bits[ti_source] = u64_up_to_pow2(Clamp(1ull << 16, total_counts[ti_source], 1ull << 27));
+        U64 sampled_total = (total_counts[ti_source] + LNK_ESTIMATE_SAMPLE_STRIDE - 1) / LNK_ESTIMATE_SAMPLE_STRIDE;
+        task.estimate_bitmap_bits[ti_source] = u64_up_to_pow2(Clamp(1ull << 16, sampled_total, 1ull << 27));
         task.estimate_bitmap     [ti_source] = push_array(scratch.arena, U32, task.estimate_bitmap_bits[ti_source] / 32);
       }
 
@@ -3145,14 +3167,20 @@ lnk_merge_types(TP_Context *tp, TP_Arena *tp_temp, LNK_CodeViewInput *input, LNK
           // linear counting: distinct ~= m * ln(m / zeros)
           F64 estimate = (F64)bit_count * log((F64)bit_count / (F64)zero_count);
           if (estimate < (F64)set_count) { estimate = (F64)set_count; }
+          // scale the sampled distinct count back up to a full-population estimate (see the
+          // sampling comment above lnk_estimate_unique_leaves_task)
+          estimate *= LNK_ESTIMATE_SAMPLE_SCALE;
           // 1.9x safety keeps the load factor <= ~0.55 even before pow2 rounding; overflow (only
           // possible if the estimate undershoots by >1.8x) is caught and retried deterministically
           U64 target = (U64)(estimate * 1.9) + 4096;
           cap = Min(u64_up_to_pow2(target), leaf_ht_cap_fallback[ti_source]);
+          lnk_log(LNK_Log_Timers, "[typededup] estimate src=%llu: set=%llu est=%.0f cap=%llu (fallback %llu)",
+                  ti_source, set_count, estimate, cap, leaf_ht_cap_fallback[ti_source]);
         }
         task.leaf_ht_arr[ti_source].cap = cap;
       }
     }
+    lnk_log(LNK_Log_Timers, "[typededup] unique-leaf estimate in %.2f ms", (F64)(now_time_us() - estimate_begin_us) / 1000.0);
     ProfEnd();
 
     for EachIndex(ti_source, CV_TypeIndexSource_COUNT) {
@@ -3244,6 +3272,10 @@ lnk_merge_types(TP_Context *tp, TP_Arena *tp_temp, LNK_CodeViewInput *input, LNK
     task.assigned_ti_arr[ti_source].hash_arr = push_array(scratch.arena, U64, task.assigned_ti_arr[ti_source].cap);
     task.offsets[ti_source]                    = offsets_from_counts_array_u64(scratch.arena, task.counts[ti_source], tp->worker_count);
     tp_for_parallel_prof(tp, 0, tp->worker_count, lnk_get_present_buckets_task, &task, "Copy present buckets");
+
+    lnk_log(LNK_Log_Timers, "[typededup] src=%llu: unique=%llu cap=%llu load=%.3f",
+            ti_source, task.unique_leaf_refs_arr[ti_source].count, task.leaf_ht_arr[ti_source].cap,
+            task.leaf_ht_arr[ti_source].cap ? (F64)task.unique_leaf_refs_arr[ti_source].count / (F64)task.leaf_ht_arr[ti_source].cap : 0.0);
 
     // sort output leaves based on { location index, leaf index } to guarantee determinism
     {
@@ -4640,20 +4672,74 @@ lnk_gc_types(TP_Context *tp, Arena *arena, LNK_CodeViewInput *cv, LNK_MergedType
   ProfEnd();
 }
 
-// FAIR-SHARE: round-robin cv->obj_count objs across `worker_count` lane buckets.
+typedef struct
+{
+  U64 weight;
+  U32 obj_idx;
+} LNK_ObjDistWeight;
+
+force_inline int
+lnk_obj_dist_weight_is_before(void *raw_a, void *raw_b)
+{
+  LNK_ObjDistWeight *a = raw_a, *b = raw_b;
+  if (a->weight != b->weight) { return a->weight > b->weight; }
+  return a->obj_idx < b->obj_idx; // deterministic total order
+}
+
+// FAIR-SHARE: distribute cv->obj_count objs across `worker_count` lane buckets.
 // Rebuilt per barrier pass so the distribution matches the cohort C that pass
 // runs at (lnk_move_global_symbols_to_gsi / lnk_write_pdb_modules read
-// task->obj_indices[task_id] for lanes [0,C)). Output is width-independent, so any
-// C produces byte-identical PDB bytes; only the per-lane partitioning changes.
+// task->obj_indices[task_id] for lanes [0,C)). Output is width- and
+// assignment-independent -- per-obj results land in per-obj slots (module
+// streams) or in GSI bucket chains that are content-sorted at serialization
+// (gsi_symbol_is_before radsorts every chain) -- so any deterministic partition
+// produces byte-identical PDB bytes; only the per-lane balance changes.
+//
+// `weights` (optional, [obj_count]) upgrades the round-robin to a greedy LPT
+// (longest-processing-time) assignment: objs are taken in weight-descending
+// order (obj_idx tie-break -> deterministic) and each goes to the least-loaded
+// lane. Round-robin ignores per-obj symbol-stream size, so a lane that draws
+// several giant objs holds the whole barrier pass at the final barrier while
+// the other lanes idle.
 internal void
-lnk_build_pdb_distribute_obj_indices(Arena *arena, LNK_BuildPdb *task, U64 obj_count, U32 worker_count)
+lnk_build_pdb_distribute_obj_indices(Arena *arena, LNK_BuildPdb *task, U64 obj_count, U32 worker_count, U64 *weights)
 {
-  U64 objs_per_worker = CeilIntegerDiv(obj_count, worker_count);
   task->obj_indices = push_array(arena, U32Array, worker_count);
-  for EachIndex(i, worker_count)  { task->obj_indices[i].v = push_array(arena, U32, objs_per_worker ? objs_per_worker : 1); }
-  for EachIndex(obj_idx, obj_count) {
-    U32Array *obj_indices = &task->obj_indices[obj_idx % worker_count];
-    obj_indices->v[obj_indices->count++] = (U32)obj_idx;
+  if (weights == 0) {
+    U64 objs_per_worker = CeilIntegerDiv(obj_count, worker_count);
+    for EachIndex(i, worker_count)  { task->obj_indices[i].v = push_array(arena, U32, objs_per_worker ? objs_per_worker : 1); }
+    for EachIndex(obj_idx, obj_count) {
+      U32Array *obj_indices = &task->obj_indices[obj_idx % worker_count];
+      obj_indices->v[obj_indices->count++] = (U32)obj_idx;
+    }
+  } else {
+    Temp scratch = scratch_begin(&arena, 1);
+
+    LNK_ObjDistWeight *order = push_array_no_zero(scratch.arena, LNK_ObjDistWeight, obj_count);
+    for EachIndex(obj_idx, obj_count) { order[obj_idx] = (LNK_ObjDistWeight){ .weight = weights[obj_idx], .obj_idx = (U32)obj_idx }; }
+    radsort(order, obj_count, lnk_obj_dist_weight_is_before);
+
+    U64 *loads  = push_array(scratch.arena, U64, worker_count);
+    U32 *assign = push_array_no_zero(scratch.arena, U32, obj_count);
+    for EachIndex(i, obj_count) {
+      U32 min_lane = 0;
+      for (U32 lane = 1; lane < worker_count; lane += 1) { if (loads[lane] < loads[min_lane]) { min_lane = lane; } }
+      assign[order[i].obj_idx] = min_lane;
+      loads[min_lane] += order[i].weight + 1; // +1 spreads zero-weight objs too
+      task->obj_indices[min_lane].count += 1;
+    }
+
+    for EachIndex(lane, worker_count) {
+      task->obj_indices[lane].v     = push_array_no_zero(arena, U32, task->obj_indices[lane].count);
+      task->obj_indices[lane].count = 0;
+    }
+    // fill in ascending obj order per lane (deterministic, cache-friendly iteration)
+    for EachIndex(obj_idx, obj_count) {
+      U32Array *obj_indices = &task->obj_indices[assign[obj_idx]];
+      obj_indices->v[obj_indices->count++] = (U32)obj_idx;
+    }
+
+    scratch_end(scratch);
   }
 }
 
@@ -4712,13 +4798,19 @@ lnk_build_pdb(TP_Context *tp, TP_Arena *tp_arena, String8 image_data, LNK_Config
 
     ProfScope("Move Global Symbols")
     {
+      U64 phase_begin_us = now_time_us();
       // FAIR-SHARE: pin the cohort, distribute objs over exactly the cohort lanes,
       // then run the barrier pass at that cohort. tp_barrier_begin sets
       // tp->worker_count := C for the bracket.
       U32 C = tp_barrier_begin(tp);
-      lnk_build_pdb_distribute_obj_indices(scratch.arena, &task, cv->obj_count, C);
+      // weight = per-obj symbols-subsection byte size: both proc-refs passes walk
+      // exactly these bytes per obj, and String8List.total_size makes it O(1)
+      U64 *weights = push_array_no_zero(scratch.arena, U64, cv->obj_count);
+      for EachIndex(obj_idx, cv->obj_count) { weights[obj_idx] = cv_sub_section_from_debug_s(cv->debug_s_arr[obj_idx], CV_C13SubSectionKind_Symbols).total_size; }
+      lnk_build_pdb_distribute_obj_indices(scratch.arena, &task, cv->obj_count, C, weights);
       tp_for_parallel_reserve(tp, 0, C, lnk_move_global_symbols_to_gsi, &task); // BARRIER pass (path B): tp_sum_u64/tp_broadcast/barrier_wait
       tp_barrier_end(tp);
+      lnk_log(LNK_Log_Timers, "[pdb] move global symbols in %.2f ms (cohort %u)", (F64)(now_time_us() - phase_begin_us) / 1000.0, C);
     }
 
       ProfScope("Build GSI and PSI")
@@ -4726,10 +4818,20 @@ lnk_build_pdb(TP_Context *tp, TP_Arena *tp_arena, String8 image_data, LNK_Config
 
     ProfScope("Write Modules")
     {
+      U64 phase_begin_us = now_time_us();
       U32 C = tp_barrier_begin(tp);
-      lnk_build_pdb_distribute_obj_indices(scratch.arena, &task, cv->obj_count, C);
+      // weight = total debug$S byte size: the module-stream write walks every
+      // subsection of the obj (symbols + lines + checksums + ...)
+      U64 *weights = push_array_no_zero(scratch.arena, U64, cv->obj_count);
+      for EachIndex(obj_idx, cv->obj_count) {
+        U64 total = 0;
+        for EachIndex(k, CV_C13SubSectionIdxKind_COUNT) { total += cv->debug_s_arr[obj_idx].data_list[k].total_size; }
+        weights[obj_idx] = total;
+      }
+      lnk_build_pdb_distribute_obj_indices(scratch.arena, &task, cv->obj_count, C, weights);
       tp_for_parallel_reserve(tp, 0, C, lnk_write_pdb_modules, &task); // BARRIER pass (path B): barrier_wait/tp_broadcast
       tp_barrier_end(tp);
+      lnk_log(LNK_Log_Timers, "[pdb] write modules in %.2f ms (cohort %u)", (F64)(now_time_us() - phase_begin_us) / 1000.0, C);
     }
   }
 
