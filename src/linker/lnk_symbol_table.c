@@ -735,15 +735,19 @@ exit:;
 internal B32
 lnk_resolve_symbol(LNK_SymbolTable *symtab, LNK_ObjSymbolRef symbol, LNK_ObjSymbolRef *symbol_out)
 {
-  B32                        is_resolved   = 1;
-  COFF_ParsedSymbol          symbol_parsed = lnk_parsed_symbol_from_coff_symbol_idx(symbol.obj, symbol.symbol_idx);
+  B32 is_resolved = 1;
+  // interp needs only value/section_number/storage_class -- decode the name (a string-table
+  // read + strlen per call) lazily, only in the branches that search the symbol table by name.
+  // The /OPT:REF reloc walk calls this once per reloc hop and its Regular case never needs it.
+  COFF_ParsedSymbol          symbol_parsed = lnk_parsed_symbol_from_coff_symbol_idx_no_name(symbol.obj, symbol.symbol_idx);
   COFF_SymbolValueInterpType symbol_interp = coff_interp_symbol(symbol_parsed.section_number, symbol_parsed.value, symbol_parsed.storage_class);
   switch (symbol_interp) {
-  case COFF_SymbolValueInterp_Regular: { 
+  case COFF_SymbolValueInterp_Regular: {
     LNK_Symbol *symlink = lnk_obj_get_comdat_symlink(symbol.obj, symbol_parsed.section_number);
     *symbol_out = symlink ? lnk_ref_from_symbol(symlink) : symbol;
   } break;
   case COFF_SymbolValueInterp_Weak: {
+    symbol_parsed = lnk_parsed_symbol_from_coff_symbol_idx(symbol.obj, symbol.symbol_idx);
     LNK_Symbol                 *defn        = lnk_symbol_table_search(symtab, symbol_parsed.name);
     COFF_ParsedSymbol           defn_parsed = lnk_parsed_from_symbol(defn);
     COFF_SymbolValueInterpType  defn_interp = lnk_interp_from_symbol(defn);
@@ -754,6 +758,7 @@ lnk_resolve_symbol(LNK_SymbolTable *symtab, LNK_ObjSymbolRef symbol, LNK_ObjSymb
     }
   } break;
   case COFF_SymbolValueInterp_Undefined: {
+    symbol_parsed = lnk_parsed_symbol_from_coff_symbol_idx(symbol.obj, symbol.symbol_idx);
     LNK_Symbol *defn = lnk_symbol_table_search(symtab, symbol_parsed.name);
     if (defn) {
       *symbol_out = lnk_ref_from_symbol(defn);
@@ -762,11 +767,13 @@ lnk_resolve_symbol(LNK_SymbolTable *symtab, LNK_ObjSymbolRef symbol, LNK_ObjSymb
     }
   } break;
   case COFF_SymbolValueInterp_Common: {
+    symbol_parsed = lnk_parsed_symbol_from_coff_symbol_idx(symbol.obj, symbol.symbol_idx);
     LNK_Symbol *defn = lnk_symbol_table_search(symtab, symbol_parsed.name);
     *symbol_out = lnk_ref_from_symbol(defn);
   } break;
   case COFF_SymbolValueInterp_Abs: {
-    if (symbol_parsed.storage_class == COFF_SymStorageClass_External) { 
+    if (symbol_parsed.storage_class == COFF_SymStorageClass_External) {
+      symbol_parsed = lnk_parsed_symbol_from_coff_symbol_idx(symbol.obj, symbol.symbol_idx);
       LNK_Symbol *defn = lnk_symbol_table_search(symtab, symbol_parsed.name);
       *symbol_out = lnk_ref_from_symbol(defn);
     } else {

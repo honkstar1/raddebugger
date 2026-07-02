@@ -2657,6 +2657,17 @@ THREAD_POOL_TASK_FUNC(lnk_walk_relocs_and_mark_ref_sections_task)
   tp_broadcast(&global_batch_list);
   tp_broadcast(&active_thread_count);
 
+  // Per-worker memo: (obj input idx << 32 | coff symbol idx) -> final ref of the reloc-symbol
+  // resolve chain below. A symbol is referenced by one reloc per call site, so the chain
+  // (interp parse + symbol-table trie search per hop) otherwise repeats for identical inputs
+  // millions of times. Open-addressing and lossy (a collision past the probe window evicts);
+  // a miss only costs the recompute -- the cached value is a pure function of the key because
+  // the symbol table and parsed_symbols are read-only during /OPT:REF.
+  typedef struct { U64 key; LNK_Obj *obj; U64 symbol_idx; } LNK_RefResolveSlot;
+  U64                 resolve_cache_mask = (1ull << 20) - 1;
+  LNK_RefResolveSlot *resolve_cache      = push_array_no_zero(scratch.arena, LNK_RefResolveSlot, resolve_cache_mask + 1);
+  MemorySet(resolve_cache, 0xff, sizeof(resolve_cache[0]) * (resolve_cache_mask + 1));
+
   LNK_RelocRefsBatchList free_list = {0};
   for (;;) {
     // update active thread count
@@ -2676,42 +2687,83 @@ THREAD_POOL_TASK_FUNC(lnk_walk_relocs_and_mark_ref_sections_task)
           // reloc -> symbol
           LNK_ObjSymbolRef ref_symbol = (LNK_ObjSymbolRef){ .obj = batch->v[i].obj, .symbol_idx = reloc->isymbol };
           {
-            Temp    temp         = temp_begin(scratch2.arena);
-            HashMap seen_hm      = {0};
-            B32     keep_walking = 1;
-            do {
-              // detect cyclic chains
-              U64 symbol_key = ((U64)ref_symbol.obj->input_idx << 32ull) | (U64)ref_symbol.symbol_idx;
-              if (hash_map_search_u64_u64(&seen_hm, symbol_key) == 0) {
-                hash_map_push_u64_u64(temp.arena, &seen_hm, symbol_key, 1);
-              } else {
-                COFF_ParsedSymbol reloc_parsed = lnk_parsed_symbol_from_coff_symbol_idx(batch->v[i].obj, reloc->isymbol);
-                lnk_error_obj(LNK_Warning_CyclicSymbol, batch->v[i].obj, "symbol %S forms a cyclic chain (/OPT:REF)", reloc_parsed.name);
-                MemoryZeroStruct(&ref_symbol);
+            // resolve-cache lookup
+            U64 cache_key  = ((U64)ref_symbol.obj->input_idx << 32ull) | (U64)ref_symbol.symbol_idx;
+            U64 cache_hash = cache_key * 0x9E3779B97F4A7C15ull; cache_hash ^= cache_hash >> 32;
+            U64 cache_slot = max_U64;
+            B32 cache_hit  = 0;
+            for (U64 probe_idx = 0; probe_idx < 8; probe_idx += 1) {
+              U64 slot = (cache_hash + probe_idx) & resolve_cache_mask;
+              if (resolve_cache[slot].key == cache_key) {
+                ref_symbol = (LNK_ObjSymbolRef){ .obj = resolve_cache[slot].obj, .symbol_idx = (U32)resolve_cache[slot].symbol_idx };
+                cache_hit  = 1;
                 break;
               }
+              if (resolve_cache[slot].key == max_U64) { cache_slot = slot; break; }
+            }
 
-              // unpack symbol
-              COFF_ParsedSymbol          ref_parsed = lnk_parsed_symbol_from_coff_symbol_idx(ref_symbol.obj, ref_symbol.symbol_idx);
-              COFF_SymbolValueInterpType ref_interp = coff_interp_from_parsed_symbol(ref_parsed);
+            if (!cache_hit) {
+              // cycle detection via linear scan of the visited chain: chains are 1-3 hops in
+              // practice, and this keeps the tree HashMap + per-hop arena pushes off the hot path
+              // (exact same first-revisit semantics)
+              U64  chain_fixed[64];
+              U64 *chain       = chain_fixed;
+              U64  chain_count = 0;
+              U64  chain_cap   = ArrayCount(chain_fixed);
+              B32  was_cyclic  = 0;
 
-              // resolve symbol
-              LNK_ObjSymbolRef next_ref = {0};
-              if (lnk_resolve_symbol(symtab, ref_symbol, &next_ref)) {
-                keep_walking = (ref_interp == COFF_SymbolValueInterp_Weak || ref_interp == COFF_SymbolValueInterp_Undefined);
-                ref_symbol   = next_ref;
-              } else {
-                keep_walking = 0;
+              Temp temp         = temp_begin(scratch2.arena);
+              B32  keep_walking = 1;
+              do {
+                // detect cyclic chains
+                U64 symbol_key = ((U64)ref_symbol.obj->input_idx << 32ull) | (U64)ref_symbol.symbol_idx;
+                B32 was_seen   = 0;
+                for EachIndex(chain_idx, chain_count) {
+                  if (chain[chain_idx] == symbol_key) { was_seen = 1; break; }
+                }
+                if (!was_seen) {
+                  if (chain_count == chain_cap) {
+                    U64 *new_chain = push_array_no_zero(temp.arena, U64, chain_cap * 2);
+                    MemoryCopy(new_chain, chain, sizeof(chain[0]) * chain_count);
+                    chain = new_chain; chain_cap *= 2;
+                  }
+                  chain[chain_count++] = symbol_key;
+                } else {
+                  COFF_ParsedSymbol reloc_parsed = lnk_parsed_symbol_from_coff_symbol_idx(batch->v[i].obj, reloc->isymbol);
+                  lnk_error_obj(LNK_Warning_CyclicSymbol, batch->v[i].obj, "symbol %S forms a cyclic chain (/OPT:REF)", reloc_parsed.name);
+                  MemoryZeroStruct(&ref_symbol);
+                  was_cyclic = 1;
+                  break;
+                }
+
+                // unpack symbol (interp needs no name decode)
+                COFF_ParsedSymbol          ref_parsed = lnk_parsed_symbol_from_coff_symbol_idx_no_name(ref_symbol.obj, ref_symbol.symbol_idx);
+                COFF_SymbolValueInterpType ref_interp = coff_interp_from_parsed_symbol(ref_parsed);
+
+                // resolve symbol
+                LNK_ObjSymbolRef next_ref = {0};
+                if (lnk_resolve_symbol(symtab, ref_symbol, &next_ref)) {
+                  keep_walking = (ref_interp == COFF_SymbolValueInterp_Weak || ref_interp == COFF_SymbolValueInterp_Undefined);
+                  ref_symbol   = next_ref;
+                } else {
+                  keep_walking = 0;
+                }
+              } while (keep_walking);
+              temp_end(temp);
+
+              // memoize (skip the cyclic-warning path so the warning replays per reloc as before)
+              if (!was_cyclic) {
+                if (cache_slot == max_U64) { cache_slot = cache_hash & resolve_cache_mask; }
+                resolve_cache[cache_slot] = (LNK_RefResolveSlot){ .key = cache_key, .obj = ref_symbol.obj, .symbol_idx = ref_symbol.symbol_idx };
               }
-            } while (keep_walking);
-            temp_end(temp);
+            }
           }
 
           // skip unresolved symbol
           if (ref_symbol.obj == 0) { continue; }
 
-          // unpack resolved symbol
-          COFF_ParsedSymbol           ref_parsed = lnk_parsed_symbol_from_coff_symbol_idx(ref_symbol.obj, ref_symbol.symbol_idx);
+          // unpack resolved symbol (only interp + section_number are used -- skip the name decode)
+          COFF_ParsedSymbol           ref_parsed = lnk_parsed_symbol_from_coff_symbol_idx_no_name(ref_symbol.obj, ref_symbol.symbol_idx);
           COFF_SymbolValueInterpType  ref_interp = coff_interp_from_parsed_symbol(ref_parsed);
 
           if (ref_interp == COFF_SymbolValueInterp_Regular) {
@@ -2729,19 +2781,38 @@ THREAD_POOL_TASK_FUNC(lnk_walk_relocs_and_mark_ref_sections_task)
               seed_sn  = fold.leader_sn;
             }
 
-            HashMap visited_sections_hm = {0};
-            U32Node *stack = push_array(temp.arena, U32Node, 1);
-            stack->data    = seed_sn;
+            // per-walk visited set + walk stack: flat arrays with linear-scan membership --
+            // associative groups are a handful of sections, and the tree HashMap + per-node
+            // arena pushes dominated this walk
+            U32  visited_fixed[64];
+            U32 *visited       = visited_fixed;
+            U64  visited_count = 0;
+            U64  visited_cap   = ArrayCount(visited_fixed);
+            U32  stack_fixed[64];
+            U32 *stack       = stack_fixed;
+            U64  stack_count = 0;
+            U64  stack_cap   = ArrayCount(stack_fixed);
+            stack[stack_count++] = seed_sn;
             do {
-              U32 section_number = stack->data;
-              SLLStackPop(stack);
+              U32 section_number = stack[--stack_count];
 
               // is section number valid?
               if (section_number == 0 || section_number > walk_obj->header.section_count_no_null) { continue; }
 
               // detect cyclic associative sections
-              if (hash_map_search_u64_u64(&visited_sections_hm, section_number)) { continue; }
-              hash_map_push_u64_u64(temp.arena, &visited_sections_hm, section_number, 1);
+              {
+                B32 was_seen = 0;
+                for EachIndex(visited_idx, visited_count) {
+                  if (visited[visited_idx] == section_number) { was_seen = 1; break; }
+                }
+                if (was_seen) { continue; }
+                if (visited_count == visited_cap) {
+                  U32 *new_visited = push_array_no_zero(temp.arena, U32, visited_cap * 2);
+                  MemoryCopy(new_visited, visited, sizeof(visited[0]) * visited_count);
+                  visited = new_visited; visited_cap *= 2;
+                }
+                visited[visited_count++] = section_number;
+              }
 
               // push associated section
               for EachNode(associated_n, U32Node, walk_obj->associated_sections[section_number]) {
@@ -2769,7 +2840,10 @@ THREAD_POOL_TASK_FUNC(lnk_walk_relocs_and_mark_ref_sections_task)
                   for EachIndex(lsi, leader_sn_count) {
                     U32 lsn = leader_sns[lsi];
                     if (lsn == 0 || lsn > leader_obj->header.section_count_no_null) { continue; }
-                    U8 lseen = ins_atomic_u8_eval_assign(&is_live[leader_obj->input_idx][lsn], 1);
+                    // plain read first -- most targets are already live, and the read keeps the
+                    // flag cacheline shared instead of dirtying it with an unconditional exchange
+                    U8 lseen = *(volatile U8 *)&is_live[leader_obj->input_idx][lsn];
+                    if (!lseen) { lseen = ins_atomic_u8_eval_assign(&is_live[leader_obj->input_idx][lsn], 1); }
                     if (lseen) { continue; }
                     COFF_SectionFlags lflags = leader_obj->section_flags[lsn - 1];
                     if (lflags & (COFF_SectionFlag_LnkRemove | COFF_SectionFlag_LnkInfo | LNK_SECTION_FLAG_DEBUG)) { continue; }
@@ -2787,16 +2861,28 @@ THREAD_POOL_TASK_FUNC(lnk_walk_relocs_and_mark_ref_sections_task)
                   continue; // do not mark the follower live
                 }
 
-                if (hash_map_search_u64_u64(&visited_sections_hm, assoc_sn)) { continue; }
-                U32Node *stack_n = push_array(temp.arena, U32Node, 1);
-                stack_n->data = assoc_sn;
-                SLLStackPush(stack, stack_n);
+                {
+                  B32 assoc_seen = 0;
+                  for EachIndex(visited_idx, visited_count) {
+                    if (visited[visited_idx] == assoc_sn) { assoc_seen = 1; break; }
+                  }
+                  if (assoc_seen) { continue; }
+                }
+                if (stack_count == stack_cap) {
+                  U32 *new_stack = push_array_no_zero(temp.arena, U32, stack_cap * 2);
+                  MemoryCopy(new_stack, stack, sizeof(stack[0]) * stack_count);
+                  stack = new_stack; stack_cap *= 2;
+                }
+                stack[stack_count++] = assoc_sn;
               }
 
               COFF_SectionFlags   section_flags  = walk_obj->section_flags[section_number-1];
 
               // on first section visit, set live flag and enqueue section
-              U8 was_visited = ins_atomic_u8_eval_assign(&is_live[walk_obj->input_idx][section_number], 1);
+              // (plain read first -- most targets are already live; the read keeps the flag
+              //  cacheline shared instead of dirtying it with an unconditional exchange)
+              U8 was_visited = *(volatile U8 *)&is_live[walk_obj->input_idx][section_number];
+              if (!was_visited) { was_visited = ins_atomic_u8_eval_assign(&is_live[walk_obj->input_idx][section_number], 1); }
               if (was_visited) { continue; }
 
               // is section eligible for walking?
@@ -2822,7 +2908,7 @@ THREAD_POOL_TASK_FUNC(lnk_walk_relocs_and_mark_ref_sections_task)
 
               batch->v[batch->count++] = refs;
 
-            } while (stack);
+            } while (stack_count);
 
             temp_end(temp);
           }
