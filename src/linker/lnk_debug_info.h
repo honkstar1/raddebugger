@@ -7,11 +7,18 @@
 // RRT
 
 global read_only String8 g_rrt_magic   = str8_lit_comp("RAD-TYPE-SERVER\0");
-global read_only U64     g_rrt_version = 2;
+global read_only U64     g_rrt_version = 3; // v3: hash_alg tag added after version; type_hashes may be XXH3-128 low64
+
+// type-leaf hash algorithm tag persisted in RRT (v3+); consuming link must select
+// the same algorithm (LNK_CodeViewInput.type_hash_xxh3), otherwise RRT hashes and locally
+// computed obj-leaf hashes would live in different hash spaces and dedup would break.
+#define LNK_RRT_HashAlg_BLAKE3        0
+#define LNK_RRT_HashAlg_XXH3_128LOW64 1
 
 typedef struct LNK_RRT
 {
   String8 path;
+  U64     hash_alg; // LNK_RRT_HashAlg_*
 
   String8 type_data_raw;
   union {
@@ -73,6 +80,7 @@ typedef struct
   LNK_Config  *config;
   U64          obj_count;
   B32          is_stripped;
+  B32          type_hash_xxh3; // internal type-leaf hashing uses XXH3-128 (low64); forced off when precomputed blake3 hashes are in play (accepted .debug$H sections or RRT type servers) -- see selection at the end of lnk_make_code_view_input
 
   LNK_RRT_Array rrt_input;
 

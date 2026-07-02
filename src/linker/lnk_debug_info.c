@@ -350,6 +350,9 @@ lnk_string_list_from_rrt(Arena *arena, LNK_RRT *rrt)
   // (2) version
   str8_list_push(arena, &rrt_data, str8_struct(&g_rrt_version));
 
+  // (2b) type hash algorithm (v3+)
+  str8_list_push(arena, &rrt_data, str8_struct(push_u64(arena, rrt->hash_alg)));
+
   // (3) type data ranges
   str8_list_push(arena, &rrt_data, str8_array_fixed(rrt->type_data_ranges));
 
@@ -435,6 +438,16 @@ lnk_rrt_from_string(Arena *arena, String8 rrt_data, String8 path, LNK_RRT *rrt_o
     lnk_error(LNK_Error_IllData, "ERROR: %S: RRT version mismatch, got %llu, expected %llu", path, version, g_rrt_version);
     goto exit;
   }
+
+  // (2b) type hash algorithm (v3+)
+  U64 hash_alg      = 0;
+  U64 hash_alg_size = str8_deserial_read_struct(rrt_data, cursor, &hash_alg);
+  if (hash_alg_size != sizeof(hash_alg)) {
+    lnk_error(LNK_Error_IllData, "ERROR: %S: RRT file does not contain enough bytes to read the type hash algorithm", path);
+    goto exit;
+  }
+  cursor += hash_alg_size;
+  rrt_out->hash_alg = hash_alg;
 
   // (3) type data ranges
   Rng1U64 type_data_ranges[CV_TypeIndexSource_COUNT] = {0};
@@ -1956,6 +1969,40 @@ lnk_make_code_view_input(TP_Context *tp, TP_Arena *tp_arena, LNK_Config *config,
   }
   ProfEnd();
 
+  // Select the internal type-leaf hash algorithm for this link. Leaf hashes are opaque 8-byte
+  // equality keys for type dedup -- they never reach image/PDB bytes -- so we default to XXH3-128
+  // (low64). We must fall back to blake3 only when precomputed blake3 hashes are already in play,
+  // i.e. they must share one hash space with locally computed hashes:
+  //  - .debug$H sections accepted by lnk_parse_debug_h_task (/DEBUG:GHASH and alg==BLAKE3; note
+  //    the switch alone does not force blake3 -- MSVC never emits .debug$H, so UE-style links
+  //    with /DEBUG:GHASH still get XXH3);
+  //  - RRT type servers, whose persisted hashes carry an explicit alg tag (v3+).
+  {
+    // pass 1: any precomputed blake3 source present?
+    B32 any_blake3 = 0;
+    if (config->ghash) { // hashes accepted from .debug$H are always blake3
+      for EachIndex(obj_idx, input.obj_count) {
+        if (input.debug_h_arr[obj_idx].count) { any_blake3 = 1; break; }
+      }
+    }
+    for EachIndex(ts_idx, input.ts_arr.count) {
+      LNK_TypeServer *ts = &input.ts_arr.v[ts_idx];
+      if (ts->rrt && !input.is_type_server_discarded[ts_idx] && ts->rrt->hash_alg == LNK_RRT_HashAlg_BLAKE3) { any_blake3 = 1; break; }
+    }
+
+    // pass 2: all persisted-hash sources must agree with the selection
+    if (any_blake3) {
+      for EachIndex(ts_idx, input.ts_arr.count) {
+        LNK_TypeServer *ts = &input.ts_arr.v[ts_idx];
+        if (ts->rrt && !input.is_type_server_discarded[ts_idx] && ts->rrt->hash_alg == LNK_RRT_HashAlg_XXH3_128LOW64) {
+          lnk_error(LNK_Error_IllData, "ERROR: %S: RRT type hash algorithm (XXH3) conflicts with blake3 hashes required by this link (.debug$H or another RRT); regenerate the RRT with matching linker flags", ts->rrt->path);
+        }
+      }
+    }
+
+    input.type_hash_xxh3 = !any_blake3;
+  }
+
   scratch_end(scratch);
   ProfEnd();
   return input;
@@ -2057,6 +2104,45 @@ lnk_match_leaf_ref(LNK_CodeViewInput *input, LNK_LeafRef a, LNK_LeafRef b)
   return a_hash == b_hash;
 }
 
+// Internal type-leaf hasher. Values produced here are opaque 8-byte equality keys for type
+// dedup (lnk_match_leaf_ref) -- they never reach image/PDB bytes, only the dedup partition does.
+// XXH3-128 (low 64 bits kept) when input->type_hash_xxh3 (default); blake3 (first 8 bytes, XOF)
+// when /DEBUG:GHASH so locally-computed hashes stay bit-compatible with precomputed .debug$H
+// blake3 hashes accepted by lnk_parse_debug_h_task. Identical input byte sequence either way;
+// only the algorithm differs, uniformly for the entire link (objs, PCH, IFC blobs, RRT build).
+typedef struct
+{
+  B32 use_xxh3;
+  union {
+    XXH3_state_t  xxh3;
+    blake3_hasher blake3;
+  } v;
+} LNK_LeafHasher;
+
+internal void
+lnk_leaf_hasher_init(LNK_LeafHasher *h, B32 use_xxh3)
+{
+  h->use_xxh3 = use_xxh3;
+  if (use_xxh3) { XXH3_128bits_reset(&h->v.xxh3); }
+  else          { blake3_hasher_init(&h->v.blake3); }
+}
+
+internal void
+lnk_leaf_hasher_update(LNK_LeafHasher *h, void *bytes, U64 size)
+{
+  if (h->use_xxh3) { XXH3_128bits_update(&h->v.xxh3, bytes, size); }
+  else             { blake3_hasher_update(&h->v.blake3, bytes, size); }
+}
+
+internal U64
+lnk_leaf_hasher_final64(LNK_LeafHasher *h)
+{
+  U64 hash;
+  if (h->use_xxh3) { hash = XXH3_128bits_digest(&h->v.xxh3).low64; }
+  else             { blake3_hasher_finalize(&h->v.blake3, (U8 *)&hash, sizeof(hash)); }
+  return hash;
+}
+
 internal U64
 lnk_hash_cv_leaf(LNK_CodeViewInput *input, LNK_LeafRef leaf_ref, CV_TiOffsets ti_offs, B32 discard_cycles)
 {
@@ -2067,7 +2153,7 @@ lnk_hash_cv_leaf(LNK_CodeViewInput *input, LNK_LeafRef leaf_ref, CV_TiOffsets ti
   U64                 ti_count       = cv_ti_offsets_count(&ti_offs);
 
   // init hasher
-  blake3_hasher hasher; blake3_hasher_init(&hasher);
+  LNK_LeafHasher hasher; lnk_leaf_hasher_init(&hasher, input->type_hash_xxh3);
 
   // hash bytes around indices
   {
@@ -2076,14 +2162,14 @@ lnk_hash_cv_leaf(LNK_CodeViewInput *input, LNK_LeafRef leaf_ref, CV_TiOffsets ti
       CV_TiOff ti_info = cv_ti_offset_at(&ti_offs, ti_idx);
       U8 *bytes = leaf.data.str + last_ti_off;
       U64 size  = ti_info.offset - last_ti_off;
-      blake3_hasher_update(&hasher, bytes, size);
+      lnk_leaf_hasher_update(&hasher, bytes, size);
       last_ti_off = ti_info.offset + sizeof(CV_TypeIndex);
     }
 
     Assert(leaf.data.size >= last_ti_off);
     U8 *bytes = leaf.data.str + last_ti_off;
     U64 size  = leaf.data.size - last_ti_off;
-    blake3_hasher_update(&hasher, bytes, size);
+    lnk_leaf_hasher_update(&hasher, bytes, size);
   }
 
   // mix-in sub leaf hashes
@@ -2094,7 +2180,7 @@ lnk_hash_cv_leaf(LNK_CodeViewInput *input, LNK_LeafRef leaf_ref, CV_TiOffsets ti
 
     // simple indices are stable across compile units
     if (sub_ti < debug_t->ti_ranges[sub_ti_n.source].min) {
-      blake3_hasher_update(&hasher, &sub_ti, sizeof(sub_ti));
+      lnk_leaf_hasher_update(&hasher, &sub_ti, sizeof(sub_ti));
       continue;
     }
 
@@ -2106,7 +2192,7 @@ lnk_hash_cv_leaf(LNK_CodeViewInput *input, LNK_LeafRef leaf_ref, CV_TiOffsets ti
       memory_write16(leaf_header + OffsetOf(CV_LeafHeader, size), sizeof(CV_LeafKind));
 
       // reset hasher
-      blake3_hasher_init(&hasher);
+      lnk_leaf_hasher_init(&hasher, hasher.use_xxh3);
 
       // log error
       Temp    scratch       = scratch_begin(0,0);
@@ -2128,7 +2214,7 @@ lnk_hash_cv_leaf(LNK_CodeViewInput *input, LNK_LeafRef leaf_ref, CV_TiOffsets ti
       memory_write16(leaf_header + OffsetOf(CV_LeafHeader, size), sizeof(CV_LeafKind));
 
       // reset hasher
-      blake3_hasher_init(&hasher);
+      lnk_leaf_hasher_init(&hasher, hasher.use_xxh3);
 
       // log error
       Temp    scratch       = scratch_begin(0,0);
@@ -2145,15 +2231,14 @@ lnk_hash_cv_leaf(LNK_CodeViewInput *input, LNK_LeafRef leaf_ref, CV_TiOffsets ti
     U64         sub_hash = input->debug_h_arr[sub_ref.obj_idx].v[sub_ref.leaf_idx];
 
     // mix-in sub-type hash
-    blake3_hasher_update(&hasher, &sub_hash, sizeof(sub_hash));
+    lnk_leaf_hasher_update(&hasher, &sub_hash, sizeof(sub_hash));
   }
 
   // hash leaf header
   CV_LeafHeader *leaf_header = cv_debug_t_get_leaf_header(debug_t, leaf_ref.leaf_idx);
-  blake3_hasher_update(&hasher, leaf_header, sizeof(*leaf_header));
+  lnk_leaf_hasher_update(&hasher, leaf_header, sizeof(*leaf_header));
 
-  U64 hash;
-  blake3_hasher_finalize(&hasher, (U8 *) &hash, sizeof(hash));
+  U64 hash = lnk_leaf_hasher_final64(&hasher);
 
   Assert(hash != 0);
   Assert(input->debug_h_arr[leaf_ref.obj_idx].v[leaf_ref.leaf_idx] == 0 ||
