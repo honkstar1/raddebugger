@@ -72,10 +72,14 @@ typedef struct LNK_SymbolHashTrieChunkList
   U64                      count;
   LNK_SymbolHashTrieChunk *first;
   LNK_SymbolHashTrieChunk *last;
+  // running total of live slots across all chunks (sum of chunk->count); maintained at the push
+  // site (and the insert-race rollback) so lnk_symbol_table_search_symbol_count is O(workers)
+  // instead of walking every chunk per lib per lib-search round. same value as the walk.
+  U64                      symbol_count;
   // false-sharing pad: symtab->chunks / search_chunks are [worker_count] arrays indexed
-  // [worker_id]; at 24B/entry adjacent workers share a cache line on the parallel insert.
+  // [worker_id]; at 32B/entry adjacent workers share a cache line on the parallel insert.
   // Pad each entry to a full 64B line so each worker owns its line. Pure layout -> byte-identical.
-  U8                       pad_[64 - 3*8];
+  U8                       pad_[64 - 4*8];
 } LNK_SymbolHashTrieChunkList;
 
 // --- Symbol Table ------------------------------------------------------------

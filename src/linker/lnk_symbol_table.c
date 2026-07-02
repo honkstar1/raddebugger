@@ -83,12 +83,14 @@ lnk_symbol_hash_trie_chunk_list_push(Arena *arena, LNK_SymbolHashTrieChunkList *
   }
 
   LNK_SymbolHashTrie *result = &list->last->v[list->last->count++];
+  ++list->symbol_count;
   return result;
 }
 
 internal void
 lnk_symbol_hash_trie_chunk_list_concat_in_place(LNK_SymbolHashTrieChunkList *list, LNK_SymbolHashTrieChunkList *to_concat)
 {
+  list->symbol_count += to_concat->symbol_count; // SLLConcatInPlace only carries ->count; it zeroes to_concat
   SLLConcatInPlace(list, to_concat);
 }
 
@@ -403,6 +405,7 @@ lnk_symbol_hash_trie_insert_or_replace(Arena                        *arena,
 
       // rollback chunk list push
       --chunks->last->count;
+      --chunks->symbol_count;
 
       // retry insert with trie node from another thread
       curr_trie = cmp;
@@ -598,12 +601,12 @@ lnk_symbol_table_search_symbol_count(LNK_SymbolTable *symtab)
 {
   // total number of weak/undefined symbols inserted into search_chunks. this only ever grows
   // during the lib-search loop (symbols are never removed mid-loop), so it serves as a monotonic
-  // version stamp for the set of symbols the lib search would scan.
+  // version stamp for the set of symbols the lib search would scan. the per-list running
+  // symbol_count is maintained at the chunk push site, so this is O(workers) instead of walking
+  // the chunk lists per lib per round.
   U64 count = 0;
   for EachIndex(worker_id, symtab->arena->count) {
-    for EachNode(c, LNK_SymbolHashTrieChunk, symtab->search_chunks[worker_id].first) {
-      count += c->count;
-    }
+    count += symtab->search_chunks[worker_id].symbol_count;
   }
   return count;
 }
