@@ -196,6 +196,39 @@ THREAD_POOL_TASK_FUNC(lnk_parse_debug_t_task)
   } else {
     MemoryZeroStruct(&task->out_types[task_id]);
   }
+
+  // parse-time leaf hashing (see LNK_CodeViewInput.leaf_prehash): hash this obj's leaves right
+  // here while the .debug$T pages are still resident. Eligible objs are exactly the plain /Z7
+  // class whose leaf hashes are self-contained: every effect that could otherwise change hash
+  // input between parse and lnk_merge_types is excluded --
+  //   - obj->debug_p_sect_idx valid  -> PCH provider (LF_ENDPRECOMP rewrite) or discard-both case
+  //   - first leaf LF_PRECOMP        -> PCH consumer (offsets shift + needs .debug$P sub hashes)
+  //   - first leaf type-server ref   -> ext obj (hashes wired from the type server)
+  //   - any LF_IFC_RECORD leaf       -> IFC consumer (leaf rewritten to NOTYPE + TI redirects)
+  //   - RRT input / accepted .debug$H excluded globally by the leaf_prehash gate
+  // For the remaining objs lnk_leaf_ref_from_ti always resolves within the same obj, so the
+  // exact per-leaf hashing (identical code path, algorithm and order) commutes with the phases
+  // in between; lnk_merge_types skips objs whose debug_h is already populated.
+  if (task->prehash && task->out_types[task_id].count > 0) {
+    LNK_Obj   *obj     = task->input->obj_arr[task_id];
+    CV_DebugT *debug_t = &task->out_types[task_id];
+    B32 eligible = !debug_t->has_ifc_record &&
+                   !(obj->debug_p_sect_idx < obj->header.section_count_no_null) &&
+                   !cv_debug_t_is_pch(debug_t) &&
+                   !cv_debug_t_is_type_server_ref(debug_t);
+    if (eligible) {
+      CV_DebugH *debug_h = &task->input->debug_h_arr[task_id];
+      debug_h->count = debug_t->count;
+      debug_h->v     = push_array(arena, U64, debug_h->count);
+      for EachIndex(leaf_idx, debug_t->count) {
+        Temp         temp    = temp_begin(arena);
+        CV_Leaf      leaf    = cv_debug_t_get_leaf(debug_t, leaf_idx);
+        CV_TiOffsets ti_offs = cv_leaf_ti_offsets(temp.arena, leaf.kind, leaf.data);
+        lnk_hash_cv_leaf(task->input, (LNK_LeafRef){ (U32)task_id, (U32)leaf_idx }, ti_offs, 1);
+        temp_end(temp);
+      }
+    }
+  }
   ProfEnd();
 }
 
@@ -1565,6 +1598,29 @@ lnk_make_code_view_input(TP_Context *tp, TP_Arena *tp_arena, LNK_Config *config,
     }
   }
 
+  // Decide parse-time leaf hashing (LNK_CodeViewInput.leaf_prehash) BEFORE parsing .debug$T.
+  // Requires the hash algorithm to be decidable up front: with no RRT input and no .debug$H
+  // section on any obj (when /DEBUG:GHASH) the selection at the end of this function is
+  // guaranteed to pick XXH3, so we can pin it now and hash eligible objs inside
+  // lnk_parse_debug_t_task while their pages are still resident.
+  {
+    B32 leaf_prehash = (rrt_input.count == 0);
+    if (leaf_prehash && config->ghash) {
+      for EachIndex(obj_idx, obj_count) {
+        if (obj_arr[obj_idx]->debug_h_sect_idx < obj_arr[obj_idx]->header.section_count_no_null) { leaf_prehash = 0; break; }
+      }
+    }
+    input.leaf_prehash = leaf_prehash;
+    if (leaf_prehash) { input.type_hash_xxh3 = 1; }
+  }
+
+  // hoisted allocations: lnk_parse_debug_t_task's prehash path writes input.debug_h_arr[obj]
+  // and lnk_hash_cv_leaf -> lnk_leaf_ref_from_ti reads input.obj_to_ts, so both must exist
+  // before the .debug$T parse phase runs (they were previously allocated after it)
+  input.debug_h_arr = push_array(tp_arena->v[0], CV_DebugH, input.obj_count);
+  input.obj_to_ts   = push_array(tp_arena->v[0], U64, input.count);
+  MemorySet(input.obj_to_ts, 0xff, input.count * sizeof(input.obj_to_ts[0]));
+
   ProfBegin("Parse CodeView");
   CV_DebugT *debug_p_arr;
   {
@@ -1602,15 +1658,16 @@ lnk_make_code_view_input(TP_Context *tp, TP_Arena *tp_arena, LNK_Config *config,
     tp_for_parallel_prof(tp, 0,        obj_count, lnk_strip_debug_t_sig_task, &parse_types, "Strip .debug$P");
     tp_for_parallel_prof(tp, tp_arena, obj_count, lnk_parse_debug_t_task,     &parse_types, "Parse .debug$P");
 
-    // parse .debug$T
+    // parse .debug$T (+ prehash self-contained objs, see LNK_CodeViewInput.leaf_prehash)
     input.debug_t_arr     = push_array(tp_arena->v[0], CV_DebugT, obj_count);
     parse_types.raw_types = raw_debug_t_arr;
     parse_types.out_types = input.debug_t_arr;
     tp_for_parallel_prof(tp, 0,        obj_count, lnk_strip_debug_t_sig_task, &parse_types, "Strip .debug$T");
+    parse_types.prehash = input.leaf_prehash;
     tp_for_parallel_prof(tp, tp_arena, obj_count, lnk_parse_debug_t_task,     &parse_types, "Parse .debug$T");
+    parse_types.prehash = 0;
 
     // parse .debug$H
-    input.debug_h_arr = push_array(tp_arena->v[0], CV_DebugH, input.obj_count);
     if (config->ghash) {
       tp_for_parallel_prof(tp, tp_arena, obj_count, lnk_parse_debug_h_task, &input, "Parse .debug$H");
     }
@@ -1652,8 +1709,7 @@ lnk_make_code_view_input(TP_Context *tp, TP_Arena *tp_arena, LNK_Config *config,
 
   ProfScope("Set up PDB and RRT")
   {
-    input.obj_to_ts = push_array(tp_arena->v[0], U64, input.count);
-    MemorySet(input.obj_to_ts, 0xff, input.count * sizeof(input.obj_to_ts[0]));
+    // (obj_to_ts is allocated before the parse phases now -- see the leaf_prehash block)
 
     LNK_TypeServerList  ts_list = {0};
     HashTable          *ts_ht   = hash_table_init(scratch.arena, 256);
@@ -1979,8 +2035,12 @@ lnk_make_code_view_input(TP_Context *tp, TP_Arena *tp_arena, LNK_Config *config,
   //  - RRT type servers, whose persisted hashes carry an explicit alg tag (v3+).
   {
     // pass 1: any precomputed blake3 source present?
+    // NOTE: under leaf_prehash, debug_h_arr slots are already populated with locally computed
+    // XXH3 hashes -- but the prehash gate itself proved no obj has a .debug$H section, so the
+    // scan below (which would misread prehashed counts as accepted .debug$H) is skipped; the
+    // result is identical to what the scan would have produced without prehashing (0).
     B32 any_blake3 = 0;
-    if (config->ghash) { // hashes accepted from .debug$H are always blake3
+    if (config->ghash && !input.leaf_prehash) { // hashes accepted from .debug$H are always blake3
       for EachIndex(obj_idx, input.obj_count) {
         if (input.debug_h_arr[obj_idx].count) { any_blake3 = 1; break; }
       }
@@ -3720,41 +3780,92 @@ THREAD_POOL_TASK_FUNC(lnk_move_global_symbols_to_gsi)
 
     U64    bucket_cap;
     void **buckets;
+    U64   *collect_counts; // [worker_count]
+    void **flat_symbols;   // [global_symbol_count]
     if (task_id == 0) {
-      bucket_cap = global_symbol_count * 13 / 10;
-      buckets    = push_array(scratch.arena, void *, bucket_cap);
+      bucket_cap     = global_symbol_count * 13 / 10;
+      buckets        = push_array(scratch.arena, void *, bucket_cap);
+      collect_counts = push_array(scratch.arena, U64, tp->worker_count);
+      flat_symbols   = push_array_no_zero(scratch.arena, void *, global_symbol_count ? global_symbol_count : 1);
     }
     tp_broadcast(&bucket_cap);
     tp_broadcast(&buckets);
+    tp_broadcast(&collect_counts);
+    tp_broadcast(&flat_symbols);
 
-    // insert symbols into hash table
-    for EachNode(n, VoidNode, global_symbols.first) {
-      String8 raw  = cv_raw_from_symbol(n->v);
-      U64     hash = u64_hash_from_str8(raw);
-      cv_symbol_deduper_insert_or_update(buckets, bucket_cap, hash, n->v);
+    // BALANCE: per-lane global-symbol density varies a lot (the collect partition above is
+    // weighted by raw symbol bytes, not by global-symbol count), which skewed the insert phase
+    // by ~2x. Flatten the per-worker lists (in worker order) into one array and re-divide the
+    // INSERTS evenly. The deduper is CAS-based and content-keyed: any insert partition yields
+    // the same deduped content set, and downstream order is already schedule-independent (the
+    // per-chain sort keys on the content hash written into n->data.offset below), so this only
+    // changes who performs an insert, never the output.
+    ProfBegin("Insert Global Symbols");
+    collect_counts[task_id] = global_symbols.count;
+    barrier_wait(tp->barrier);
+    {
+      U64 flat_off = 0;
+      for (U64 w = 0; w < task_id; w += 1) { flat_off += collect_counts[w]; }
+      for EachNode(n, VoidNode, global_symbols.first) { flat_symbols[flat_off++] = n->v; }
     }
     barrier_wait(tp->barrier);
 
-    U64       symbol_count  = 0;
-    void    **symbol_arr    = 0; // [symbol_count]
-    Rng1U64  *symbol_ranges = 0; // [worker_count]
-    U32      *symbol_hashes = 0; // [symbol_count]
-    if (task_id == 0) {
-      ProfBeginV("Compact Buckets [bucket_cap %llu]", bucket_cap);
-      for EachIndex(src, bucket_cap) {
-        buckets[symbol_count] = buckets[src];
-        symbol_count += buckets[src] != 0;
+    // insert symbols into hash table (even split of the flattened array)
+    {
+      U64 ins_lo = (task_id * global_symbol_count) / tp->worker_count;
+      U64 ins_hi = ((task_id + 1) * global_symbol_count) / tp->worker_count;
+      for (U64 i = ins_lo; i < ins_hi; i += 1) {
+        String8 raw  = cv_raw_from_symbol(flat_symbols[i]);
+        U64     hash = u64_hash_from_str8(raw);
+        cv_symbol_deduper_insert_or_update(buckets, bucket_cap, hash, flat_symbols[i]);
       }
-      ProfEnd();
+    }
+    barrier_wait(tp->barrier);
+    ProfEnd();
 
-      symbol_arr    = buckets;
+    // compact buckets in parallel: each worker owns a contiguous slot range, counts its
+    // occupied slots, then copies them to its prefix-sum offset. Concatenated ranges preserve
+    // ascending slot order, so symbol_arr is byte-identical to the old task-0-serial compaction
+    // (which stalled the other workers at the next barrier for the whole bucket_cap sweep).
+    U64       symbol_count   = 0;
+    void    **symbol_arr     = 0; // [symbol_count]
+    Rng1U64  *symbol_ranges  = 0; // [worker_count]
+    U32      *symbol_hashes  = 0; // [symbol_count]
+    U64      *compact_counts = 0; // [worker_count]
+    if (task_id == 0) {
+      compact_counts = push_array(scratch.arena, U64, tp->worker_count);
+    }
+    tp_broadcast(&compact_counts);
+
+    ProfBeginV("Compact Buckets [bucket_cap %llu]", bucket_cap);
+    U64 slot_lo = (task_id * bucket_cap) / tp->worker_count;
+    U64 slot_hi = ((task_id + 1) * bucket_cap) / tp->worker_count;
+    {
+      U64 c = 0;
+      for (U64 slot = slot_lo; slot < slot_hi; slot += 1) { c += buckets[slot] != 0; }
+      compact_counts[task_id] = c;
+    }
+    barrier_wait(tp->barrier);
+
+    for EachIndex(w, tp->worker_count) { symbol_count += compact_counts[w]; } // same value on every worker
+    if (task_id == 0) {
+      symbol_arr    = push_array_no_zero(scratch.arena, void *, symbol_count ? symbol_count : 1);
       symbol_ranges = tp_divide_work(scratch.arena, symbol_count, tp->worker_count);
       symbol_hashes = push_array_no_zero(scratch.arena, U32, symbol_count);
     }
-    tp_broadcast(&symbol_count);
     tp_broadcast(&symbol_arr);
     tp_broadcast(&symbol_ranges);
     tp_broadcast(&symbol_hashes);
+
+    {
+      U64 dst = 0;
+      for (U64 w = 0; w < task_id; w += 1) { dst += compact_counts[w]; }
+      for (U64 slot = slot_lo; slot < slot_hi; slot += 1) {
+        if (buckets[slot]) { symbol_arr[dst++] = buckets[slot]; }
+      }
+    }
+    barrier_wait(tp->barrier);
+    ProfEnd();
 
     // hash symbols
     Rng1U64 symbol_range = symbol_ranges[task_id];

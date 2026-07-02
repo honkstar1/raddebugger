@@ -241,6 +241,11 @@ typedef struct CV_DebugT
   // PCH
   Rng1U64 pch_ti_range[CV_TypeIndexSource_COUNT];
   U32     pch_obj_idx;
+
+  // set when the stream contains at least one LF_IFC_RECORD (0x1522) header-unit
+  // placeholder leaf (detected during the cv_debug_t_from_data header sweep);
+  // such streams are rewritten later (placeholder -> NOTYPE) by IFC resolution
+  B8      has_ifc_record;
 } CV_DebugT;
 
 ////////////////////////////////
