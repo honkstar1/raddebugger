@@ -98,6 +98,7 @@ global read_only LNK_CmdSwitch g_cmd_switch_map[] =
   { LNK_CmdSwitch_Rad_WriteTempFiles,               0, "RAD_WRITE_TEMP_FILES",                 "[:NO]",     "When speicifed linker writes image and debug info to temporary files and renames after link is done." },
   { LNK_CmdSwitch_Rad_TimeStamp,                    0, "RAD_TIME_STAMP",                       ":#",        "Time stamp embeded in EXE and PDB."                                               },
   { LNK_CmdSwitch_Rad_TypeHashAlg,                  0, "RAD_TPYE_HASH_ALG",                    ":{BLAKE3}", "Sets hashing algorithm for type merging."                                         },
+  { LNK_CmdSwitch_Rad_TypeHashAlg,                  0, "RAD_TYPEHASHALG",                      ":{BLAKE3}", "Alias of RAD_TPYE_HASH_ALG (spelling used by UnrealBuildTool)."                   },
   { LNK_CmdSwitch_Rad_UnresolvedSymbolLimit,        0, "RAD_UNRESOLVED_SYMBOL_LIMIT",          ":#",        "Limits number of unresolved symbol errors linker reports."                        },
   { LNK_CmdSwitch_Rad_UnresolvedSymbolRefLimit,     0, "RAD_UNRESOLVED_SYMBOL_REF_LIMIT",      ":#",        "Limit number of unresolved symbol references linker reports."                     },
   { LNK_CmdSwitch_Rad_Version,                      0, "RAD_VERSION",                          "",          "Print version and exit."                                                          },
@@ -1145,6 +1146,17 @@ lnk_apply_cmd_option_to_config(LNK_Config *config, String8 cmd_name, String8List
   switch (cmd_switch) {
   case LNK_CmdSwitch_Null: {
     String8 value = str8_list_join(scratch.arena, &value_strings, &(StringJoin){.sep=str8_lit_comp(",")});
+
+    // Unknown /RAD_* switches on the command line are a hard error: the RAD_
+    // namespace is owned by this linker, so an unknown one means the build
+    // system expects a feature this binary does not have (e.g. a stale
+    // radlink.exe asked to /RAD_BUNDLE). Silently dropping the switch (the
+    // release-default /RAD_IGNORE mutes LNK_Warning_UnknownSwitch) would run
+    // a bogus regular link instead of the requested mode.
+    if (obj == 0 && str8_match_lit("RAD_", str8_prefix(cmd_name, 4), StringMatchFlag_CaseInsensitive)) {
+      lnk_error(LNK_Error_Cmdl, "unknown switch: \"/%S%s%S\"; this radlink build does not support it (stale linker binary?)", cmd_name, value.size ? ":" : "", value);
+    }
+
     lnk_error_obj(LNK_Warning_UnknownSwitch, obj, "unknown switch: \"/%S%s%S\"", cmd_name, value.size ? ":" : "", value);
   } break;
 
