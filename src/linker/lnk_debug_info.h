@@ -97,7 +97,11 @@ typedef struct
 
   U64              symbol_input_count;
   LNK_SymbolInput *symbol_inputs;       // [symbol_input_count]
-  Rng1U64         *symbol_input_ranges; // [worker_count]
+  Rng1U64         *symbol_input_ranges; // [symbol_input_range_count]
+  // FAIR-SHARE: fixed lane count symbol_input_ranges was built for (full pool width at build
+  // time). Barrier passes may run at a pinned cohort C < this; they must walk lanes
+  // [task_id, symbol_input_range_count) strided by the cohort, NOT index by task_id alone.
+  U64              symbol_input_range_count;
 
   // IFC (header-unit debug-record) resolution:
   // redirects a consuming obj's local LF_IFC_RECORD placeholder TI to a leaf in
