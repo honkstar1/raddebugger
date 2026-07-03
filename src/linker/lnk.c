@@ -8122,6 +8122,12 @@ typedef struct LNK_SummaryInfo
   U64          objs_count;
   U64          input_bytes;  // sum of obj data sizes (lib members count their slice)
   U64          libs_count;
+  // physical-memory samples (GlobalMemoryStatusEx): storm triage -- prod storms
+  // show pdb-phase kernel time exploding 54x for the same fault count, fitting
+  // free-list exhaustion / page-repurpose; these 3 samples prove/refute that
+  U64          mem_avail_t0;  // ullAvailPhys at link start
+  U64          mem_avail_pdb; // ullAvailPhys at pdb-phase start (0 = phase never ran)
+  U32          mem_load_max;  // max dwMemoryLoad seen across the samples
   // name COPIES: config strings parsed out of an @rsp point into the response
   // file buffer, whose scratch dies right after config parse -- capture the
   // bytes here instead of keeping String8s into freed memory
@@ -8155,6 +8161,23 @@ lnk_summary_counters_from_timer(LNK_TimerType timer)
   // same mid-phase guard as lnk_summary_us_from_timer
   if (g_timers[timer].end <= g_timers[timer].begin) { return zero; }
   return lnk_summary_counters_sub_sat(g_timer_counters_end[timer], g_timer_counters_begin[timer]);
+}
+
+// one GlobalMemoryStatusEx sample for the summary line: returns available
+// physical bytes and folds dwMemoryLoad into the running max. 1 syscall per
+// call, called 3x per link (link start, pdb-phase start, print time).
+internal U64
+lnk_summary_sample_mem(void)
+{
+  U64 avail = 0;
+#if OS_WINDOWS
+  MEMORYSTATUSEX msx = { sizeof(msx) };
+  if (GlobalMemoryStatusEx(&msx)) {
+    avail = msx.ullAvailPhys;
+    if (msx.dwMemoryLoad > g_summary_info.mem_load_max) { g_summary_info.mem_load_max = msx.dwMemoryLoad; }
+  }
+#endif
+  return avail;
 }
 
 internal U64
@@ -8242,8 +8265,11 @@ lnk_print_summary(int exit_code)
                             str8(g_summary_info.pool_name, g_summary_info.pool_name_size), grant_avg, park_seconds, procs_now, procs_peak);
   }
 
+  // final memory sample (t1) -- 3rd and last GlobalMemoryStatusEx of the link
+  U64 mem_avail_t1 = lnk_summary_sample_mem();
+
   lnk_fprintf(stdout,
-              "[radlink summary] v=2 out=%S exit=%d t0=%llu t1=%llu wall=%.1f user=%.1f kern=%.1f ws=%.1fG pf=%.1fM io=%llu/%lluMB workers=%llu%S"
+              "[radlink summary] v=2 out=%S exit=%d t0=%llu t1=%llu wall=%.1f user=%.1f kern=%.1f ws=%.1fG pf=%.1fM io=%llu/%lluMB mem=%.1f/%.1f/%.1f/%u workers=%llu%S"
               " in=%lluo/%.1fG libs=%llu"
               " ph[inp=%S res=%S icf=%S ref=%S img=%S dbg=%S pdb=%S wr=%S]"
               " dbgg[mcvi=%S merge=%S]"
@@ -8259,6 +8285,10 @@ lnk_print_summary(int exit_code)
               page_faults_m,
               io_read_mb,
               io_write_mb,
+              (F64)g_summary_info.mem_avail_t0  / (F64)GB(1),
+              (F64)g_summary_info.mem_avail_pdb / (F64)GB(1),
+              (F64)mem_avail_t1                 / (F64)GB(1),
+              g_summary_info.mem_load_max,
               g_summary_info.worker_count,
               pool_stats,
               g_summary_info.objs_count,
@@ -8664,6 +8694,7 @@ lnk_run_linker(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
 
       String8List pdb_data = {0};
       {
+        g_summary_info.mem_avail_pdb = lnk_summary_sample_mem();
         lnk_timer_begin(LNK_Timer_Pdb);
         if (config->pdb_hash_type_names != LNK_TypeNameHashMode_Null && config->pdb_hash_type_names != LNK_TypeNameHashMode_None) {
           lnk_replace_type_names_with_hashes(tp,
@@ -9080,8 +9111,9 @@ internal void
 entry_point(CmdLine *cmdline)
 {
   Temp scratch = scratch_begin(0,0);
-  g_summary_info.start_us = now_time_us();
-  g_summary_info.t0_ms    = lnk_summary_utc_ms();
+  g_summary_info.start_us     = now_time_us();
+  g_summary_info.t0_ms        = lnk_summary_utc_ms();
+  g_summary_info.mem_avail_t0 = lnk_summary_sample_mem();
   lnk_log_begin();
 
   LNK_Config *config = lnk_config_from_argcv(cmdline);
