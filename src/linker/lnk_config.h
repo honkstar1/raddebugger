@@ -102,6 +102,7 @@ typedef enum
   LNK_CmdSwitch_Rad_BuildInfo,
   LNK_CmdSwitch_Rad_CheckUnusedDelayLoadDll,
   LNK_CmdSwitch_Rad_DataDirCount,
+  LNK_CmdSwitch_Rad_DbgPhaseGate,
   LNK_CmdSwitch_Rad_Debug,
   LNK_CmdSwitch_Rad_DebugAltPath,
   LNK_CmdSwitch_Rad_DebugName,
@@ -316,6 +317,7 @@ typedef struct LNK_Config
   U64                         worker_count;
   U64                         max_worker_count;
   String8                     shared_thread_pool_name;
+  U64                         dbg_phase_gate; // /RAD_DBG_PHASE_GATE:N -- max processes concurrently inside the debug-info parse/merge window (0 = off)
   LNK_SwitchState             do_function_pad_min;
   B32                         infer_function_pad_min;
   U64                         function_pad_min;

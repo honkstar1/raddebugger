@@ -71,6 +71,7 @@ global read_only LNK_CmdSwitch g_cmd_switch_map[] =
   { LNK_CmdSwitch_Rad_MapLinesForUnresolvedSymbols, 0, "RAD_MAP_LINES_FOR_UNRESOLVED_SYMBOLS", "[:NO]",     "Use debug info to print source file location for unresolved symbol"               },
   { LNK_CmdSwitch_Rad_MemoryMapFiles,               0, "RAD_MEMORY_MAP_FILES",                 "[:{NO|READ_ONLY|READ_WRITE}]", "When enabled, files are memory-mapped instead of being read entirely on request." },
   { LNK_CmdSwitch_Rad_BootMode,                     0, "RAD_BOOT_MODE",                        "[:LINKER|TYPE_SERVER]", "Overrides default boot program."                                      },
+  { LNK_CmdSwitch_Rad_DbgPhaseGate,                 0, "RAD_DBG_PHASE_GATE",                   ":#",        "Max processes concurrently inside the debug-info parse/merge window (shared pool only; acquire times out after 10s and proceeds; 0 = off, default)." },
   { LNK_CmdSwitch_Rad_Debug,                        0, "RAD_DEBUG",                            "[:NO]",     "Emit RAD debug info file."                                                        },
   { LNK_CmdSwitch_Rad_DebugAltPath,                 0, "RAD_DEBUGALTPATH",                     ":PATH",     "Alternative output path for the RDI."                                             },
   { LNK_CmdSwitch_Rad_DebugName,                    0, "RAD_DEBUG_NAME",                       ":FILENAME", "Set file name for RAD debug info file."                                           },
@@ -1906,6 +1907,10 @@ lnk_apply_cmd_option_to_config(LNK_Config *config, String8 cmd_name, String8List
     } else {
       lnk_error_cmd_switch_invalid_param_count(LNK_Error_Boot, obj, cmd_switch);
     }
+  } break;
+
+  case LNK_CmdSwitch_Rad_DbgPhaseGate: {
+    lnk_cmd_switch_parse_u64(obj, cmd_switch, value_strings, &config->dbg_phase_gate, 0);
   } break;
 
   case LNK_CmdSwitch_Rad_Debug: {
