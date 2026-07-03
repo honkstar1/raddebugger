@@ -2640,10 +2640,148 @@ dbi_sc_compar(const PDB_DbiSectionContrib *a, const PDB_DbiSectionContrib *b)
 }
 #endif
 
+// Parallel stable LSD radix sort for the DBI section-contrib array.
+//
+// The serial sort is a pure main-thread window near link end (~157 ms on the
+// FN editor link) while every worker idles. This runs the same stable
+// least-significant-digit sort as the serial path -- five 8-bit-or-smaller
+// digit passes: sec_off bits 0-7, 8-15, 16-23, 24-31, then section index --
+// so the output permutation is IDENTICAL (stable sort by (sec, sec_off), ties
+// in input order). Each pass: per-worker histograms over contiguous input
+// ranges, one small serial exclusive prefix in (digit, worker) order (stable),
+// then a parallel scatter where every worker owns disjoint output cursors.
+// No atomics; deterministic regardless of worker count.
+
+typedef struct
+{
+  PDB_DbiSectionContrib *src;
+  PDB_DbiSectionContrib *dst;
+  Rng1U64               *range_arr;
+  U32                   *count_arr;   // [task_count][digit_count], worker-major
+  U64                    digit_count;
+  U64                    shift;       // sec_off digit shift; ignored when is_sec_pass
+  B32                    is_sec_pass; // digit = base.sec instead of a sec_off byte
+} LNK_DbiScRadixPass;
+
+internal U64
+lnk_dbi_sc_radix_digit(LNK_DbiScRadixPass *pass, PDB_DbiSectionContrib *sc)
+{
+  U64 digit;
+  if (pass->is_sec_pass) {
+    digit = sc->base.sec;
+  } else {
+    digit = (sc->base.sec_off >> pass->shift) % pass->digit_count;
+  }
+  return digit;
+}
+
+typedef struct
+{
+  PDB_DbiSectionContrib *src;
+  PDB_DbiSectionContrib *dst;
+  Rng1U64               *range_arr;
+} LNK_DbiScCopy;
+
+internal
+THREAD_POOL_TASK_FUNC(lnk_dbi_sc_copy_task)
+{
+  LNK_DbiScCopy *copy  = raw_task;
+  Rng1U64        range = copy->range_arr[task_id];
+  MemoryCopy(copy->dst + range.min, copy->src + range.min, sizeof(copy->src[0]) * dim_1u64(range));
+}
+
+internal
+THREAD_POOL_TASK_FUNC(lnk_dbi_sc_radix_histo_task)
+{
+  LNK_DbiScRadixPass *pass  = raw_task;
+  U32                *count = pass->count_arr + task_id * pass->digit_count;
+  Rng1U64             range = pass->range_arr[task_id];
+  for (U64 i = range.min; i < range.max; i += 1) {
+    count[lnk_dbi_sc_radix_digit(pass, &pass->src[i])] += 1;
+  }
+}
+
+internal
+THREAD_POOL_TASK_FUNC(lnk_dbi_sc_radix_scatter_task)
+{
+  LNK_DbiScRadixPass *pass  = raw_task;
+  U32                *count = pass->count_arr + task_id * pass->digit_count;
+  Rng1U64             range = pass->range_arr[task_id];
+  for (U64 i = range.min; i < range.max; i += 1) {
+    PDB_DbiSectionContrib *sc = &pass->src[i];
+    pass->dst[count[lnk_dbi_sc_radix_digit(pass, sc)]++] = *sc;
+  }
+}
+
 internal void
-lnk_radix_sort_dbi_sc_array(PDB_DbiSectionContrib *arr, U64 sc_count, U64 sect_count)
+lnk_dbi_sc_radix_pass_parallel(TP_Context *tp, Arena *arena, U64 task_count, Rng1U64 *range_arr, PDB_DbiSectionContrib **src, PDB_DbiSectionContrib **dst, U64 digit_count, U64 shift, B32 is_sec_pass)
+{
+  Temp temp = temp_begin(arena);
+
+  LNK_DbiScRadixPass pass = {0};
+  pass.src         = *src;
+  pass.dst         = *dst;
+  pass.range_arr   = range_arr;
+  pass.count_arr   = push_array(temp.arena, U32, task_count * digit_count);
+  pass.digit_count = digit_count;
+  pass.shift       = shift;
+  pass.is_sec_pass = is_sec_pass;
+
+  // per-worker digit histograms over contiguous input ranges
+  tp_for_parallel(tp, 0, task_count, lnk_dbi_sc_radix_histo_task, &pass);
+
+  // exclusive prefix in (digit, worker) order => stable scatter cursors
+  U32 cursor = 0;
+  for (U64 digit = 0; digit < digit_count; digit += 1) {
+    for (U64 w = 0; w < task_count; w += 1) {
+      U32 count = pass.count_arr[w * digit_count + digit];
+      pass.count_arr[w * digit_count + digit] = cursor;
+      cursor += count;
+    }
+  }
+
+  // stable parallel scatter: worker cursors are disjoint by construction
+  tp_for_parallel(tp, 0, task_count, lnk_dbi_sc_radix_scatter_task, &pass);
+
+  temp_end(temp);
+
+  // ping-pong buffers for the next pass
+  PDB_DbiSectionContrib *t = *src; *src = *dst; *dst = t;
+}
+
+internal void
+lnk_radix_sort_dbi_sc_array(TP_Context *tp, PDB_DbiSectionContrib *arr, U64 sc_count, U64 sect_count)
 {
   ProfBeginFunction();
+
+  // parallel path: same stable LSD sort split across the pool (see
+  // lnk_dbi_sc_radix_pass_parallel); serial path kept for tiny inputs
+  // (stripped-PDB links) and tp-less callers.
+  if (tp != 0 && tp->worker_count > 1 && sc_count >= KB(64)) {
+    Temp scratch = scratch_begin(0,0);
+
+    PDB_DbiSectionContrib *src        = arr;
+    PDB_DbiSectionContrib *dst        = push_array_no_zero(scratch.arena, PDB_DbiSectionContrib, sc_count);
+    U64                    task_count = tp->worker_count;
+    Rng1U64               *range_arr  = tp_divide_work(scratch.arena, sc_count, task_count);
+
+    lnk_dbi_sc_radix_pass_parallel(tp, scratch.arena, task_count, range_arr, &src, &dst, 256,        0,  0);
+    lnk_dbi_sc_radix_pass_parallel(tp, scratch.arena, task_count, range_arr, &src, &dst, 256,        8,  0);
+    lnk_dbi_sc_radix_pass_parallel(tp, scratch.arena, task_count, range_arr, &src, &dst, 256,        16, 0);
+    lnk_dbi_sc_radix_pass_parallel(tp, scratch.arena, task_count, range_arr, &src, &dst, 256,        24, 0);
+    lnk_dbi_sc_radix_pass_parallel(tp, scratch.arena, task_count, range_arr, &src, &dst, sect_count, 0,  1);
+
+    // odd number of ping-pong passes => the sorted result sits in the temp
+    // buffer; copy it back to the caller's array in parallel
+    if (src != arr) {
+      LNK_DbiScCopy copy = { .src = src, .dst = arr, .range_arr = range_arr };
+      tp_for_parallel(tp, 0, task_count, lnk_dbi_sc_copy_task, &copy);
+    }
+
+    scratch_end(scratch);
+    ProfEnd();
+    return;
+  }
 
 #if 1
   // faster but uses more memory
@@ -2773,7 +2911,7 @@ lnk_radix_sort_dbi_sc_array(PDB_DbiSectionContrib *arr, U64 sc_count, U64 sect_c
 }
 
 internal String8List
-dbi_build_sec_con(Arena *arena, PDB_DbiContext *dbi)
+dbi_build_sec_con(Arena *arena, TP_Context *tp, PDB_DbiContext *dbi)
 {
   ProfBeginFunction();
 
@@ -2790,7 +2928,7 @@ dbi_build_sec_con(Arena *arena, PDB_DbiContext *dbi)
   ProfEnd();
 
   // sort section contribs so they are binary searchable
-  lnk_radix_sort_dbi_sc_array(sc_array, dbi->sec_contrib_list.count, dbi->section_list.count + 1);
+  lnk_radix_sort_dbi_sc_array(tp, sc_array, dbi->sec_contrib_list.count, dbi->section_list.count + 1);
 
   // coalesce adjacent contributions that belong to the same module, section, and
   // flags and are perfectly contiguous. The section contribution substream is only
@@ -2908,7 +3046,7 @@ dbi_build(TP_Context *tp, PDB_DbiContext *dbi, MSF_Context *msf, MSF_StreamNumbe
   
   ProfBegin("Build");
   String8List module_info_list = dbi_build_module_info(scratch.arena, dbi, msf);
-  String8List sec_con_list     = dbi_build_sec_con(scratch.arena, dbi);
+  String8List sec_con_list     = dbi_build_sec_con(scratch.arena, tp, dbi);
   String8List sec_map_list     = dbi_build_sec_map(scratch.arena, dbi);
   String8List file_info_list   = dbi_build_file_info(scratch.arena, tp, dbi->module_list, string_ht);
   String8List dbg_header_list  = dbi_build_dbg_header(scratch.arena, dbi, msf);
