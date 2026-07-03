@@ -8247,7 +8247,7 @@ lnk_print_summary(int exit_code)
               " in=%lluo/%.1fG libs=%llu"
               " ph[inp=%S res=%S icf=%S ref=%S img=%S dbg=%S pdb=%S wr=%S]"
               " dbgg[mcvi=%S merge=%S]"
-              " pdbg[gsi=%S sym=%S mod=%S tpi=%S msf=%S wr=%S]\n",
+              " pdbg[gsi=%S sym=%S mod=%S tpi=%S str=%S sc=%S msf=%S wr=%S]\n",
               g_summary_info.out_name_size ? str8(g_summary_info.out_name, g_summary_info.out_name_size) : str8_lit("-"),
               exit_code,
               g_summary_info.t0_ms,
@@ -8278,6 +8278,8 @@ lnk_print_summary(int exit_code)
               lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbSym]),
               lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbMod]),
               lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbTpi]),
+              lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbStr]),
+              lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbSc]),
               lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbMsf]),
               lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbWr]));
 

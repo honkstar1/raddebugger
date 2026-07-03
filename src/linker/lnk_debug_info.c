@@ -5065,10 +5065,12 @@ lnk_build_pdb(TP_Context *tp, TP_Arena *tp_arena, String8 image_data, LNK_Config
   }
   lnk_summary_phase_end(LNK_SummaryPhase_PdbTpi);
 
+  lnk_summary_phase_begin(LNK_SummaryPhase_PdbStr);
   ProfBegin("Merge String Tables");
   task.string_ht = cv_dedup_string_tables(tp_arena, tp, cv->obj_count, cv->debug_s_arr);
   cv_string_hash_table_assign_buffer_offsets(tp, task.string_ht);
   ProfEnd();
+  lnk_summary_phase_end(LNK_SummaryPhase_PdbStr);
 
   if (builder_flags & LNK_PDB_BuilderFlag_Modules) {
     ProfScope ("Alloc Modules")
@@ -5120,11 +5122,14 @@ lnk_build_pdb(TP_Context *tp, TP_Arena *tp_arena, String8 image_data, LNK_Config
     }
   }
 
+  lnk_summary_phase_begin(LNK_SummaryPhase_PdbStr); // accumulates with the merge bracket above
   ProfBegin("Add string tables");
   pdb_strtab_add_cv_string_hash_table(&task.pdb->info->strtab, task.string_ht);
   ProfEnd();
+  lnk_summary_phase_end(LNK_SummaryPhase_PdbStr);
   
   if (builder_flags & LNK_PDB_BuilderFlag_SC) {
+    lnk_summary_phase_begin(LNK_SummaryPhase_PdbSc);
     ProfBegin("Build Section Contrib Map");
     {
       ProfBegin("Build DBI Section Headers");
@@ -5146,6 +5151,7 @@ lnk_build_pdb(TP_Context *tp, TP_Arena *tp_arena, String8 image_data, LNK_Config
       dbi_sec_list_concat_arr(&task.pdb->dbi->sec_contrib_list, cv->obj_count, task.sc_list);
     }
     ProfEnd();
+    lnk_summary_phase_end(LNK_SummaryPhase_PdbSc);
   }
 
   if (builder_flags & LNK_PDB_BuilderFlag_NATVIS) {

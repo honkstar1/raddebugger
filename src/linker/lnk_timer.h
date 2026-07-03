@@ -63,6 +63,8 @@ typedef enum LNK_SummaryPhase
   LNK_SummaryPhase_PdbSym,   // pdb_build_gsi_psi ("Build GSI and PSI": symrec + GSI/PSI hash streams)
   LNK_SummaryPhase_PdbMod,   // lnk_write_pdb_modules barrier pass ("Write Modules")
   LNK_SummaryPhase_PdbTpi,   // pdb_type_server_push_parallel TPI+IPI + pdb_type_server_build TPI/IPI
+  LNK_SummaryPhase_PdbStr,   // string tables: cv_dedup_string_tables + offset assign + strtab add ("Merge String Tables"/"Add string tables")
+  LNK_SummaryPhase_PdbSc,    // "Build Section Contrib Map" (per-obj section contribs + DBI section headers)
   LNK_SummaryPhase_PdbMsf,   // dbi_build + pdb_info_build + msf_build + page-node gather
   LNK_SummaryPhase_PdbWr,    // PDB file write (lnk_write_data_list_to_file_path in lnk_io)
 
