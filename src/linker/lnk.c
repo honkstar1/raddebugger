@@ -1635,6 +1635,40 @@ lnk_queue_lib_member(Arena                *arena,
   }
 }
 
+internal void
+lnk_search_lib_visit_weak(Arena                *arena,
+                          LNK_SearchLibTask    *task,
+                          LNK_LibMemberRefList *member_ref_list,
+                          LNK_Symbol           *symbol,
+                          B32                   search_anti_deps)
+{
+  LNK_Lib            *lib              = task->lib;
+  LNK_LibMemberInfo  *lib_member_infos = task->lib_member_infos;
+  LNK_ObjSymbolRef    symbol_ref       = lnk_ref_from_symbol(symbol);
+  COFF_ParsedSymbol   symbol_parsed    = lnk_parsed_symbol_from_coff_symbol_idx_no_name(symbol_ref.obj, symbol_ref.symbol_idx);
+  COFF_SymbolWeakExt *weak_ext         = coff_parse_weak_tag(symbol_parsed, symbol_ref.obj->header.is_big_obj);
+  if (weak_ext->characteristics == COFF_WeakExt_SearchLibrary) {
+    U32 member_idx;
+    if (lnk_search_lib(lib, symbol->name, &member_idx)) {
+      lnk_queue_lib_member(arena, task->imports_hm, task->link->lib_member_infos_hm, member_ref_list, symbol, lib, lib_member_infos, member_idx);
+    }
+  } else if (weak_ext->characteristics == COFF_WeakExt_AntiDependency) {
+    if (search_anti_deps) {
+      LNK_ObjSymbolRef dep_symbol = {0};
+      if (lnk_resolve_weak_symbol(task->symtab, symbol_ref, &dep_symbol)) {
+        COFF_ParsedSymbol          dep_parsed = lnk_parsed_symbol_from_coff_symbol_idx_no_name(dep_symbol.obj, dep_symbol.symbol_idx);
+        COFF_SymbolValueInterpType dep_interp = coff_interp_from_parsed_symbol(dep_parsed);
+        if (dep_interp == COFF_SymbolValueInterp_Weak) {
+          U32 member_idx;
+          if (lnk_search_lib(lib, symbol->name, &member_idx)) {
+            lnk_queue_lib_member(arena, task->imports_hm, task->link->lib_member_infos_hm, member_ref_list, symbol, lib, lib_member_infos, member_idx);
+          }
+        }
+      }
+    }
+  }
+}
+
 internal
 THREAD_POOL_TASK_FUNC(lnk_search_lib_task)
 {
@@ -1648,9 +1682,38 @@ THREAD_POOL_TASK_FUNC(lnk_search_lib_task)
   // FRONTIER cursor: resume from where this worker last left off for this lib. search_chunks is
   // append-only across the lib-search loop, so slots before the cursor were already searched and
   // (search being a pure fn of (lib, symbol->name), member-queue dedup idempotent) can never resolve
-  // a new member. reset_cursor (anti-dep mode flip) forces a full rescan from list first.
-  LNK_SymbolHashTrieChunk *start_chunk = task->reset_cursor ? 0 : lib->search_cursor_chunk[task_id];
-  U64                      start_idx   = task->reset_cursor ? 0 : lib->search_cursor_idx[task_id];
+  // a new member.
+  LNK_SymbolHashTrieChunk *start_chunk = lib->search_cursor_chunk[task_id];
+  U64                      start_idx   = lib->search_cursor_idx[task_id];
+
+  // reset_cursor (anti-dep search just turned ON): weak anti-dep slots before the cursor were
+  // deliberately not searched under the old mode, so re-visit the pre-cursor region -- but only
+  // the slots that can behave differently under the new mode:
+  //  - search_skip'd (resolved) slots can never match a lib again        -> skip
+  //  - Undefined and Weak/SearchLibrary slots were already searched vs
+  //    this lib mode-independently; re-searching is idempotent (pure fn
+  //    of (lib, name) + member-queue dedup) and queues nothing new       -> skip Undefined
+  //  - Weak slots get the full weak handling (idempotent for
+  //    SearchLibrary, and this is exactly the anti-dep retry we need)    -> visit
+  // this replaces the old full rescan, which re-dereferenced and re-searched every slot.
+  if (task->reset_cursor && start_chunk != 0) {
+    for (LNK_SymbolHashTrieChunk *c = symtab->search_chunks[task_id].first; c != 0; c = c->next) {
+      U64 i_end = (c == start_chunk) ? start_idx : c->count;
+      U8 *skip  = c->search_skip;
+      for (U64 i = 0; i < i_end; i += 1) {
+        if (skip[i]) { continue; }
+        LNK_Symbol                 *symbol        = c->v[i].symbol;
+        COFF_SymbolValueInterpType  symbol_interp = symbol->interp;
+        if (symbol_interp == COFF_SymbolValueInterp_Weak) {
+          lnk_search_lib_visit_weak(arena, task, member_ref_list, symbol, search_anti_deps);
+        } else if (symbol_interp != COFF_SymbolValueInterp_Undefined) {
+          // resolved since the last scan that touched this slot -> never a candidate again
+          skip[i] = 1;
+        }
+      }
+      if (c == start_chunk) { break; }
+    }
+  }
 
   LNK_SymbolHashTrieChunk *first_chunk = start_chunk ? start_chunk : symtab->search_chunks[task_id].first;
   LNK_SymbolHashTrieChunk *end_chunk   = symtab->search_chunks[task_id].last;
@@ -1659,7 +1722,15 @@ THREAD_POOL_TASK_FUNC(lnk_search_lib_task)
   for (LNK_SymbolHashTrieChunk *c = first_chunk; c != 0; c = c->next) {
     U64 i_begin = (c == start_chunk) ? start_idx : 0;
     U64 i_end   = c->count;
+    U8 *skip    = c->search_skip;
     for (U64 i = i_begin; i < i_end; i += 1) {
+      // search_skip[i]: this slot's symbol was already observed resolved (not Undefined/Weak).
+      // resolution is monotonic (lnk_can_replace_symbol never lets an Undefined/Weak src displace
+      // a resolved leader), so the slot can never match a lib again -- skip it without touching
+      // LNK_Symbol at all. this kills the dominant cache-miss of the scan: one random deref per
+      // resolved slot, per lib, per pass.
+      if (skip[i]) { continue; }
+
       LNK_Symbol *symbol = c->v[i].symbol;
 
       // interp is cached on the symbol at push time, so the common case (resolved symbols, which
@@ -1672,29 +1743,9 @@ THREAD_POOL_TASK_FUNC(lnk_search_lib_task)
           lnk_queue_lib_member(arena, task->imports_hm, task->link->lib_member_infos_hm, member_ref_list, symbol, lib, lib_member_infos, member_idx);
         }
       } else if (symbol_interp == COFF_SymbolValueInterp_Weak) {
-        LNK_ObjSymbolRef   symbol_ref    = lnk_ref_from_symbol(symbol);
-        COFF_ParsedSymbol  symbol_parsed = lnk_parsed_symbol_from_coff_symbol_idx_no_name(symbol_ref.obj, symbol_ref.symbol_idx);
-        COFF_SymbolWeakExt *weak_ext = coff_parse_weak_tag(symbol_parsed, symbol_ref.obj->header.is_big_obj);
-        if (weak_ext->characteristics == COFF_WeakExt_SearchLibrary) {
-          U32 member_idx;
-          if (lnk_search_lib(lib, symbol->name, &member_idx)) {
-            lnk_queue_lib_member(arena, task->imports_hm, task->link->lib_member_infos_hm, member_ref_list, symbol, lib, lib_member_infos, member_idx);
-          }
-        } else if (weak_ext->characteristics == COFF_WeakExt_AntiDependency) {
-          if (search_anti_deps) {
-            LNK_ObjSymbolRef dep_symbol = {0};
-            if (lnk_resolve_weak_symbol(symtab, symbol_ref, &dep_symbol)) {
-              COFF_ParsedSymbol          dep_parsed = lnk_parsed_symbol_from_coff_symbol_idx_no_name(dep_symbol.obj, dep_symbol.symbol_idx);
-              COFF_SymbolValueInterpType dep_interp = coff_interp_from_parsed_symbol(dep_parsed);
-              if (dep_interp == COFF_SymbolValueInterp_Weak) {
-                U32 member_idx;
-                if (lnk_search_lib(lib, symbol->name, &member_idx)) {
-                  lnk_queue_lib_member(arena, task->imports_hm, task->link->lib_member_infos_hm, member_ref_list, symbol, lib, lib_member_infos, member_idx);
-                }
-              }
-            }
-          }
-        }
+        lnk_search_lib_visit_weak(arena, task, member_ref_list, symbol, search_anti_deps);
+      } else {
+        skip[i] = 1;
       }
     }
   }
@@ -1860,9 +1911,12 @@ lnk_link_inputs(TP_Context      *tp,
               lib->search_cursor_idx   = push_array(link->arena, U64,                       tp->worker_count);
             }
 
-            // anti-dep mode flipped since last search of this lib: anti-dep weak symbols before the
-            // cursor were skipped under the old mode, so they must be re-tried -> rescan from start.
-            B32 reset_cursor = lib->was_searched && lib->searched_anti_deps != search_anti_deps;
+            // anti-dep search turned ON since last search of this lib: anti-dep weak symbols before
+            // the cursor were skipped under the old mode, so they must be re-tried -> weak-only
+            // re-pass over the pre-cursor region (see lnk_search_lib_task). the OFF flip (1 -> 0)
+            // needs no reset: a mode-1 scan is a strict superset of a mode-0 scan over the same
+            // slots, so everything a mode-0 rescan could queue was already queued (and deduped).
+            B32 reset_cursor = lib->was_searched && !lib->searched_anti_deps && search_anti_deps;
 
             LNK_SearchLibTask search_task = {
               .search_anti_deps = search_anti_deps,

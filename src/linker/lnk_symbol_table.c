@@ -78,6 +78,10 @@ lnk_symbol_hash_trie_chunk_list_push(Arena *arena, LNK_SymbolHashTrieChunkList *
     LNK_SymbolHashTrieChunk *chunk = push_array(arena, LNK_SymbolHashTrieChunk, 1);
     chunk->cap                     = cap;
     chunk->v                       = push_array_no_zero(arena, LNK_SymbolHashTrie, cap);
+    // lib-search skip cache (zeroed = every slot is a candidate); search lists only
+    if (list->is_search) {
+      chunk->search_skip = push_array(arena, U8, cap);
+    }
     SLLQueuePush(list->first, list->last, chunk);
     ++list->count;
   }
@@ -558,6 +562,9 @@ lnk_symbol_table_init(TP_Arena *arena)
   symtab->arena             = arena;
   symtab->chunks            = push_array(arena->v[0], LNK_SymbolHashTrieChunkList, arena->count);
   symtab->search_chunks     = push_array(arena->v[0], LNK_SymbolHashTrieChunkList, arena->count);
+  for EachIndex(worker_id, arena->count) {
+    symtab->search_chunks[worker_id].is_search = 1;
+  }
   return symtab;
 }
 

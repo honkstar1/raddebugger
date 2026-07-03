@@ -65,6 +65,16 @@ typedef struct LNK_SymbolHashTrieChunk
   U64                             count;
   U64                             cap;
   LNK_SymbolHashTrie             *v;
+  // [cap] bytes, allocated (zeroed) only for search_chunks lists; 0 elsewhere.
+  // search_skip[i] != 0 marks a slot whose symbol the lib search observed as
+  // resolved (not Undefined/Weak). Resolution is monotonic (lnk_can_replace_symbol
+  // never lets an Undefined/Weak src displace a resolved leader), so once set the
+  // slot can never queue a lib member again and every later per-lib scan skips it
+  // without dereferencing LNK_Symbol (the dominant cache-miss in lib search).
+  // Written only by the owning worker during its scan (search_chunks[task_id] is
+  // scanned exclusively by task_id, and scans never overlap inserts) -> no races,
+  // and the member-queue set is unchanged -> byte-identical output.
+  U8                             *search_skip;
 } LNK_SymbolHashTrieChunk;
 
 typedef struct LNK_SymbolHashTrieChunkList
@@ -76,10 +86,13 @@ typedef struct LNK_SymbolHashTrieChunkList
   // site (and the insert-race rollback) so lnk_symbol_table_search_symbol_count is O(workers)
   // instead of walking every chunk per lib per lib-search round. same value as the walk.
   U64                      symbol_count;
+  // set once at symtab init for search_chunks lists; chunk pushes into a flagged list
+  // allocate the per-slot search_skip array (lib-search resolved-slot skip cache).
+  U64                      is_search;
   // false-sharing pad: symtab->chunks / search_chunks are [worker_count] arrays indexed
-  // [worker_id]; at 32B/entry adjacent workers share a cache line on the parallel insert.
+  // [worker_id]; at 40B/entry adjacent workers share a cache line on the parallel insert.
   // Pad each entry to a full 64B line so each worker owns its line. Pure layout -> byte-identical.
-  U8                       pad_[64 - 4*8];
+  U8                       pad_[64 - 5*8];
 } LNK_SymbolHashTrieChunkList;
 
 // --- Symbol Table ------------------------------------------------------------
