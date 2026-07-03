@@ -123,3 +123,30 @@ internal void tp_stats_level_add(S64 delta);
 internal void tp_stats_park_add(U64 worker_us);
 internal void tp_stats_snapshot(F64 *grant_avg_out, F64 *park_seconds_out);
 
+// SHARED-mode cross-process block (summary line: procs=<attached>/<peak>).
+// Lives in a named section "<pool_name>.procs.v2"; the budget semaphore is
+// "<pool_name>.budget.v2". BOTH names carry the layout-version suffix so an
+// old radlink (which uses "<pool_name>.budget" and no section) and a new one
+// pointed at the SAME /RAD_SHARED_THREAD_POOL name never share kernel objects:
+// mixed old/new farms run two independent pools instead of corrupting one.
+// Bump TP_SHARED_V (and the magic) together with any layout change.
+//
+// `attached` counts processes currently attached (attach in tp_alloc; detach
+// via tp_procs_detach, called exactly once from the summary print since the
+// linker exits through _exit and never runs tp_release). `peak` is a CAS-raised
+// high watermark of `attached` over the BLOCK's lifetime (the block dies with
+// its last handle, so a farm session's overlap shows up as peak). Both are
+// best-effort: a process that dies without printing leaves `attached` high
+// until the block itself dies.
+#define TP_SHARED_V     "v2"
+#define TP_SHARED_MAGIC 0x32504C52u // 'RLP2'
+typedef struct TP_SharedBlock
+{
+  volatile U32 magic;    // TP_SHARED_MAGIC once initialized (CAS 0 -> magic)
+  volatile U32 attached; // processes currently attached
+  volatile U32 peak;     // high watermark of attached
+} TP_SharedBlock;
+
+internal void tp_procs_snapshot(U32 *attached_out, U32 *peak_out); // 0/0 when no shared pool
+internal void tp_procs_detach(void);                               // decrement + unmap (idempotent)
+

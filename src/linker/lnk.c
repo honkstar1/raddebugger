@@ -1811,9 +1811,11 @@ lnk_link_inputs(TP_Context      *tp,
 
   // summary: this function is Input (lnk_load_inputs rounds, accumulated on its
   // own bucket) + Resolve (lib search / member resolution / directives, i.e.
-  // everything else); attribute the remainder to Resolve at the bottom
-  U64 summary_begin_us    = now_time_us();
-  U64 summary_input_us_at = g_summary_phase_us[LNK_SummaryPhase_Input];
+  // everything else); attribute the remainder to Resolve at the bottom. The
+  // same subtraction works for every counter: they are monotonic and the Input
+  // brackets nest strictly inside this window
+  LNK_SummaryCounters summary_begin    = lnk_summary_counters_now();
+  LNK_SummaryCounters summary_input_at = g_summary_phase[LNK_SummaryPhase_Input];
 
   HashMap imports_hm = {0};
 
@@ -2095,8 +2097,16 @@ lnk_link_inputs(TP_Context      *tp,
     if (resolved_members_count == 0) { break; }
   }
 
-  g_summary_phase_us[LNK_SummaryPhase_Resolve] += (now_time_us() - summary_begin_us)
-                                                - (g_summary_phase_us[LNK_SummaryPhase_Input] - summary_input_us_at);
+  {
+    LNK_SummaryCounters now         = lnk_summary_counters_now();
+    LNK_SummaryCounters window      = lnk_summary_counters_sub_sat(now, summary_begin);
+    LNK_SummaryCounters input_delta = lnk_summary_counters_sub_sat(g_summary_phase[LNK_SummaryPhase_Input], summary_input_at);
+    LNK_SummaryCounters resolve     = lnk_summary_counters_sub_sat(window, input_delta);
+    g_summary_phase[LNK_SummaryPhase_Resolve].wall_us += resolve.wall_us;
+    g_summary_phase[LNK_SummaryPhase_Resolve].user_us += resolve.user_us;
+    g_summary_phase[LNK_SummaryPhase_Resolve].kern_us += resolve.kern_us;
+    g_summary_phase[LNK_SummaryPhase_Resolve].faults  += resolve.faults;
+  }
 
   scratch_end(scratch);
   ProfEnd();
@@ -8107,6 +8117,7 @@ typedef struct LNK_SummaryInfo
 {
   volatile U32 printed;      // print-exactly-once latch
   U64          start_us;     // set first thing in entry_point
+  U64          t0_ms;        // UTC ms epoch at link start (t1 is stamped at print time)
   U64          worker_count;
   U64          objs_count;
   U64          input_bytes;  // sum of obj data sizes (lib members count their slice)
@@ -8135,6 +8146,37 @@ lnk_summary_us_from_timer(LNK_TimerType timer)
 {
   // guard against a fatal exit mid-phase (begin stamped, end still zero)
   return g_timers[timer].end > g_timers[timer].begin ? g_timers[timer].end - g_timers[timer].begin : 0;
+}
+
+internal LNK_SummaryCounters
+lnk_summary_counters_from_timer(LNK_TimerType timer)
+{
+  LNK_SummaryCounters zero = {0};
+  // same mid-phase guard as lnk_summary_us_from_timer
+  if (g_timers[timer].end <= g_timers[timer].begin) { return zero; }
+  return lnk_summary_counters_sub_sat(g_timer_counters_end[timer], g_timer_counters_begin[timer]);
+}
+
+internal U64
+lnk_summary_utc_ms(void)
+{
+#if OS_WINDOWS
+  FILETIME ft;
+  GetSystemTimeAsFileTime(&ft);
+  U64 t100 = ((U64)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+  return (t100 - 116444736000000000ULL) / 10000; // FILETIME epoch -> unix ms epoch
+#else
+  return 0;
+#endif
+}
+
+// one phase bucket -> "wall-ms/user-ms/kernel-ms/faults-K" (process-wide deltas
+// at the bucket's boundaries; user can exceed wall on parallel phases, and a
+// bucket that overlaps another thread's work counts that work too)
+internal String8
+lnk_summary_str_from_counters(Arena *arena, LNK_SummaryCounters c)
+{
+  return push_str8f(arena, "%llu/%llu/%llu/%llu", c.wall_us / 1000, c.user_us / 1000, c.kern_us / 1000, c.faults / 1000);
 }
 
 internal void
@@ -8166,45 +8208,78 @@ lnk_print_summary(int exit_code)
   }
 #endif
 
-  // phase walls (ms). img/dbg/pdb come from the /RAD_LOG:TIMERS stamps; dbg is
-  // the debug-info umbrella minus the PDB/RDI sub-phases it contains.
-  U64 pdb_us = lnk_summary_us_from_timer(LNK_Timer_Pdb);
-  U64 rdi_us = lnk_summary_us_from_timer(LNK_Timer_Rdi);
-  U64 dbg_us = lnk_summary_us_from_timer(LNK_Timer_Debug);
-  dbg_us     = dbg_us > pdb_us + rdi_us ? dbg_us - (pdb_us + rdi_us) : 0;
+  // process IO totals: hard page-ins on mapped inputs surface as read bytes,
+  // UBA-detoured output writes as write bytes
+  U64 io_read_mb = 0, io_write_mb = 0;
+#if OS_WINDOWS
+  {
+    IO_COUNTERS ioc = {0};
+    if (GetProcessIoCounters(GetCurrentProcess(), &ioc)) {
+      io_read_mb  = ioc.ReadTransferCount  / MB(1);
+      io_write_mb = ioc.WriteTransferCount / MB(1);
+    }
+  }
+#endif
 
-  // governor stats, only when the shared pool is on
+  // phase triplets. img/dbg/pdb come from the /RAD_LOG:TIMERS stamps; dbg is
+  // the debug-info umbrella minus the PDB/RDI sub-phases it contains.
+  LNK_SummaryCounters img_c = lnk_summary_counters_from_timer(LNK_Timer_Image);
+  LNK_SummaryCounters pdb_c = lnk_summary_counters_from_timer(LNK_Timer_Pdb);
+  LNK_SummaryCounters rdi_c = lnk_summary_counters_from_timer(LNK_Timer_Rdi);
+  LNK_SummaryCounters dbg_c = lnk_summary_counters_sub_sat(lnk_summary_counters_sub_sat(lnk_summary_counters_from_timer(LNK_Timer_Debug), pdb_c), rdi_c);
+
+  // governor stats + cross-process attach counter, only when the shared pool is
+  // on. Snapshot procs= BEFORE detaching; detach here (once, any exit path) --
+  // the linker leaves through _exit and never runs tp_release.
   String8 pool_stats = str8_zero();
   if (g_summary_info.pool_name_size > 0) {
     F64 grant_avg, park_seconds;
+    U32 procs_now, procs_peak;
     tp_stats_snapshot(&grant_avg, &park_seconds);
-    pool_stats = push_str8f(scratch.arena, " pool=%S grant_avg=%.1f park=%.1f",
-                            str8(g_summary_info.pool_name, g_summary_info.pool_name_size), grant_avg, park_seconds);
+    tp_procs_snapshot(&procs_now, &procs_peak);
+    tp_procs_detach();
+    pool_stats = push_str8f(scratch.arena, " pool=%S grant_avg=%.1f park=%.1f procs=%u/%u",
+                            str8(g_summary_info.pool_name, g_summary_info.pool_name_size), grant_avg, park_seconds, procs_now, procs_peak);
   }
 
   lnk_fprintf(stdout,
-              "[radlink summary] out=%S exit=%d wall=%.1f user=%.1f kern=%.1f ws=%.1fG pf=%.1fM workers=%llu%S"
-              " in=%lluo/%.1fG libs=%llu ph[inp=%llu res=%llu icf=%llu ref=%llu img=%llu dbg=%llu pdb=%llu wr=%llu]\n",
+              "[radlink summary] v=2 out=%S exit=%d t0=%llu t1=%llu wall=%.1f user=%.1f kern=%.1f ws=%.1fG pf=%.1fM io=%llu/%lluMB workers=%llu%S"
+              " in=%lluo/%.1fG libs=%llu"
+              " ph[inp=%S res=%S icf=%S ref=%S img=%S dbg=%S pdb=%S wr=%S]"
+              " dbgg[mcvi=%S merge=%S]"
+              " pdbg[gsi=%S sym=%S mod=%S tpi=%S msf=%S wr=%S]\n",
               g_summary_info.out_name_size ? str8(g_summary_info.out_name, g_summary_info.out_name_size) : str8_lit("-"),
               exit_code,
+              g_summary_info.t0_ms,
+              lnk_summary_utc_ms(),
               wall,
               user_time,
               kernel_time,
               peak_ws_gib,
               page_faults_m,
+              io_read_mb,
+              io_write_mb,
               g_summary_info.worker_count,
               pool_stats,
               g_summary_info.objs_count,
               (F64)g_summary_info.input_bytes / (F64)GB(1),
               g_summary_info.libs_count,
-              g_summary_phase_us[LNK_SummaryPhase_Input]   / 1000,
-              g_summary_phase_us[LNK_SummaryPhase_Resolve] / 1000,
-              g_summary_phase_us[LNK_SummaryPhase_Icf]     / 1000,
-              g_summary_phase_us[LNK_SummaryPhase_Ref]     / 1000,
-              lnk_summary_us_from_timer(LNK_Timer_Image)   / 1000,
-              dbg_us / 1000,
-              pdb_us / 1000,
-              g_summary_phase_us[LNK_SummaryPhase_Write]   / 1000);
+              lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_Input]),
+              lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_Resolve]),
+              lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_Icf]),
+              lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_Ref]),
+              lnk_summary_str_from_counters(scratch.arena, img_c),
+              lnk_summary_str_from_counters(scratch.arena, dbg_c),
+              lnk_summary_str_from_counters(scratch.arena, pdb_c),
+              lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_Write]),
+              lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_DbgMcvi]),
+              lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_DbgMerge]),
+              lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbGsi]),
+              lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbSym]),
+              lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbMod]),
+              lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbTpi]),
+              lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbMsf]),
+              lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbWr]));
 
   scratch_end(scratch);
 }
@@ -8522,8 +8597,12 @@ lnk_run_linker(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
     // CodeView
     //
     LNK_RRT_Array     rrt_input = lnk_rrt_array_from_config(arena->v[0], config);
+    lnk_summary_phase_begin(LNK_SummaryPhase_DbgMcvi);
     LNK_CodeViewInput cv        = lnk_make_code_view_input(tp, arena, config, debug_info_objs_count, debug_info_objs, rrt_input);
+    lnk_summary_phase_end(LNK_SummaryPhase_DbgMcvi);
+    lnk_summary_phase_begin(LNK_SummaryPhase_DbgMerge);
     LNK_MergedTypes   cv_types  = lnk_merge_types(tp, arena, &cv, 0);
+    lnk_summary_phase_end(LNK_SummaryPhase_DbgMerge);
 
     // prune merged types not reachable from any surviving symbol (PDB-size win). OFF by default:
     // it removes types that a debugger can still legitimately cast to in the watch window
@@ -8573,7 +8652,9 @@ lnk_run_linker(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
         }
         pdb_data = lnk_build_pdb(tp, arena, image_ctx.image_data, config, symtab, &cv, cv_types, LNK_PDB_BuilderFlag_All);
         if (config->debug_mode == LNK_DebugMode_Full) {
+          lnk_summary_phase_begin(LNK_SummaryPhase_PdbWr);
           lnk_write_data_list_to_file_path(config->pdb_name, config->temp_pdb_name, pdb_data);
+          lnk_summary_phase_end(LNK_SummaryPhase_PdbWr);
         }
         lnk_timer_end(LNK_Timer_Pdb);
       }
@@ -8661,7 +8742,9 @@ lnk_run_linker(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
       stripped_cv.symbol_input_ranges = push_array(scratch.arena, Rng1U64, tp->worker_count);
 
       String8List pdb_data = lnk_build_pdb(tp, arena, image_ctx.image_data, config, symtab, &stripped_cv, (LNK_MergedTypes){0}, LNK_PDB_BuilderFlag_All);
+      lnk_summary_phase_begin(LNK_SummaryPhase_PdbWr);
       lnk_write_data_list_to_file_path(config->pdb_stripped_name, str8f(scratch.arena, "%S.tmp", config->pdb_stripped_name), pdb_data);
+      lnk_summary_phase_end(LNK_SummaryPhase_PdbWr);
     }
 
     lnk_timer_end(LNK_Timer_Debug);
@@ -8974,6 +9057,7 @@ entry_point(CmdLine *cmdline)
 {
   Temp scratch = scratch_begin(0,0);
   g_summary_info.start_us = now_time_us();
+  g_summary_info.t0_ms    = lnk_summary_utc_ms();
   lnk_log_begin();
 
   LNK_Config *config = lnk_config_from_argcv(cmdline);

@@ -4899,12 +4899,14 @@ lnk_build_pdb(TP_Context *tp, TP_Arena *tp_arena, String8 image_data, LNK_Config
   // lnk_build_pdb_distribute_obj_indices helper.
 
   // push types
+  lnk_summary_phase_begin(LNK_SummaryPhase_PdbTpi);
   if (builder_flags & LNK_PDB_BuilderFlag_Ipi) {
     pdb_type_server_push_parallel(tp, task.pdb->type_servers[CV_TypeIndexSource_IPI], cv_types.count[CV_TypeIndexSource_IPI], cv_types.v[CV_TypeIndexSource_IPI]);
   }
   if (builder_flags & LNK_PDB_BuilderFlag_Tpi) {
     pdb_type_server_push_parallel(tp, task.pdb->type_servers[CV_TypeIndexSource_TPI], cv_types.count[CV_TypeIndexSource_TPI], cv_types.v[CV_TypeIndexSource_TPI]);
   }
+  lnk_summary_phase_end(LNK_SummaryPhase_PdbTpi);
 
   ProfBegin("Merge String Tables");
   task.string_ht = cv_dedup_string_tables(tp_arena, tp, cv->obj_count, cv->debug_s_arr);
@@ -4918,6 +4920,7 @@ lnk_build_pdb(TP_Context *tp, TP_Arena *tp_arena, String8 image_data, LNK_Config
 
     ProfScope("Move Global Symbols")
     {
+      lnk_summary_phase_begin(LNK_SummaryPhase_PdbGsi);
       U64 phase_begin_us = now_time_us();
       // FAIR-SHARE: pin the cohort, distribute objs over exactly the cohort lanes,
       // then run the barrier pass at that cohort. tp_barrier_begin sets
@@ -4931,13 +4934,17 @@ lnk_build_pdb(TP_Context *tp, TP_Arena *tp_arena, String8 image_data, LNK_Config
       tp_for_parallel_reserve(tp, 0, C, lnk_move_global_symbols_to_gsi, &task); // BARRIER pass (path B): tp_sum_u64/tp_broadcast/barrier_wait
       tp_barrier_end(tp);
       lnk_log(LNK_Log_Timers, "[pdb] move global symbols in %.2f ms (cohort %u)", (F64)(now_time_us() - phase_begin_us) / 1000.0, C);
+      lnk_summary_phase_end(LNK_SummaryPhase_PdbGsi);
     }
 
+    lnk_summary_phase_begin(LNK_SummaryPhase_PdbSym);
       ProfScope("Build GSI and PSI")
         pdb_build_gsi_psi(tp, task.pdb);
+    lnk_summary_phase_end(LNK_SummaryPhase_PdbSym);
 
     ProfScope("Write Modules")
     {
+      lnk_summary_phase_begin(LNK_SummaryPhase_PdbMod);
       U64 phase_begin_us = now_time_us();
       U32 C = tp_barrier_begin(tp);
       // weight = total debug$S byte size: the module-stream write walks every
@@ -4952,6 +4959,7 @@ lnk_build_pdb(TP_Context *tp, TP_Arena *tp_arena, String8 image_data, LNK_Config
       tp_for_parallel_reserve(tp, 0, C, lnk_write_pdb_modules, &task); // BARRIER pass (path B): barrier_wait/tp_broadcast
       tp_barrier_end(tp);
       lnk_log(LNK_Log_Timers, "[pdb] write modules in %.2f ms (cohort %u)", (F64)(now_time_us() - phase_begin_us) / 1000.0, C);
+      lnk_summary_phase_end(LNK_SummaryPhase_PdbMod);
     }
   }
 
@@ -5015,7 +5023,22 @@ lnk_build_pdb(TP_Context *tp, TP_Arena *tp_arena, String8 image_data, LNK_Config
     ProfEnd();
   }
 
-  pdb_build(tp, tp_arena, task.pdb, task.string_ht, 0, cv->is_stripped);
+  // summary: pdb_build(tp, tp_arena, task.pdb, task.string_ht, /* build_gsi: */ 0,
+  // cv->is_stripped) inlined VERBATIM so the tpi/msf sub-buckets can bracket its
+  // two halves (pdb_type_server_build TPI/IPI vs dbi/info build) without pulling
+  // the summary infra into pdb_builder.c (which other TUs include standalone)
+  {
+    PDB_InfoContext *info = task.pdb->info;
+    lnk_summary_phase_begin(LNK_SummaryPhase_PdbTpi);
+    pdb_type_server_build(tp, task.pdb->type_servers[CV_TypeIndexSource_TPI], &info->strtab, task.pdb->msf, PDB_FixedStream_Tpi);
+    if (info->flags & PDB_FeatureFlag_HAS_ID_STREAM) {
+      pdb_type_server_build(tp, task.pdb->type_servers[CV_TypeIndexSource_IPI], &info->strtab, task.pdb->msf, PDB_FixedStream_Ipi);
+    }
+    lnk_summary_phase_end(LNK_SummaryPhase_PdbTpi);
+    lnk_summary_phase_begin(LNK_SummaryPhase_PdbMsf);
+    dbi_build(tp, task.pdb->dbi, task.pdb->msf, PDB_FixedStream_Dbi, task.string_ht, cv->is_stripped);
+    pdb_info_build(info, task.pdb->msf, PDB_FixedStream_Info);
+  }
 
   MSF_Error msf_err = msf_build(task.pdb->msf);
   if (msf_err != MSF_Error_OK) {
@@ -5025,6 +5048,7 @@ lnk_build_pdb(TP_Context *tp, TP_Arena *tp_arena, String8 image_data, LNK_Config
   ProfBegin("Get Page Nodes");
   String8List page_data_list = msf_get_page_data_nodes(tp_arena->v[0], task.pdb->msf);
   ProfEnd();
+  lnk_summary_phase_end(LNK_SummaryPhase_PdbMsf);
   
   // NOTE: linker is about to exit so we can skip memory release
   // and let windows free memory since it does this faster

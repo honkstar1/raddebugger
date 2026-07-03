@@ -104,6 +104,70 @@ tp_stats_snapshot(F64 *grant_avg_out, F64 *park_seconds_out)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+//~ SHARED-mode cross-process attach counter (summary line procs=). See the
+//  TP_SharedBlock comment in thread_pool.h for lifetime/versioning rules.
+
+global TP_SharedBlock *g_tp_shared_block;
+global SharedMemory    g_tp_shared_block_shm;
+
+internal void
+tp_procs_attach(Arena *scratch_arena, String8 name)
+{
+  String8      block_name = push_str8f(scratch_arena, "%S.procs." TP_SHARED_V, name);
+  SharedMemory shm        = shared_memory_alloc(KB(4), block_name); // create-or-open; zero-initialized on create
+  if (shm.u64[0] == 0) {
+    return; // best-effort: no section, procs= prints 0/0
+  }
+  void *ptr = shared_memory_view_open(shm, rng_1u64(0, KB(4)));
+  if (ptr == 0) {
+    shared_memory_close(shm);
+    return;
+  }
+  TP_SharedBlock *block = (TP_SharedBlock *)ptr;
+  // first attacher stamps the magic (CAS 0 -> magic); anyone who then reads a
+  // DIFFERENT non-zero magic is looking at an incompatible layout (belt and
+  // braces on top of the versioned name) and must not touch the block
+  ins_atomic_u32_eval_cond_assign(&block->magic, TP_SHARED_MAGIC, 0);
+  if (ins_atomic_u32_eval(&block->magic) != TP_SHARED_MAGIC) {
+    shared_memory_view_close(shm, ptr, rng_1u64(0, KB(4)));
+    shared_memory_close(shm);
+    return;
+  }
+  U32 now = ins_atomic_u32_inc_eval(&block->attached);
+  for (;;) { // CAS-raise the watermark
+    U32 peak = ins_atomic_u32_eval(&block->peak);
+    if (now <= peak || ins_atomic_u32_eval_cond_assign(&block->peak, now, peak) == peak) {
+      break;
+    }
+  }
+  g_tp_shared_block     = block;
+  g_tp_shared_block_shm = shm;
+}
+
+internal void
+tp_procs_snapshot(U32 *attached_out, U32 *peak_out)
+{
+  *attached_out = 0;
+  *peak_out     = 0;
+  if (g_tp_shared_block != 0) {
+    *attached_out = ins_atomic_u32_eval(&g_tp_shared_block->attached);
+    *peak_out     = ins_atomic_u32_eval(&g_tp_shared_block->peak);
+  }
+}
+
+internal void
+tp_procs_detach(void)
+{
+  if (g_tp_shared_block != 0) {
+    ins_atomic_u32_dec_eval(&g_tp_shared_block->attached);
+    shared_memory_view_close(g_tp_shared_block_shm, (void *)g_tp_shared_block, rng_1u64(0, KB(4)));
+    shared_memory_close(g_tp_shared_block_shm);
+    g_tp_shared_block = 0;
+    MemoryZeroStruct(&g_tp_shared_block_shm);
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
 //~ SHARED (cross-process governor) path -- OURS.
 
 internal void
@@ -294,7 +358,10 @@ tp_alloc(Arena *arena, U32 worker_count, U32 max_worker_count, String8 name)
       // does NOT amass the full cohort; it runs at whatever budget is free right
       // now (best-effort), so multiple processes can run barrier passes
       // concurrently and none can deadlock waiting to amass the machine.
-      String8 budget_name = push_str8f(scratch.arena, "%S.budget", name);
+      // ".v2" LAYOUT-VERSION suffix: see TP_SharedBlock in thread_pool.h -- old
+      // exes ("%S.budget", no procs section) and new exes must never share
+      // kernel objects for the same pool name
+      String8 budget_name = push_str8f(scratch.arena, "%S.budget." TP_SHARED_V, name);
       pool->budget_semaphore    = semaphore_alloc(max_worker_count, max_worker_count, budget_name);
 
       // local wake/governor signalling. governor_semaphore is a 0/1 "at least one
@@ -330,6 +397,7 @@ tp_alloc(Arena *arena, U32 worker_count, U32 max_worker_count, String8 name)
   // stats: start the grant_avg integration window (shared mode only)
   if (is_shared) {
     g_tp_shared_stats.begin_us = g_tp_shared_stats.last_us = now_time_us();
+    tp_procs_attach(scratch.arena, name); // summary line procs= (attach counter + peak watermark)
   }
 
   scratch_end(scratch);
