@@ -123,30 +123,31 @@ internal void tp_stats_level_add(S64 delta);
 internal void tp_stats_park_add(U64 worker_us);
 internal void tp_stats_snapshot(F64 *grant_avg_out, F64 *park_seconds_out);
 
-// SHARED-mode cross-process block (summary line: procs=<attached>/<peak>).
-// Lives in a named section "<pool_name>.procs.v2"; the budget semaphore is
-// "<pool_name>.budget.v2". BOTH names carry the layout-version suffix so an
-// old radlink (which uses "<pool_name>.budget" and no section) and a new one
-// pointed at the SAME /RAD_SHARED_THREAD_POOL name never share kernel objects:
-// mixed old/new farms run two independent pools instead of corrupting one.
-// Bump TP_SHARED_V (and the magic) together with any layout change.
+// SHARED-mode cross-process attach counter (summary line: procs=<n>/<maxseen>).
+// Lives in a named counter SEMAPHORE "<pool_name>.nproc.v3"; the budget
+// semaphore is "<pool_name>.budget.v2". Names carry a version suffix so an old
+// radlink pointed at the SAME /RAD_SHARED_THREAD_POOL name never shares kernel
+// objects with a new one: mixed old/new farms run independent pools instead of
+// corrupting one.
 //
-// `attached` counts processes currently attached (attach in tp_alloc; detach
-// via tp_procs_detach, called exactly once from the summary print since the
-// linker exits through _exit and never runs tp_release). `peak` is a CAS-raised
-// high watermark of `attached` over the BLOCK's lifetime (the block dies with
-// its last handle, so a farm session's overlap shows up as peak). Both are
-// best-effort: a process that dies without printing leaves `attached` high
-// until the block itself dies.
+// WHY A SEMAPHORE: UBA detours CreateFileMapping and VIRTUALIZES named
+// sections per-process, so the previous "<pool_name>.procs.v2" shared-memory
+// block reported procs=1/1 under UBA. Named SEMAPHORES pass through the detour
+// (the budget semaphore is demonstrably shared in prod: fair grants across
+// processes), so the counter is the semaphore's own count:
+//   attach = release(+1, &prev) -> n = prev+1 (each attached process holds one permit)
+//   detach = 0-timeout wait (-1)
+//   read   = release(+1, &prev) -> n = prev (prev already counts our own
+//            permit), then 0-timeout wait to undo
+// The transient read +1 can inflate a concurrent reader's n by 1 -- advisory
+// counter, acceptable. Peak cannot be tracked exactly cross-process without
+// shm, so `maxseen` is this process's local max of n observed at attach and at
+// the summary read. Best-effort: a process that dies without detaching leaves
+// the count high until the semaphore object itself dies with its last handle.
 #define TP_SHARED_V     "v2"
-#define TP_SHARED_MAGIC 0x32504C52u // 'RLP2'
-typedef struct TP_SharedBlock
-{
-  volatile U32 magic;    // TP_SHARED_MAGIC once initialized (CAS 0 -> magic)
-  volatile U32 attached; // processes currently attached
-  volatile U32 peak;     // high watermark of attached
-} TP_SharedBlock;
+#define TP_NPROC_V      "v3"
+#define TP_NPROC_MAX    (1u << 20) // far above any plausible concurrent-link count
 
-internal void tp_procs_snapshot(U32 *attached_out, U32 *peak_out); // 0/0 when no shared pool
-internal void tp_procs_detach(void);                               // decrement + unmap (idempotent)
+internal void tp_procs_snapshot(U32 *attached_out, U32 *maxseen_out); // 0/0 when no shared pool
+internal void tp_procs_detach(void);                                  // give the permit back + close (idempotent)
 

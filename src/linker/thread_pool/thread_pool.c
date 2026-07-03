@@ -104,66 +104,56 @@ tp_stats_snapshot(F64 *grant_avg_out, F64 *park_seconds_out)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-//~ SHARED-mode cross-process attach counter (summary line procs=). See the
-//  TP_SharedBlock comment in thread_pool.h for lifetime/versioning rules.
+//~ SHARED-mode cross-process attach counter (summary line procs=). Counter
+//  SEMAPHORE, not a named section -- see the "<pool_name>.nproc.v3" comment in
+//  thread_pool.h for why (UBA virtualizes named sections per-process).
 
-global TP_SharedBlock *g_tp_shared_block;
-global SharedMemory    g_tp_shared_block_shm;
+global Semaphore g_tp_procs_sem;      // zero handle = not attached
+global U32       g_tp_procs_maxseen;  // process-local max of observed n
 
 internal void
 tp_procs_attach(Arena *scratch_arena, String8 name)
 {
-  String8      block_name = push_str8f(scratch_arena, "%S.procs." TP_SHARED_V, name);
-  SharedMemory shm        = shared_memory_alloc(KB(4), block_name); // create-or-open; zero-initialized on create
-  if (shm.u64[0] == 0) {
-    return; // best-effort: no section, procs= prints 0/0
+  String8   sem_name = push_str8f(scratch_arena, "%S.nproc." TP_NPROC_V, name);
+  Semaphore sem      = semaphore_alloc(0, TP_NPROC_MAX, sem_name); // create-or-open, count starts at 0
+  if (sem.u64[0] == 0) {
+    return; // best-effort: no semaphore, procs= prints 0/0
   }
-  void *ptr = shared_memory_view_open(shm, rng_1u64(0, KB(4)));
-  if (ptr == 0) {
-    shared_memory_close(shm);
+  U32 prev = 0;
+  if (!semaphore_drop_prev(sem, &prev)) { // attach: hold one permit
+    semaphore_release(sem);
     return;
   }
-  TP_SharedBlock *block = (TP_SharedBlock *)ptr;
-  // first attacher stamps the magic (CAS 0 -> magic); anyone who then reads a
-  // DIFFERENT non-zero magic is looking at an incompatible layout (belt and
-  // braces on top of the versioned name) and must not touch the block
-  ins_atomic_u32_eval_cond_assign(&block->magic, TP_SHARED_MAGIC, 0);
-  if (ins_atomic_u32_eval(&block->magic) != TP_SHARED_MAGIC) {
-    shared_memory_view_close(shm, ptr, rng_1u64(0, KB(4)));
-    shared_memory_close(shm);
-    return;
-  }
-  U32 now = ins_atomic_u32_inc_eval(&block->attached);
-  for (;;) { // CAS-raise the watermark
-    U32 peak = ins_atomic_u32_eval(&block->peak);
-    if (now <= peak || ins_atomic_u32_eval_cond_assign(&block->peak, now, peak) == peak) {
-      break;
-    }
-  }
-  g_tp_shared_block     = block;
-  g_tp_shared_block_shm = shm;
+  g_tp_procs_sem     = sem;
+  g_tp_procs_maxseen = prev + 1;
 }
 
 internal void
-tp_procs_snapshot(U32 *attached_out, U32 *peak_out)
+tp_procs_snapshot(U32 *attached_out, U32 *maxseen_out)
 {
   *attached_out = 0;
-  *peak_out     = 0;
-  if (g_tp_shared_block != 0) {
-    *attached_out = ins_atomic_u32_eval(&g_tp_shared_block->attached);
-    *peak_out     = ins_atomic_u32_eval(&g_tp_shared_block->peak);
+  *maxseen_out  = 0;
+  if (g_tp_procs_sem.u64[0] != 0) {
+    U32 prev = 0;
+    if (semaphore_drop_prev(g_tp_procs_sem, &prev)) { // read: +1 ...
+      semaphore_take(g_tp_procs_sem, 0);              // ... then undo (0-timeout, count > 0 by construction)
+      // prev = count BEFORE the transient release = #attached, which already
+      // includes THIS process's attach permit -- no +1 (unlike attach)
+      U32 n = prev;
+      g_tp_procs_maxseen = Max(g_tp_procs_maxseen, n);
+      *attached_out      = n;
+    }
+    *maxseen_out = g_tp_procs_maxseen;
   }
 }
 
 internal void
 tp_procs_detach(void)
 {
-  if (g_tp_shared_block != 0) {
-    ins_atomic_u32_dec_eval(&g_tp_shared_block->attached);
-    shared_memory_view_close(g_tp_shared_block_shm, (void *)g_tp_shared_block, rng_1u64(0, KB(4)));
-    shared_memory_close(g_tp_shared_block_shm);
-    g_tp_shared_block = 0;
-    MemoryZeroStruct(&g_tp_shared_block_shm);
+  if (g_tp_procs_sem.u64[0] != 0) {
+    semaphore_take(g_tp_procs_sem, 0); // give the attach permit back (0-timeout: never block an exit path)
+    semaphore_release(g_tp_procs_sem);
+    MemoryZeroStruct(&g_tp_procs_sem);
   }
 }
 
