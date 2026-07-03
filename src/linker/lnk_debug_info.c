@@ -74,10 +74,33 @@ typedef struct LNK_Win32MemoryRangeEntry
   SIZE_T NumberOfBytes;
 } LNK_Win32MemoryRangeEntry;
 typedef BOOL LNK_Win32PrefetchVirtualMemoryFunc(HANDLE process, ULONG_PTR count, LNK_Win32MemoryRangeEntry *ranges, ULONG flags); // WINAPI omitted: x64-only convention
+
+// entries per task: the kernel's per-page population work dominates the
+// syscall overhead, so small batches fanned out over the pool parallelize the
+// MM work (14 GiB of mcvi input: ~0.9 s serial -> a wide parallel burst)
+#define LNK_PREFETCH_BATCH_SIZE 256
+
+typedef struct
+{
+  LNK_Win32PrefetchVirtualMemoryFunc *proc;
+  U64                                 entry_count;
+  LNK_Win32MemoryRangeEntry          *entries;
+} LNK_PrefetchTask;
+
+internal
+THREAD_POOL_TASK_FUNC(lnk_prefetch_task)
+{
+  LNK_PrefetchTask *task = raw_task;
+  U64 lo = task_id * LNK_PREFETCH_BATCH_SIZE;
+  U64 hi = Min(lo + LNK_PREFETCH_BATCH_SIZE, task->entry_count);
+  if (lo < hi) {
+    task->proc(GetCurrentProcess(), (ULONG_PTR)(hi - lo), task->entries + lo, 0);
+  }
+}
 #endif
 
 internal void
-lnk_prefetch_ranges(U64 range_count, Rng1U64 *ranges)
+lnk_prefetch_ranges(TP_Context *tp, U64 range_count, Rng1U64 *ranges)
 {
 #if OS_WINDOWS
   // resolve once (Win8+; on older OS fall through silently). Only called from
@@ -99,9 +122,8 @@ lnk_prefetch_ranges(U64 range_count, Rng1U64 *ranges)
   // obj-by-obj in file-offset order, so adjacent sections of the same mapped
   // obj (the common case by far) fold into one entry. No sort -- the API does
   // not require ordered or disjoint ranges, overlap just costs a cheap re-walk.
-  U64 batch_cap = 2048; // a few thousand ranges per syscall
-  LNK_Win32MemoryRangeEntry *batch = push_array_no_zero(scratch.arena, LNK_Win32MemoryRangeEntry, batch_cap);
-  U64 batch_count = 0;
+  LNK_Win32MemoryRangeEntry *entries     = push_array_no_zero(scratch.arena, LNK_Win32MemoryRangeEntry, range_count);
+  U64                        entry_count = 0;
   U64 pending_min = 0, pending_max = 0;
   for EachIndex(range_idx, range_count) {
     if (ranges[range_idx].min >= ranges[range_idx].max) { continue; }
@@ -113,24 +135,28 @@ lnk_prefetch_ranges(U64 range_count, Rng1U64 *ranges)
       continue;
     }
     if (pending_max != 0) {
-      batch[batch_count].VirtualAddress = (void *)pending_min;
-      batch[batch_count].NumberOfBytes  = (SIZE_T)(pending_max - pending_min);
-      batch_count += 1;
-      if (batch_count == batch_cap) {
-        prefetch_proc(GetCurrentProcess(), (ULONG_PTR)batch_count, batch, 0);
-        batch_count = 0;
-      }
+      entries[entry_count].VirtualAddress = (void *)pending_min;
+      entries[entry_count].NumberOfBytes  = (SIZE_T)(pending_max - pending_min);
+      entry_count += 1;
     }
     pending_min = min;
     pending_max = max;
   }
   if (pending_max != 0) {
-    batch[batch_count].VirtualAddress = (void *)pending_min;
-    batch[batch_count].NumberOfBytes  = (SIZE_T)(pending_max - pending_min);
-    batch_count += 1;
+    entries[entry_count].VirtualAddress = (void *)pending_min;
+    entries[entry_count].NumberOfBytes  = (SIZE_T)(pending_max - pending_min);
+    entry_count += 1;
   }
-  if (batch_count > 0) {
-    prefetch_proc(GetCurrentProcess(), (ULONG_PTR)batch_count, batch, 0);
+
+  // fan the batches out over the pool: population is per-page kernel work, so
+  // this turns a serial ~1 s stall into a wide parallel burst. Purely advisory
+  // syscalls with no output -- any batch interleaving is fine.
+  LNK_PrefetchTask task        = { .proc = prefetch_proc, .entry_count = entry_count, .entries = entries };
+  U64              batch_count = CeilIntegerDiv(entry_count, LNK_PREFETCH_BATCH_SIZE);
+  if (tp != 0 && batch_count > 1) {
+    tp_for_parallel(tp, 0, batch_count, lnk_prefetch_task, &task);
+  } else {
+    for EachIndex(batch_idx, batch_count) { lnk_prefetch_task(0, 0, batch_idx, &task, 0); }
   }
 
   scratch_end(scratch);
@@ -1675,7 +1701,7 @@ lnk_make_code_view_input(TP_Context *tp, TP_Arena *tp_arena, LNK_Config *config,
     U64 prefetch_begin_us = now_time_us();
     U64 prefetch_bytes    = 0;
     for EachIndex(range_idx, range_count) { prefetch_bytes += dim_1u64(ranges[range_idx]); }
-    lnk_prefetch_ranges(range_count, ranges);
+    lnk_prefetch_ranges(tp, range_count, ranges);
     lnk_log(LNK_Log_Timers, "[mcvi] prefetched %llu debug section ranges (%llu MiB) in %.2f ms",
             range_count, prefetch_bytes / MB(1), (F64)(now_time_us() - prefetch_begin_us) / 1000.0);
 
@@ -3278,7 +3304,7 @@ lnk_merge_types(TP_Context *tp, TP_Arena *tp_temp, LNK_CodeViewInput *input, LNK
       U64 prefetch_begin_us = now_time_us();
       U64 prefetch_bytes    = 0;
       for EachIndex(range_idx, range_count) { prefetch_bytes += dim_1u64(ranges[range_idx]); }
-      lnk_prefetch_ranges(range_count, ranges);
+      lnk_prefetch_ranges(tp, range_count, ranges);
       lnk_log(LNK_Log_Timers, "[merge] prefetched %llu type data ranges (%llu MiB) in %.2f ms",
               range_count, prefetch_bytes / MB(1), (F64)(now_time_us() - prefetch_begin_us) / 1000.0);
 
