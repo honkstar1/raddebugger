@@ -53,6 +53,10 @@
 #include "llvm/llvm.c"
 #include "dwarf/x64/dwarf_x64.c"
 
+#if OS_WINDOWS
+# include <psapi.h> // GetProcessMemoryInfo for the end-of-link summary line
+#endif
+
 // --- Third Party -------------------------------------------------------------
 
 #include "base_ext/base_blake3.h"
@@ -1373,6 +1377,7 @@ internal void
 lnk_load_inputs(TP_Context *tp, TP_Arena *arena, LNK_Config *config, LNK_Inputer *inputer, LNK_SymbolTable *symtab, LNK_Link *link)
 {
   ProfBeginFunction();
+  lnk_summary_phase_begin(LNK_SummaryPhase_Input);
   Temp scratch = scratch_begin(arena->v, arena->count);
 
   U64 obj_id_base = link->objs.count;
@@ -1561,6 +1566,7 @@ lnk_load_inputs(TP_Context *tp, TP_Arena *arena, LNK_Config *config, LNK_Inputer
   }
 
   scratch_end(scratch);
+  lnk_summary_phase_end(LNK_SummaryPhase_Input);
   ProfEnd();
 }
 
@@ -1802,6 +1808,12 @@ lnk_link_inputs(TP_Context      *tp,
 {
   ProfBeginFunction();
   Temp scratch = scratch_begin(arena->v, arena->count);
+
+  // summary: this function is Input (lnk_load_inputs rounds, accumulated on its
+  // own bucket) + Resolve (lib search / member resolution / directives, i.e.
+  // everything else); attribute the remainder to Resolve at the bottom
+  U64 summary_begin_us    = now_time_us();
+  U64 summary_input_us_at = g_summary_phase_us[LNK_SummaryPhase_Input];
 
   HashMap imports_hm = {0};
 
@@ -2082,6 +2094,9 @@ lnk_link_inputs(TP_Context      *tp,
 
     if (resolved_members_count == 0) { break; }
   }
+
+  g_summary_phase_us[LNK_SummaryPhase_Resolve] += (now_time_us() - summary_begin_us)
+                                                - (g_summary_phase_us[LNK_SummaryPhase_Input] - summary_input_us_at);
 
   scratch_end(scratch);
   ProfEnd();
@@ -2517,14 +2532,18 @@ lnk_link_image(TP_Context *tp, TP_Arena *arena, LNK_Config *config, LNK_Inputer 
   // fold identical code COMDATs (routes followers to a leader; /OPT:REF then GCs them)
   //
   if (config->opt_icf == LNK_SwitchState_Yes) {
+    lnk_summary_phase_begin(LNK_SummaryPhase_Icf);
     lnk_opt_icf(tp, arena->v[0], symtab, config, link->objs);
+    lnk_summary_phase_end(LNK_SummaryPhase_Icf);
   }
 
   //
   // discard COMDAT sections that are not referenced
   //
   if (config->opt_ref == LNK_SwitchState_Yes) {
+    lnk_summary_phase_begin(LNK_SummaryPhase_Ref);
     lnk_opt_ref(tp, symtab, config, link->objs);
+    lnk_summary_phase_end(LNK_SummaryPhase_Ref);
   }
 
   //
@@ -8071,9 +8090,123 @@ internal void
 lnk_write_thread(void *raw_ctx)
 {
   ProfBeginFunction();
+  lnk_summary_phase_begin(LNK_SummaryPhase_Write);
   LNK_WriteThreadContext *ctx = raw_ctx;
   lnk_write_data_to_file_path(ctx->path, ctx->temp_path, ctx->data);
+  lnk_summary_phase_end(LNK_SummaryPhase_Write);
   ProfEnd();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//~ One-line end-of-link summary (always on; production triage). Everything
+//  needed at print time is stashed in this global as the link progresses, so
+//  the line can be emitted best-effort from ANY exit path (lnk_exit on error,
+//  entry_point on success) with whatever was known by then.
+
+typedef struct LNK_SummaryInfo
+{
+  volatile U32 printed;      // print-exactly-once latch
+  U64          start_us;     // set first thing in entry_point
+  U64          worker_count;
+  U64          objs_count;
+  U64          input_bytes;  // sum of obj data sizes (lib members count their slice)
+  U64          libs_count;
+  // name COPIES: config strings parsed out of an @rsp point into the response
+  // file buffer, whose scratch dies right after config parse -- capture the
+  // bytes here instead of keeping String8s into freed memory
+  U64          out_name_size;
+  U64          pool_name_size; // non-zero => /RAD_SHARED_THREAD_POOL
+  U8           out_name [128];
+  U8           pool_name[128];
+} LNK_SummaryInfo;
+
+global LNK_SummaryInfo g_summary_info;
+
+internal void
+lnk_summary_copy_name(U8 *dst, U64 dst_cap, U64 *dst_size_out, String8 name)
+{
+  U64 size = Min(name.size, dst_cap);
+  MemoryCopy(dst, name.str, size);
+  *dst_size_out = size;
+}
+
+internal U64
+lnk_summary_us_from_timer(LNK_TimerType timer)
+{
+  // guard against a fatal exit mid-phase (begin stamped, end still zero)
+  return g_timers[timer].end > g_timers[timer].begin ? g_timers[timer].end - g_timers[timer].begin : 0;
+}
+
+internal void
+lnk_print_summary(int exit_code)
+{
+  // print exactly once, no matter which exit path gets here first
+  if (ins_atomic_u32_eval_cond_assign(&g_summary_info.printed, 1, 0) != 0) {
+    return;
+  }
+
+  Temp scratch = scratch_begin(0, 0);
+
+  F64 wall = g_summary_info.start_us ? (F64)(now_time_us() - g_summary_info.start_us) / 1000000.0 : 0;
+
+  // process CPU + memory counters
+  F64 user_time = 0, kernel_time = 0, peak_ws_gib = 0, page_faults_m = 0;
+#if OS_WINDOWS
+  {
+    FILETIME create_ft, exit_ft, kernel_ft, user_ft;
+    if (GetProcessTimes(GetCurrentProcess(), &create_ft, &exit_ft, &kernel_ft, &user_ft)) {
+      user_time   = (F64)(((U64)user_ft.dwHighDateTime   << 32) | user_ft.dwLowDateTime)   / 10000000.0;
+      kernel_time = (F64)(((U64)kernel_ft.dwHighDateTime << 32) | kernel_ft.dwLowDateTime) / 10000000.0;
+    }
+    PROCESS_MEMORY_COUNTERS pmc = { (DWORD)sizeof(pmc) };
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+      peak_ws_gib   = (F64)pmc.PeakWorkingSetSize / (F64)GB(1);
+      page_faults_m = (F64)pmc.PageFaultCount / 1000000.0;
+    }
+  }
+#endif
+
+  // phase walls (ms). img/dbg/pdb come from the /RAD_LOG:TIMERS stamps; dbg is
+  // the debug-info umbrella minus the PDB/RDI sub-phases it contains.
+  U64 pdb_us = lnk_summary_us_from_timer(LNK_Timer_Pdb);
+  U64 rdi_us = lnk_summary_us_from_timer(LNK_Timer_Rdi);
+  U64 dbg_us = lnk_summary_us_from_timer(LNK_Timer_Debug);
+  dbg_us     = dbg_us > pdb_us + rdi_us ? dbg_us - (pdb_us + rdi_us) : 0;
+
+  // governor stats, only when the shared pool is on
+  String8 pool_stats = str8_zero();
+  if (g_summary_info.pool_name_size > 0) {
+    F64 grant_avg, park_seconds;
+    tp_stats_snapshot(&grant_avg, &park_seconds);
+    pool_stats = push_str8f(scratch.arena, " pool=%S grant_avg=%.1f park=%.1f",
+                            str8(g_summary_info.pool_name, g_summary_info.pool_name_size), grant_avg, park_seconds);
+  }
+
+  lnk_fprintf(stdout,
+              "[radlink summary] out=%S exit=%d wall=%.1f user=%.1f kern=%.1f ws=%.1fG pf=%.1fM workers=%llu%S"
+              " in=%lluo/%.1fG libs=%llu ph[inp=%llu res=%llu icf=%llu ref=%llu img=%llu dbg=%llu pdb=%llu wr=%llu]\n",
+              g_summary_info.out_name_size ? str8(g_summary_info.out_name, g_summary_info.out_name_size) : str8_lit("-"),
+              exit_code,
+              wall,
+              user_time,
+              kernel_time,
+              peak_ws_gib,
+              page_faults_m,
+              g_summary_info.worker_count,
+              pool_stats,
+              g_summary_info.objs_count,
+              (F64)g_summary_info.input_bytes / (F64)GB(1),
+              g_summary_info.libs_count,
+              g_summary_phase_us[LNK_SummaryPhase_Input]   / 1000,
+              g_summary_phase_us[LNK_SummaryPhase_Resolve] / 1000,
+              g_summary_phase_us[LNK_SummaryPhase_Icf]     / 1000,
+              g_summary_phase_us[LNK_SummaryPhase_Ref]     / 1000,
+              lnk_summary_us_from_timer(LNK_Timer_Image)   / 1000,
+              dbg_us / 1000,
+              pdb_us / 1000,
+              g_summary_phase_us[LNK_SummaryPhase_Write]   / 1000);
+
+  scratch_end(scratch);
 }
 
 
@@ -8332,6 +8465,15 @@ lnk_run_linker(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
   U64       libs_count = link.libs.count;
   LNK_Obj **objs       = lnk_array_from_obj_list(scratch.arena, link.objs);
   LNK_Lib **libs       = lnk_array_from_lib_list(scratch.arena, link.libs);
+
+  // summary: input volume (lib members count their member slice)
+  {
+    U64 input_bytes = 0;
+    for EachIndex(obj_idx, objs_count) { input_bytes += objs[obj_idx]->data.size; }
+    g_summary_info.objs_count  = objs_count;
+    g_summary_info.libs_count  = libs_count;
+    g_summary_info.input_bytes = input_bytes;
+  }
 
   //
   // Layout Image
@@ -8831,9 +8973,19 @@ internal void
 entry_point(CmdLine *cmdline)
 {
   Temp scratch = scratch_begin(0,0);
+  g_summary_info.start_us = now_time_us();
   lnk_log_begin();
 
-  LNK_Config *config   = lnk_config_from_argcv(cmdline);
+  LNK_Config *config = lnk_config_from_argcv(cmdline);
+
+  // summary: identity fields, copied IMMEDIATELY after the parse -- @rsp-parsed
+  // config strings can point into the response-file scratch, which is reused by
+  // the very next pushes on this thread (observed as garbage pool= names when
+  // the copy happened after tp_alloc)
+  lnk_summary_copy_name(g_summary_info.out_name,  sizeof(g_summary_info.out_name),  &g_summary_info.out_name_size,  str8_skip_last_slash(config->out_path));
+  lnk_summary_copy_name(g_summary_info.pool_name, sizeof(g_summary_info.pool_name), &g_summary_info.pool_name_size, config->shared_thread_pool_name);
+  g_summary_info.worker_count = config->worker_count;
+
   TP_Context *tp       = tp_alloc(scratch.arena, config->worker_count, config->max_worker_count, config->shared_thread_pool_name);
   TP_Arena   *tp_arena = tp_arena_alloc(tp);
 
@@ -8864,6 +9016,8 @@ entry_point(CmdLine *cmdline)
   case LNK_BootMode_Linker:      lnk_run_linker       (tp, tp_arena, config); break;
   case LNK_BootMode_TypeServer:  lnk_run_type_server  (tp, tp_arena, config); break;
   }
+
+  lnk_print_summary(0);
 
   lnk_log_end();
   scratch_end(scratch);

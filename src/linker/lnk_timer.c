@@ -15,6 +15,22 @@ lnk_timer_end(LNK_TimerType timer)
   g_timers[timer].end = now_time_us();
 }
 
+global U64 g_summary_phase_us   [LNK_SummaryPhase_Count];
+global U64 g_summary_phase_start[LNK_SummaryPhase_Count];
+
+internal void
+lnk_summary_phase_begin(LNK_SummaryPhase phase)
+{
+  g_summary_phase_start[phase] = now_time_us();
+}
+
+internal void
+lnk_summary_phase_end(LNK_SummaryPhase phase)
+{
+  // atomic: the Write bracket runs on the background image-write thread
+  ins_atomic_u64_add_eval(&g_summary_phase_us[phase], now_time_us() - g_summary_phase_start[phase]);
+}
+
 internal String8
 lnk_string_from_timer_type(LNK_TimerType type)
 {

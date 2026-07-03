@@ -64,6 +64,46 @@ tp_worker_main(void *raw_worker)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+//~ SHARED-mode governor stats (summary line). Zero cost when the pool is off:
+//  every call site below is on a shared-mode-only path.
+
+global TP_SharedStats g_tp_shared_stats;
+
+internal void
+tp_stats_level_add(S64 delta)
+{
+  // transitions are rare (one per grant/release, thousands per link), so a tiny
+  // spinlock around the integrator is cheaper than any clever lock-free scheme
+  for (; ins_atomic_u64_eval_cond_assign(&g_tp_shared_stats.lock, 1, 0) != 0; ) { }
+  U64 now_us = now_time_us();
+  g_tp_shared_stats.area_us += (U64)(g_tp_shared_stats.level * (S64)(now_us - g_tp_shared_stats.last_us));
+  g_tp_shared_stats.last_us  = now_us;
+  g_tp_shared_stats.level   += delta;
+  ins_atomic_u64_eval_assign(&g_tp_shared_stats.lock, 0);
+}
+
+internal void
+tp_stats_park_add(U64 worker_us)
+{
+  ins_atomic_u64_add_eval(&g_tp_shared_stats.park_us, worker_us);
+}
+
+internal void
+tp_stats_snapshot(F64 *grant_avg_out, F64 *park_seconds_out)
+{
+  *grant_avg_out    = 0;
+  *park_seconds_out = 0;
+  if (g_tp_shared_stats.begin_us != 0) {
+    tp_stats_level_add(0); // finalize the integral up to now
+    U64 wall_us = g_tp_shared_stats.last_us - g_tp_shared_stats.begin_us;
+    if (wall_us > 0) {
+      *grant_avg_out = (F64)g_tp_shared_stats.area_us / (F64)wall_us;
+    }
+    *park_seconds_out = (F64)g_tp_shared_stats.park_us / 1000000.0;
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
 //~ SHARED (cross-process governor) path -- OURS.
 
 internal void
@@ -140,6 +180,7 @@ tp_worker_main_shared(void *raw_worker)
 
     if (!barrier_pass) {
       // path A: hand my budget slot back so another process can use it
+      tp_stats_level_add(-1);
       ins_atomic_u64_dec_eval(&pool->granted);
       semaphore_drop(pool->budget_semaphore);
     }
@@ -178,7 +219,11 @@ tp_governor_main(void *raw_pool)
       if (want > 0) {
         // Bounded wait so we re-check pass_active/demand and never block forever
         // on budget that may never free if the pass ends first.
-        if (semaphore_take(pool->budget_semaphore, now_time_us() + 1000)) {
+        U64 wait_begin_us = now_time_us();
+        B32 got_slot      = semaphore_take(pool->budget_semaphore, wait_begin_us + 1000);
+        // stats: while we waited here, `want` runnable workers sat parked on budget
+        tp_stats_park_add((now_time_us() - wait_begin_us) * (U64)want);
+        if (got_slot) {
           // Publish the grant (granted++) BEFORE checking pass_active, and ABORT
           // with granted-- if the pass already ended. This makes main's path-A
           // drain-spin (waits granted==0) observe any in-flight grant and block
@@ -195,6 +240,7 @@ tp_governor_main(void *raw_pool)
           // all workers parked). granted++ first closes that window.
           ins_atomic_u64_inc_eval(&pool->granted);
           if (ins_atomic_u32_eval(&pool->pass_active)) {
+            tp_stats_level_add(+1);
             semaphore_drop(pool->wake_semaphore);
           } else {
             ins_atomic_u64_dec_eval(&pool->granted);   // abort: pass ended
@@ -279,6 +325,11 @@ tp_alloc(Arena *arena, U32 worker_count, U32 max_worker_count, String8 name)
   // launch the per-process governor (shared mode only)
   if (is_shared && worker_count > 1) {
     pool->governor_handle = thread_launch(tp_governor_main, pool);
+  }
+
+  // stats: start the grant_avg integration window (shared mode only)
+  if (is_shared) {
+    g_tp_shared_stats.begin_us = g_tp_shared_stats.last_us = now_time_us();
   }
 
   scratch_end(scratch);
@@ -531,6 +582,13 @@ tp_barrier_begin(TP_Context *pool)
   pool->worker_count          = cohort;
   pool->barrier_pass          = 1;
   pool->barrier_depth         = 1;
+
+  // stats: cohort slots are held for the whole bracket; the shortfall is the
+  // budget we wanted but could not grab (parked lanes while this pass runs)
+  pool->barrier_begin_us  = now_time_us();
+  pool->barrier_shortfall = want - extra;
+  if (extra > 0) { tp_stats_level_add((S64)extra); }
+
   return cohort;
 }
 
@@ -546,6 +604,14 @@ tp_barrier_end(TP_Context *pool)
   }
 
   U32 extra = pool->barrier_cohort_extra;
+
+  // stats: release the held slots from the integral; account parked lanes
+  if (extra > 0) { tp_stats_level_add(-(S64)extra); }
+  if (pool->barrier_shortfall > 0) {
+    tp_stats_park_add((now_time_us() - pool->barrier_begin_us) * (U64)pool->barrier_shortfall);
+  }
+  pool->barrier_begin_us  = 0;
+  pool->barrier_shortfall = 0;
 
   // restore the full-width pool + the original barrier
   barrier_release(pool->barrier);

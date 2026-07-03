@@ -55,6 +55,8 @@ typedef struct TP_Context
   U32          barrier_saved_workers;  // worker_count to restore at tp_barrier_end
   U32          barrier_cohort_extra;   // budget slots held for this barrier pass (cohort = 1 + this)
   Barrier      barrier_saved;          // pool->barrier to restore at tp_barrier_end
+  U64          barrier_begin_us;       // stats: bracket open time (for park accounting)
+  U32          barrier_shortfall;      // stats: budget slots we wanted but could not grab for this pass
 
   U32          worker_count;
   TP_Worker   *worker_arr;
@@ -97,4 +99,27 @@ internal void         tp_for_parallel_reserve(TP_Context *pool, TP_Arena *arena,
 #define tp_for_parallel_reserve_prof(pool, arena, task_count, task_func, task_data, zone_name) ProfBegin(zone_name); tp_for_parallel_reserve(pool, arena, task_count, task_func, task_data); ProfEnd();
 internal Rng1U64 *    tp_divide_work(Arena *arena, U64 item_count, U32 worker_count);
 #define tp_broadcast(p) tp_broadcast_(tp, task_id, p, sizeof(*p))
+
+// SHARED-mode governor stats (for the end-of-link summary line). All counters
+// are only ever touched from shared-mode-only code paths, so the non-shared
+// pool pays zero cost. `level` is the count of global budget slots this
+// process currently HOLDS (path-A grants + path-B cohort extras); it is
+// integrated over time (area_us = sum level x dt, QPC-stamped on every
+// grant/release transition) so grant_avg = area/wall. `park_us` accumulates
+// worker-microseconds spent waiting on budget while this process had pending
+// demand (path A: governor budget waits x wanted-worker count; path B: pass
+// duration x cohort shortfall).
+typedef struct TP_SharedStats
+{
+  volatile U64 lock;      // spinlock for the {last_us, level, area_us} integrator
+  U64          begin_us;  // pool alloc time (grant_avg denominator start)
+  U64          last_us;   // last transition stamp
+  S64          level;     // budget slots currently held
+  U64          area_us;   // integral of level over time
+  volatile U64 park_us;   // worker-us parked on budget while work was available
+} TP_SharedStats;
+
+internal void tp_stats_level_add(S64 delta);
+internal void tp_stats_park_add(U64 worker_us);
+internal void tp_stats_snapshot(F64 *grant_avg_out, F64 *park_seconds_out);
 
