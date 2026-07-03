@@ -8251,6 +8251,31 @@ lnk_print_summary(int exit_code)
   LNK_SummaryCounters rdi_c = lnk_summary_counters_from_timer(LNK_Timer_Rdi);
   LNK_SummaryCounters dbg_c = lnk_summary_counters_sub_sat(lnk_summary_counters_sub_sat(lnk_summary_counters_from_timer(LNK_Timer_Debug), pdb_c), rdi_c);
 
+  // residual catch-alls: umbrella bucket minus the sum of its printed
+  // sub-buckets, clamped at 0 per field (a /PDBSTRIPPED link runs the pdb
+  // sub-phases a second time OUTSIDE the Timer_Pdb bracket, which can push the
+  // sub-bucket sum past the umbrella -- clamp instead of printing garbage).
+  // Storm triage: prod shows the pdbg sub-buckets covering only ~19% of pdb
+  // kernel time in a storm window vs ~96% locally -- other= pins the
+  // uncovered span without waiting for a local repro.
+  LNK_SummaryCounters pdb_other, dbg_other;
+  {
+    LNK_SummaryCounters pdbg_sum = g_summary_phase[LNK_SummaryPhase_PdbGsi];
+    pdbg_sum = lnk_summary_counters_add(pdbg_sum, g_summary_phase[LNK_SummaryPhase_PdbHsh]);
+    pdbg_sum = lnk_summary_counters_add(pdbg_sum, g_summary_phase[LNK_SummaryPhase_PdbIni]);
+    pdbg_sum = lnk_summary_counters_add(pdbg_sum, g_summary_phase[LNK_SummaryPhase_PdbSym]);
+    pdbg_sum = lnk_summary_counters_add(pdbg_sum, g_summary_phase[LNK_SummaryPhase_PdbMod]);
+    pdbg_sum = lnk_summary_counters_add(pdbg_sum, g_summary_phase[LNK_SummaryPhase_PdbTpi]);
+    pdbg_sum = lnk_summary_counters_add(pdbg_sum, g_summary_phase[LNK_SummaryPhase_PdbStr]);
+    pdbg_sum = lnk_summary_counters_add(pdbg_sum, g_summary_phase[LNK_SummaryPhase_PdbSc]);
+    pdbg_sum = lnk_summary_counters_add(pdbg_sum, g_summary_phase[LNK_SummaryPhase_PdbMsf]);
+    pdbg_sum = lnk_summary_counters_add(pdbg_sum, g_summary_phase[LNK_SummaryPhase_PdbWr]);
+    pdb_other = lnk_summary_counters_sub_sat(pdb_c, pdbg_sum);
+
+    LNK_SummaryCounters dbgg_sum = lnk_summary_counters_add(g_summary_phase[LNK_SummaryPhase_DbgMcvi], g_summary_phase[LNK_SummaryPhase_DbgMerge]);
+    dbg_other = lnk_summary_counters_sub_sat(dbg_c, dbgg_sum);
+  }
+
   // governor stats + cross-process attach counter, only when the shared pool is
   // on. Snapshot procs= BEFORE detaching; detach here (once, any exit path) --
   // the linker leaves through _exit and never runs tp_release.
@@ -8272,8 +8297,8 @@ lnk_print_summary(int exit_code)
               "[radlink summary] v=2 out=%S exit=%d t0=%llu t1=%llu wall=%.1f user=%.1f kern=%.1f ws=%.1fG pf=%.1fM io=%llu/%lluMB mem=%.1f/%.1f/%.1f/%u workers=%llu%S"
               " in=%lluo/%.1fG libs=%llu"
               " ph[inp=%S res=%S icf=%S ref=%S img=%S dbg=%S pdb=%S wr=%S]"
-              " dbgg[mcvi=%S merge=%S]"
-              " pdbg[gsi=%S sym=%S mod=%S tpi=%S str=%S sc=%S msf=%S wr=%S]\n",
+              " dbgg[mcvi=%S merge=%S other=%S]"
+              " pdbg[hsh=%S ini=%S gsi=%S sym=%S mod=%S tpi=%S str=%S sc=%S msf=%S wr=%S other=%S]\n",
               g_summary_info.out_name_size ? str8(g_summary_info.out_name, g_summary_info.out_name_size) : str8_lit("-"),
               exit_code,
               g_summary_info.t0_ms,
@@ -8304,6 +8329,9 @@ lnk_print_summary(int exit_code)
               lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_Write]),
               lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_DbgMcvi]),
               lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_DbgMerge]),
+              lnk_summary_str_from_counters(scratch.arena, dbg_other),
+              lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbHsh]),
+              lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbIni]),
               lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbGsi]),
               lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbSym]),
               lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbMod]),
@@ -8311,7 +8339,8 @@ lnk_print_summary(int exit_code)
               lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbStr]),
               lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbSc]),
               lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbMsf]),
-              lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbWr]));
+              lnk_summary_str_from_counters(scratch.arena, g_summary_phase[LNK_SummaryPhase_PdbWr]),
+              lnk_summary_str_from_counters(scratch.arena, pdb_other));
 
   scratch_end(scratch);
 }
@@ -8696,6 +8725,7 @@ lnk_run_linker(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
       {
         g_summary_info.mem_avail_pdb = lnk_summary_sample_mem();
         lnk_timer_begin(LNK_Timer_Pdb);
+        lnk_summary_phase_begin(LNK_SummaryPhase_PdbHsh);
         if (config->pdb_hash_type_names != LNK_TypeNameHashMode_Null && config->pdb_hash_type_names != LNK_TypeNameHashMode_None) {
           lnk_replace_type_names_with_hashes(tp,
                                              arena,
@@ -8705,6 +8735,7 @@ lnk_run_linker(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
                                              config->pdb_hash_type_name_length,
                                              config->pdb_hash_type_name_map);
         }
+        lnk_summary_phase_end(LNK_SummaryPhase_PdbHsh);
         pdb_data = lnk_build_pdb(tp, arena, image_ctx.image_data, config, symtab, &cv, cv_types, LNK_PDB_BuilderFlag_All);
         if (config->debug_mode == LNK_DebugMode_Full) {
           lnk_summary_phase_begin(LNK_SummaryPhase_PdbWr);

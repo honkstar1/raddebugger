@@ -37,6 +37,17 @@ lnk_summary_counters_sub_sat(LNK_SummaryCounters a, LNK_SummaryCounters b)
   return c;
 }
 
+internal LNK_SummaryCounters
+lnk_summary_counters_add(LNK_SummaryCounters a, LNK_SummaryCounters b)
+{
+  LNK_SummaryCounters c;
+  c.wall_us = a.wall_us + b.wall_us;
+  c.user_us = a.user_us + b.user_us;
+  c.kern_us = a.kern_us + b.kern_us;
+  c.faults  = a.faults  + b.faults;
+  return c;
+}
+
 internal void
 lnk_timer_begin(LNK_TimerType timer)
 {

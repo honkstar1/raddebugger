@@ -5056,6 +5056,11 @@ lnk_build_pdb(TP_Context *tp, TP_Arena *tp_arena, String8 image_data, LNK_Config
     builder_flags = ~0;
   }
 
+  // ini= bucket: pdb_alloc_ commits the MSF + type-server tables (fresh pages,
+  // ~132K faults on the editor link) -- under a storm every fresh commit pays
+  // the page-repurpose path, so this span needs its own attribution
+  lnk_summary_phase_begin(LNK_SummaryPhase_PdbIni);
+
   LNK_BuildPdb task = {
     .image_data                      = image_data,
     .symtab                          = symtab,
@@ -5080,6 +5085,8 @@ lnk_build_pdb(TP_Context *tp, TP_Arena *tp_arena, String8 image_data, LNK_Config
   // for lanes [0,C)). Distributing to the full worker_count up front would leave
   // objs in buckets [C,worker_count) unprocessed when C<worker_count. See the
   // lnk_build_pdb_distribute_obj_indices helper.
+
+  lnk_summary_phase_end(LNK_SummaryPhase_PdbIni);
 
   // push types
   lnk_summary_phase_begin(LNK_SummaryPhase_PdbTpi);
