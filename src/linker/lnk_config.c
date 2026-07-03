@@ -72,6 +72,7 @@ global read_only LNK_CmdSwitch g_cmd_switch_map[] =
   { LNK_CmdSwitch_Rad_MemoryMapFiles,               0, "RAD_MEMORY_MAP_FILES",                 "[:{NO|READ_ONLY|READ_WRITE}]", "When enabled, files are memory-mapped instead of being read entirely on request." },
   { LNK_CmdSwitch_Rad_BootMode,                     0, "RAD_BOOT_MODE",                        "[:LINKER|TYPE_SERVER]", "Overrides default boot program."                                      },
   { LNK_CmdSwitch_Rad_DbgPhaseGate,                 0, "RAD_DBG_PHASE_GATE",                   ":#",        "Max processes concurrently inside the debug-info parse/merge window (shared pool only; acquire times out after 10s and proceeds; 0 = off, default)." },
+  { LNK_CmdSwitch_Rad_MemGate,                      0, "RAD_MEM_GATE",                         ":#",        "Available-physical-memory floor in GB below which the arena-heavy windows are admission-gated across the shared pool (4 permits, 10s timeout-then-proceed). Default: max(8GB, 4%% of total). 0 = off." },
   { LNK_CmdSwitch_Rad_Debug,                        0, "RAD_DEBUG",                            "[:NO]",     "Emit RAD debug info file."                                                        },
   { LNK_CmdSwitch_Rad_DebugAltPath,                 0, "RAD_DEBUGALTPATH",                     ":PATH",     "Alternative output path for the RDI."                                             },
   { LNK_CmdSwitch_Rad_DebugName,                    0, "RAD_DEBUG_NAME",                       ":FILENAME", "Set file name for RAD debug info file."                                           },
@@ -1913,6 +1914,10 @@ lnk_apply_cmd_option_to_config(LNK_Config *config, String8 cmd_name, String8List
     lnk_cmd_switch_parse_u64(obj, cmd_switch, value_strings, &config->dbg_phase_gate, 0);
   } break;
 
+  case LNK_CmdSwitch_Rad_MemGate: {
+    lnk_cmd_switch_parse_u64(obj, cmd_switch, value_strings, &config->mem_gate_gb, 0);
+  } break;
+
   case LNK_CmdSwitch_Rad_Debug: {
     lnk_cmd_switch_parse_flag(obj, cmd_switch, value_strings, &config->rad_debug);
   } break;
@@ -2249,6 +2254,7 @@ lnk_config_init(LNK_CmdLine cmd_line)
   config->arena        = arena;
   config->raw_cmd_line = str8_list_copy(arena, &cmd_line.raw_cmd_line);
   config->work_dir     = get_current_path(arena);
+  config->mem_gate_gb  = max_U64; // /RAD_MEM_GATE auto threshold: max(8GB, 4% of total); explicit :0 turns the gate off
 
   // apply command line switches
   for EachNode(cmd, LNK_CmdOption, cmd_line.first_option) {
