@@ -102,7 +102,6 @@ typedef enum
   LNK_CmdSwitch_Rad_BuildInfo,
   LNK_CmdSwitch_Rad_CheckUnusedDelayLoadDll,
   LNK_CmdSwitch_Rad_DataDirCount,
-  LNK_CmdSwitch_Rad_MemGate,
   LNK_CmdSwitch_Rad_Debug,
   LNK_CmdSwitch_Rad_DebugAltPath,
   LNK_CmdSwitch_Rad_DebugName,
@@ -317,7 +316,6 @@ typedef struct LNK_Config
   U64                         worker_count;
   U64                         max_worker_count;
   String8                     shared_thread_pool_name;
-  U64                         mem_gate_gb;    // /RAD_MEM_GATE:GB -- available-physical floor below which the arena-heavy windows are admission-gated (max_U64 = auto: max(8GB, 4% of total); 0 = off)
   LNK_SwitchState             do_function_pad_min;
   B32                         infer_function_pad_min;
   U64                         function_pad_min;

@@ -8202,11 +8202,6 @@ lnk_summary_str_from_counters(Arena *arena, LNK_SummaryCounters c)
   return push_str8f(arena, "%llu/%llu/%llu/%llu", c.wall_us / 1000, c.user_us / 1000, c.kern_us / 1000, c.faults / 1000);
 }
 
-// memory-aware admission counters (see lnk_memgate_enter below); declared here
-// so the summary line can print them
-global U32 g_memgate_waits;     // engaged acquires (= low-memory events)
-global U64 g_memgate_waited_us; // total time spent blocked on the gate
-
 internal void
 lnk_print_summary(int exit_code)
 {
@@ -8295,17 +8290,11 @@ lnk_print_summary(int exit_code)
                             str8(g_summary_info.pool_name, g_summary_info.pool_name_size), grant_avg, park_seconds, procs_now, procs_peak);
   }
 
-  // memory-aware admission stats, only when the gate actually engaged
-  String8 memgate_stats = str8_zero();
-  if (g_memgate_waits > 0) {
-    memgate_stats = push_str8f(scratch.arena, " memgate=%u/%llu", g_memgate_waits, g_memgate_waited_us / 1000);
-  }
-
   // final memory sample (t1) -- 3rd and last GlobalMemoryStatusEx of the link
   U64 mem_avail_t1 = lnk_summary_sample_mem();
 
   lnk_fprintf(stdout,
-              "[radlink summary] v=2 out=%S exit=%d t0=%llu t1=%llu wall=%.1f user=%.1f kern=%.1f ws=%.1fG pf=%.1fM io=%llu/%lluMB mem=%.1f/%.1f/%.1f/%u workers=%llu%S%S"
+              "[radlink summary] v=2 out=%S exit=%d t0=%llu t1=%llu wall=%.1f user=%.1f kern=%.1f ws=%.1fG pf=%.1fM io=%llu/%lluMB mem=%.1f/%.1f/%.1f/%u workers=%llu%S"
               " in=%lluo/%.1fG libs=%llu"
               " ph[inp=%S res=%S icf=%S ref=%S img=%S dbg=%S pdb=%S wr=%S]"
               " dbgg[mcvi=%S merge=%S other=%S]"
@@ -8327,7 +8316,6 @@ lnk_print_summary(int exit_code)
               g_summary_info.mem_load_max,
               g_summary_info.worker_count,
               pool_stats,
-              memgate_stats,
               g_summary_info.objs_count,
               (F64)g_summary_info.input_bytes / (F64)GB(1),
               g_summary_info.libs_count,
@@ -8357,62 +8345,6 @@ lnk_print_summary(int exit_code)
   scratch_end(scratch);
 }
 
-
-////////////////////////////////////////////////////////////////////////////////
-//~ Memory-aware admission (/RAD_MEM_GATE, default ON, conservative): before
-//  entering the two arena-heavy windows (debug-info parse/merge; PDB build)
-//  check available physical memory -- one GlobalMemoryStatusEx, zero effect
-//  when memory is plentiful. Only when available drops below the floor
-//  (default max(8GB, 4% of total)) does entry serialize through a small named
-//  semaphore shared across the pool ("<pool>.memgate.v3", 4 permits), which
-//  staggers the windows that commit tens of GB. Prod storms (96 concurrent
-//  links) show the same fault count costing 125us/fault vs 2.3us after the
-//  storm -- the box falls onto the page-repurpose path once the zero/free
-//  lists drain; staggering the big committers keeps it off that path.
-//  Acquire has a MANDATORY 10s timeout-then-proceed: a crashed/slow holder
-//  can never deadlock or starve the farm, and a timed-out process must NOT
-//  drop a permit it never took.
-
-#define LNK_MEMGATE_PERMITS 4
-
-typedef struct LNK_MemGate
-{
-  Semaphore sem;   // zero handle => gate not engaged for this window
-  B32       taken; // we own a permit and must drop it at window end
-} LNK_MemGate;
-
-internal LNK_MemGate
-lnk_memgate_enter(LNK_Config *config)
-{
-  LNK_MemGate gate = {0};
-#if OS_WINDOWS
-  if (config->mem_gate_gb == 0)             { return gate; } // /RAD_MEM_GATE:0
-  if (!lnk_is_thread_pool_shared(config))   { return gate; } // no pool => no one to stagger against
-  MEMORYSTATUSEX msx = { sizeof(msx) };
-  if (!GlobalMemoryStatusEx(&msx)) { return gate; }
-  U64 floor_bytes = config->mem_gate_gb == max_U64 ? Max(GB(8), msx.ullTotalPhys / 25) // auto: max(8GB, 4% of total)
-                                                   : GB(1) * config->mem_gate_gb;
-  if (msx.ullAvailPhys >= floor_bytes) { return gate; }
-  Temp scratch = scratch_begin(0, 0);
-  String8 gate_name = push_str8f(scratch.arena, "%S.memgate.v3", config->shared_thread_pool_name);
-  gate.sem = semaphore_alloc(LNK_MEMGATE_PERMITS, LNK_MEMGATE_PERMITS, gate_name);
-  if (gate.sem.u64[0] != 0) {
-    U64 wait_begin_us = now_time_us();
-    gate.taken = semaphore_take(gate.sem, wait_begin_us + 10*1000000);
-    g_memgate_waits     += 1;
-    g_memgate_waited_us += now_time_us() - wait_begin_us;
-  }
-  scratch_end(scratch);
-#endif
-  return gate;
-}
-
-internal void
-lnk_memgate_exit(LNK_MemGate *gate)
-{
-  if (gate->taken)           { semaphore_drop(gate->sem); }
-  if (gate->sem.u64[0] != 0) { semaphore_release(gate->sem); MemoryZeroStruct(gate); }
-}
 
 internal void
 lnk_log_timers(void)
@@ -8725,10 +8657,6 @@ lnk_run_linker(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
     //
     // CodeView
     //
-    // memory-aware admission window 1: the parse/merge span commits tens of GB
-    // of scratch; under low physical memory stagger entry across the pool
-    LNK_MemGate dbg_mem_gate = lnk_memgate_enter(config);
-
     LNK_RRT_Array     rrt_input = lnk_rrt_array_from_config(arena->v[0], config);
     lnk_summary_phase_begin(LNK_SummaryPhase_DbgMcvi);
     LNK_CodeViewInput cv        = lnk_make_code_view_input(tp, arena, config, debug_info_objs_count, debug_info_objs, rrt_input);
@@ -8736,9 +8664,6 @@ lnk_run_linker(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
     lnk_summary_phase_begin(LNK_SummaryPhase_DbgMerge);
     LNK_MergedTypes   cv_types  = lnk_merge_types(tp, arena, &cv, 0);
     lnk_summary_phase_end(LNK_SummaryPhase_DbgMerge);
-
-    // leave memory-aware admission window 1
-    lnk_memgate_exit(&dbg_mem_gate);
 
     // prune merged types not reachable from any surviving symbol (PDB-size win). OFF by default:
     // it removes types that a debugger can still legitimately cast to in the watch window
@@ -8776,10 +8701,6 @@ lnk_run_linker(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
 
       String8List pdb_data = {0};
       {
-        // memory-aware admission window 2: the PDB build re-grows scratch +
-        // commits the MSF/type-server tables; stagger under low physical memory
-        LNK_MemGate pdb_mem_gate = lnk_memgate_enter(config);
-
         g_summary_info.mem_avail_pdb = lnk_summary_sample_mem();
         lnk_timer_begin(LNK_Timer_Pdb);
         lnk_summary_phase_begin(LNK_SummaryPhase_PdbHsh);
@@ -8800,9 +8721,6 @@ lnk_run_linker(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
           lnk_summary_phase_end(LNK_SummaryPhase_PdbWr);
         }
         lnk_timer_end(LNK_Timer_Pdb);
-
-        // leave memory-aware admission window 2
-        lnk_memgate_exit(&pdb_mem_gate);
       }
 
       if (config->rad_debug == LNK_SwitchState_Yes) {

@@ -71,7 +71,6 @@ global read_only LNK_CmdSwitch g_cmd_switch_map[] =
   { LNK_CmdSwitch_Rad_MapLinesForUnresolvedSymbols, 0, "RAD_MAP_LINES_FOR_UNRESOLVED_SYMBOLS", "[:NO]",     "Use debug info to print source file location for unresolved symbol"               },
   { LNK_CmdSwitch_Rad_MemoryMapFiles,               0, "RAD_MEMORY_MAP_FILES",                 "[:{NO|READ_ONLY|READ_WRITE}]", "When enabled, files are memory-mapped instead of being read entirely on request." },
   { LNK_CmdSwitch_Rad_BootMode,                     0, "RAD_BOOT_MODE",                        "[:LINKER|TYPE_SERVER]", "Overrides default boot program."                                      },
-  { LNK_CmdSwitch_Rad_MemGate,                      0, "RAD_MEM_GATE",                         ":#",        "Available-physical-memory floor in GB below which the arena-heavy windows are admission-gated across the shared pool (4 permits, 10s timeout-then-proceed). Default: max(8GB, 4%% of total). 0 = off." },
   { LNK_CmdSwitch_Rad_Debug,                        0, "RAD_DEBUG",                            "[:NO]",     "Emit RAD debug info file."                                                        },
   { LNK_CmdSwitch_Rad_DebugAltPath,                 0, "RAD_DEBUGALTPATH",                     ":PATH",     "Alternative output path for the RDI."                                             },
   { LNK_CmdSwitch_Rad_DebugName,                    0, "RAD_DEBUG_NAME",                       ":FILENAME", "Set file name for RAD debug info file."                                           },
@@ -1909,10 +1908,6 @@ lnk_apply_cmd_option_to_config(LNK_Config *config, String8 cmd_name, String8List
     }
   } break;
 
-  case LNK_CmdSwitch_Rad_MemGate: {
-    lnk_cmd_switch_parse_u64(obj, cmd_switch, value_strings, &config->mem_gate_gb, 0);
-  } break;
-
   case LNK_CmdSwitch_Rad_Debug: {
     lnk_cmd_switch_parse_flag(obj, cmd_switch, value_strings, &config->rad_debug);
   } break;
@@ -2091,7 +2086,7 @@ lnk_apply_cmd_option_to_config(LNK_Config *config, String8 cmd_name, String8List
     } else {
       // NOTE: must copy into the config arena -- the parsed string points into
       // response-file/cmdline scratch that is freed long before late consumers
-      // (pool init, summary, /RAD_MEM_GATE) read it
+      // (pool init, summary) read it
       lnk_cmd_switch_parse_string_copy(config->arena, obj, cmd_switch, value_strings, &config->shared_thread_pool_name);
       if (config->shared_thread_pool_name.size == 0) {
         lnk_error_cmd_switch(LNK_Error_Cmdl, obj, cmd_switch, "invalid empty string for thread pool name");
@@ -2252,7 +2247,6 @@ lnk_config_init(LNK_CmdLine cmd_line)
   config->arena        = arena;
   config->raw_cmd_line = str8_list_copy(arena, &cmd_line.raw_cmd_line);
   config->work_dir     = get_current_path(arena);
-  config->mem_gate_gb  = max_U64; // /RAD_MEM_GATE auto threshold: max(8GB, 4% of total); explicit :0 turns the gate off
 
   // apply command line switches
   for EachNode(cmd, LNK_CmdOption, cmd_line.first_option) {
