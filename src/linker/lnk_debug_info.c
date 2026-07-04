@@ -5056,9 +5056,11 @@ lnk_build_pdb(TP_Context *tp, TP_Arena *tp_arena, String8 image_data, LNK_Config
     builder_flags = ~0;
   }
 
-  // ini= bucket: pdb_alloc_ commits the MSF + type-server tables (fresh pages,
-  // ~132K faults on the editor link) -- under a storm every fresh commit pays
-  // the page-repurpose path, so this span needs its own attribution
+  // ini= bucket: pdb_alloc_ commits the MSF + type-server tables. This was
+  // ~132K faults/link (the entire prod #3 bucket) while commit_memory's RIO
+  // probe-and-lock prefaulted every committed page of the first 512MiB MSF
+  // page-data node; with lazy commit the bracket is ~0 -- kept for attribution
+  // so a regression here is visible on the summary line
   lnk_summary_phase_begin(LNK_SummaryPhase_PdbIni);
 
   LNK_BuildPdb task = {
