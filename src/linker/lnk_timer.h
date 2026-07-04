@@ -61,7 +61,7 @@ typedef enum LNK_SummaryPhase
   // pdb sub-buckets (printed as pdbg[...]); brackets sit on the pre-existing
   // Prof/timer boundaries inside lnk_build_pdb + the write at its call site
   LNK_SummaryPhase_PdbHsh,   // lnk_replace_type_names_with_hashes (/RAD_PDB_HASH_TYPE_NAMES): parallel rewrite touching every merged TPI leaf -- storm re-fault amplifier
-  LNK_SummaryPhase_PdbIni,   // lnk_build_pdb task init: pdb_alloc_ (MSF + type-server tables, ~132K fresh commits on the editor link)
+  LNK_SummaryPhase_PdbIni,   // lnk_build_pdb task init: pdb_alloc_ (MSF + type-server tables; was ~132K faults/link while commit_memory prefaulted every committed page -- lazy commit dropped it to ~0)
   LNK_SummaryPhase_PdbGsi,   // lnk_move_global_symbols_to_gsi barrier pass ("Move Global Symbols")
   LNK_SummaryPhase_PdbSym,   // pdb_build_gsi_psi ("Build GSI and PSI": symrec + GSI/PSI hash streams)
   LNK_SummaryPhase_PdbMod,   // lnk_write_pdb_modules barrier pass ("Write Modules")

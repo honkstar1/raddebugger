@@ -272,15 +272,17 @@ internal B32
 commit_memory(void *ptr, U64 size)
 {
   B32 result = (VirtualAlloc(ptr, size, MEM_COMMIT, PAGE_READWRITE) != 0);
-
-#if !NO_WIN32_RIO
-  if(w32_rio_functions.RIORegisterBuffer)
-  {
-    // wine does not implement these functions
-    w32_rio_functions.RIODeregisterBuffer(w32_rio_functions.RIORegisterBuffer(ptr, size));
-  }
-#endif
-
+  // NOTE(perf): this used to RIORegisterBuffer+RIODeregisterBuffer the committed
+  // range as a batched prefault trick. Registration probe-and-locks EVERY page in
+  // the range, which turns every commit into an eager demand-zero fault of the
+  // full range: pages that are never subsequently touched (e.g. the tail of a
+  // 512MiB MSF page-data node, oversized table slots) still get faulted, zeroed,
+  // and charged to the working set. On a big editor link that was ~1.2M
+  // process page faults and multiple GiB of resident-but-never-used memory.
+  // Plain MEM_COMMIT is cheap (no page is touched); pages fault in lazily on
+  // first touch, so the fault count tracks what is actually used and the
+  // faults land spread across parallel workers instead of serially at the
+  // commit site.
 #if PROFILE_TELEMETRY
   tmAlloc(0, ptr, size / 1024, "Win32 Commit");
 #endif
