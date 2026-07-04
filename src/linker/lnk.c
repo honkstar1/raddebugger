@@ -8369,9 +8369,9 @@ lnk_print_summary(int exit_code)
 //  links) show the same fault count costing 125us/fault vs 2.3us after the
 //  storm -- the box falls onto the page-repurpose path once the zero/free
 //  lists drain; staggering the big committers keeps it off that path.
-//  Acquire has a MANDATORY 10s timeout-then-proceed (same as dbggate.v3): a
-//  crashed/slow holder can never deadlock or starve the farm, and a timed-out
-//  process must NOT drop a permit it never took.
+//  Acquire has a MANDATORY 10s timeout-then-proceed: a crashed/slow holder
+//  can never deadlock or starve the farm, and a timed-out process must NOT
+//  drop a permit it never took.
 
 #define LNK_MEMGATE_PERMITS 4
 
@@ -8725,26 +8725,9 @@ lnk_run_linker(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
     //
     // CodeView
     //
-    // /RAD_DBG_PHASE_GATE:N (default OFF): stagger the MM-heavy debug-info
-    // parse/merge window across concurrent links sharing a pool. Even with
-    // bulk prefetch, N-way-concurrent first-touch of tens of GB each convoys
-    // on machine memory bandwidth; the gate admits at most N processes into
-    // the window at once (named semaphore "<pool>.dbggate.v3"). Acquire has a
-    // MANDATORY 10s timeout-then-proceed so a crashed/slow holder can never
-    // deadlock or starve the farm -- worst case the gate degrades to a stagger.
     // memory-aware admission window 1: the parse/merge span commits tens of GB
     // of scratch; under low physical memory stagger entry across the pool
     LNK_MemGate dbg_mem_gate = lnk_memgate_enter(config);
-
-    Semaphore dbg_phase_gate = {0};
-    B32       dbg_gate_taken = 0;
-    if (config->dbg_phase_gate > 0 && lnk_is_thread_pool_shared(config)) {
-      String8 gate_name = push_str8f(scratch.arena, "%S.dbggate.v3", config->shared_thread_pool_name);
-      dbg_phase_gate = semaphore_alloc((U32)config->dbg_phase_gate, (U32)config->dbg_phase_gate, gate_name);
-      if (dbg_phase_gate.u64[0] != 0) {
-        dbg_gate_taken = semaphore_take(dbg_phase_gate, now_time_us() + 10*1000000);
-      }
-    }
 
     LNK_RRT_Array     rrt_input = lnk_rrt_array_from_config(arena->v[0], config);
     lnk_summary_phase_begin(LNK_SummaryPhase_DbgMcvi);
@@ -8753,11 +8736,6 @@ lnk_run_linker(TP_Context *tp, TP_Arena *arena, LNK_Config *config)
     lnk_summary_phase_begin(LNK_SummaryPhase_DbgMerge);
     LNK_MergedTypes   cv_types  = lnk_merge_types(tp, arena, &cv, 0);
     lnk_summary_phase_end(LNK_SummaryPhase_DbgMerge);
-
-    // leave the debug-info phase gate (only if we actually got a slot;
-    // a timeout-proceed must NOT release a permit it never took)
-    if (dbg_gate_taken)             { semaphore_drop(dbg_phase_gate); }
-    if (dbg_phase_gate.u64[0] != 0) { semaphore_release(dbg_phase_gate); MemoryZeroStruct(&dbg_phase_gate); }
 
     // leave memory-aware admission window 1
     lnk_memgate_exit(&dbg_mem_gate);
