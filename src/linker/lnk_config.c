@@ -2094,7 +2094,10 @@ lnk_apply_cmd_option_to_config(LNK_Config *config, String8 cmd_name, String8List
     if (value_strings.node_count == 0) {
       config->shared_thread_pool_name = str8_lit(LNK_DEFAULT_THREAD_POOL_NAME);
     } else {
-      lnk_cmd_switch_parse_string(obj, cmd_switch, value_strings, &config->shared_thread_pool_name);
+      // NOTE: must copy into the config arena -- the parsed string points into
+      // response-file/cmdline scratch that is freed long before late consumers
+      // (pool init, summary, /RAD_MEM_GATE, /RAD_DBG_PHASE_GATE) read it
+      lnk_cmd_switch_parse_string_copy(config->arena, obj, cmd_switch, value_strings, &config->shared_thread_pool_name);
       if (config->shared_thread_pool_name.size == 0) {
         lnk_error_cmd_switch(LNK_Error_Cmdl, obj, cmd_switch, "invalid empty string for thread pool name");
       }

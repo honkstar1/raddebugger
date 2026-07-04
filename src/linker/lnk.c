@@ -8387,18 +8387,14 @@ lnk_memgate_enter(LNK_Config *config)
   LNK_MemGate gate = {0};
 #if OS_WINDOWS
   if (config->mem_gate_gb == 0)             { return gate; } // /RAD_MEM_GATE:0
-  if (g_summary_info.pool_name_size == 0)   { return gate; } // no pool => no one to stagger against
+  if (!lnk_is_thread_pool_shared(config))   { return gate; } // no pool => no one to stagger against
   MEMORYSTATUSEX msx = { sizeof(msx) };
   if (!GlobalMemoryStatusEx(&msx)) { return gate; }
   U64 floor_bytes = config->mem_gate_gb == max_U64 ? Max(GB(8), msx.ullTotalPhys / 25) // auto: max(8GB, 4% of total)
                                                    : GB(1) * config->mem_gate_gb;
   if (msx.ullAvailPhys >= floor_bytes) { return gate; }
   Temp scratch = scratch_begin(0, 0);
-  // NOTE: use the pool-name COPY stashed for the summary line --
-  // config->shared_thread_pool_name is parsed WITHOUT a copy and can point
-  // into the dead response-file scratch by the time the debug phase runs
-  // (same lifetime bug class as the pool= garbage fixed in the summary round)
-  String8 gate_name = push_str8f(scratch.arena, "%S.memgate.v3", str8(g_summary_info.pool_name, g_summary_info.pool_name_size));
+  String8 gate_name = push_str8f(scratch.arena, "%S.memgate.v3", config->shared_thread_pool_name);
   gate.sem = semaphore_alloc(LNK_MEMGATE_PERMITS, LNK_MEMGATE_PERMITS, gate_name);
   if (gate.sem.u64[0] != 0) {
     U64 wait_begin_us = now_time_us();
