@@ -1147,17 +1147,17 @@ lnk_apply_cmd_option_to_config(LNK_Config *config, String8 cmd_name, String8List
   case LNK_CmdSwitch_Null: {
     String8 value = str8_list_join(scratch.arena, &value_strings, &(StringJoin){.sep=str8_lit_comp(",")});
 
-    // Unknown /RAD_* switches on the command line are a hard error: the RAD_
-    // namespace is owned by this linker, so an unknown one means the build
-    // system expects a feature this binary does not have (e.g. a stale
-    // radlink.exe asked to /RAD_BUNDLE). Silently dropping the switch (the
-    // release-default /RAD_IGNORE mutes LNK_Warning_UnknownSwitch) would run
-    // a bogus regular link instead of the requested mode.
+    // Unknown /RAD_* switches on the command line warn and are ignored: the
+    // RAD_ namespace is owned by this linker, but newer build scripts must
+    // keep working against older radlink binaries (forward compatibility),
+    // so an unrecognized /RAD_* switch must not fail the link. Use
+    // LNK_Warning_Cmdl so the warning stays visible even though the
+    // release-default /RAD_IGNORE mutes LNK_Warning_UnknownSwitch.
     if (obj == 0 && str8_match_lit("RAD_", str8_prefix(cmd_name, 4), StringMatchFlag_CaseInsensitive)) {
-      lnk_error(LNK_Error_Cmdl, "unknown switch: \"/%S%s%S\"; this radlink build does not support it (stale linker binary?)", cmd_name, value.size ? ":" : "", value);
+      lnk_error(LNK_Warning_Cmdl, "unknown switch \"/%S%s%S\"; this radlink build does not support it -- switch ignored", cmd_name, value.size ? ":" : "", value);
+    } else {
+      lnk_error_obj(LNK_Warning_UnknownSwitch, obj, "unknown switch: \"/%S%s%S\"", cmd_name, value.size ? ":" : "", value);
     }
-
-    lnk_error_obj(LNK_Warning_UnknownSwitch, obj, "unknown switch: \"/%S%s%S\"", cmd_name, value.size ? ":" : "", value);
   } break;
 
   default: break;
