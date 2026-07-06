@@ -5289,6 +5289,9 @@ THREAD_POOL_TASK_FUNC(lnk_patch_virtual_offsets_and_sizes_in_obj_section_headers
 
   ProfBeginV("Patch Virtual Offset And Size In Section Headers [%S]", obj->path);
   COFF_SectionHeader *section_table = (COFF_SectionHeader *)str8_substr(obj->data, obj->header.section_table_range).str;
+  // headers live in the read-only mapped input view; promote the whole table in one call
+  // instead of taking a copy-on-write fault per page (~20 pages/obj on section-heavy objs)
+  lnk_cow_promote_range(section_table, dim_1u64(obj->header.section_table_range));
   for (U64 sect_idx = 0; sect_idx < obj->header.section_count_no_null; sect_idx += 1) {
     COFF_SectionHeader *sect_header = &section_table[sect_idx];
     if (~obj->section_flags[sect_idx] & COFF_SectionFlag_LnkRemove) {
@@ -5310,6 +5313,8 @@ THREAD_POOL_TASK_FUNC(lnk_patch_file_offsets_and_sizes_in_obj_section_headers_ta
 
   ProfBeginV("Patch File Offsets And Sizes In Obj Section Headers [%S]", obj->path);
   COFF_SectionHeader *section_table = (COFF_SectionHeader *)str8_substr(obj->data, obj->header.section_table_range).str;
+  // usually a no-op: the virtual-offset patch task already promoted (and dirtied) these pages
+  lnk_cow_promote_range(section_table, dim_1u64(obj->header.section_table_range));
   for (U64 sect_idx = 0; sect_idx < obj->header.section_count_no_null; sect_idx += 1) {
     COFF_SectionHeader *sect_header = &section_table[sect_idx];
     COFF_SectionFlags   sect_flags  = obj->section_flags[sect_idx];

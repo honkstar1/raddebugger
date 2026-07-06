@@ -89,10 +89,15 @@ lnk_lib_from_data(Arena *arena, String8 data, String8 path, U64 input_idx, LNK_L
     Assert(first_member.symbol_count == first_member.member_offset_count);
     
     symbol_count = first_member.symbol_count;
-    
-    // convert big endian offsets
-    for (U32 offset_idx = 0; offset_idx < symbol_count; offset_idx += 1) {
-      first_member.member_offsets[offset_idx] = from_be_u32(first_member.member_offsets[offset_idx]);
+
+    // convert big endian offsets on a private copy -- converting in place would dirty
+    // copy-on-write pages of the mapped archive (import libs put the whole offset table here)
+    {
+      U32 *member_offsets_le = push_array_no_zero(scratch.arena, U32, symbol_count);
+      for (U32 offset_idx = 0; offset_idx < symbol_count; offset_idx += 1) {
+        member_offsets_le[offset_idx] = from_be_u32(first_member.member_offsets[offset_idx]);
+      }
+      first_member.member_offsets = member_offsets_le;
     }
 
     // compress member offsets to match those from the second header

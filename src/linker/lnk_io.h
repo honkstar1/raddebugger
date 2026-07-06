@@ -50,6 +50,11 @@ internal File      lnk_file_open_with_rename_permissions(String8 path);
 internal B32       lnk_file_set_delete_on_close(File handle, B32 delete_file);
 internal B32       lnk_file_rename(File handle, String8 new_name);
 
+// make a range of a read-only mapped input view writable (copy-on-write) in one call;
+// no-op for heap-backed or read-write-shared inputs. Writers not routed through this
+// are still safe: lnk_cow_page_promote_veh promotes faulting pages one at a time.
+internal void lnk_cow_promote_range(void *ptr, U64 size);
+
 internal String8      lnk_read_data_from_file_path(Arena *arena, LNK_IO_Flags io_flags, String8 path);
 internal String8Array lnk_read_data_from_file_path_parallel(TP_Context *tp, Arena *arena, LNK_IO_Flags io_flags, String8Array path_arr);
 
