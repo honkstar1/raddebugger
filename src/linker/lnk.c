@@ -8220,7 +8220,8 @@ lnk_print_summary(int exit_code)
   F64 wall = g_summary_info.start_us ? (F64)(now_time_us() - g_summary_info.start_us) / 1000000.0 : 0;
 
   // process CPU + memory counters
-  F64 user_time = 0, kernel_time = 0, peak_ws_gib = 0, page_faults_m = 0;
+  F64 user_time = 0, kernel_time = 0, peak_ws_gib = 0, page_faults_m = 0, peak_commit_gib = 0;
+  U32 cow_promoted_pages = 0;
 #if OS_WINDOWS
   {
     FILETIME create_ft, exit_ft, kernel_ft, user_ft;
@@ -8232,7 +8233,11 @@ lnk_print_summary(int exit_code)
     if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
       peak_ws_gib   = (F64)pmc.PeakWorkingSetSize / (F64)GB(1);
       page_faults_m = (F64)pmc.PageFaultCount / 1000000.0;
+      // peak pagefile-backed commit charge -- the number build-farm memory admission
+      // sees; with read-only input views this tracks ws minus the mapped input set
+      peak_commit_gib = (F64)pmc.PeakPagefileUsage / (F64)GB(1);
     }
+    cow_promoted_pages = (U32)g_lnk_cow_promoted_pages;
   }
 #endif
 
@@ -8299,7 +8304,7 @@ lnk_print_summary(int exit_code)
   U64 mem_avail_t1 = lnk_summary_sample_mem();
 
   lnk_fprintf(stdout,
-              "[radlink summary] v=2 out=%S exit=%d t0=%llu t1=%llu wall=%.1f user=%.1f kern=%.1f ws=%.1fG pf=%.1fM io=%llu/%lluMB mem=%.1f/%.1f/%.1f/%u workers=%llu%S"
+              "[radlink summary] v=3 out=%S exit=%d t0=%llu t1=%llu wall=%.1f user=%.1f kern=%.1f ws=%.1fG cm=%.1fG cowp=%u pf=%.1fM io=%llu/%lluMB mem=%.1f/%.1f/%.1f/%u workers=%llu%S"
               " in=%lluo/%.1fG libs=%llu"
               " ph[inp=%S res=%S icf=%S ref=%S img=%S dbg=%S pdb=%S wr=%S]"
               " dbgg[mcvi=%S merge=%S other=%S]"
@@ -8312,6 +8317,8 @@ lnk_print_summary(int exit_code)
               user_time,
               kernel_time,
               peak_ws_gib,
+              peak_commit_gib,
+              cow_promoted_pages,
               page_faults_m,
               io_read_mb,
               io_write_mb,
