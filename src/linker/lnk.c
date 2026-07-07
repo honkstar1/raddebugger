@@ -8210,8 +8210,26 @@ lnk_summary_str_from_counters(Arena *arena, LNK_SummaryCounters c)
 internal void
 lnk_print_summary(int exit_code)
 {
-  // print exactly once, no matter which exit path gets here first
+  // run exactly once, no matter which exit path gets here first
   if (ins_atomic_u32_eval_cond_assign(&g_summary_info.printed, 1, 0) != 0) {
+    return;
+  }
+
+  // detach from the shared-pool cross-process counter on every exit path, even
+  // when the summary line is off -- the linker leaves through _exit and never
+  // runs tp_release, so this is the only place the counter gets decremented
+  F64 pool_grant_avg = 0, pool_park_seconds = 0;
+  U32 pool_procs_now = 0, pool_procs_peak = 0;
+  B32 pool_on = (g_summary_info.pool_name_size > 0);
+  if (pool_on) {
+    tp_stats_snapshot(&pool_grant_avg, &pool_park_seconds);
+    tp_procs_snapshot(&pool_procs_now, &pool_procs_peak);
+    tp_procs_detach();
+  }
+
+  // the line itself is opt-in (/RAD_LOG:Summary) -- always-on turned out to be
+  // noise in build logs; farm convoy triage passes the switch explicitly
+  if (!lnk_get_log_status(LNK_Log_Summary)) {
     return;
   }
 
@@ -8286,18 +8304,11 @@ lnk_print_summary(int exit_code)
     dbg_other = lnk_summary_counters_sub_sat(dbg_c, dbgg_sum);
   }
 
-  // governor stats + cross-process attach counter, only when the shared pool is
-  // on. Snapshot procs= BEFORE detaching; detach here (once, any exit path) --
-  // the linker leaves through _exit and never runs tp_release.
+  // governor stats snapshotted above, before the detach
   String8 pool_stats = str8_zero();
-  if (g_summary_info.pool_name_size > 0) {
-    F64 grant_avg, park_seconds;
-    U32 procs_now, procs_peak;
-    tp_stats_snapshot(&grant_avg, &park_seconds);
-    tp_procs_snapshot(&procs_now, &procs_peak);
-    tp_procs_detach();
+  if (pool_on) {
     pool_stats = push_str8f(scratch.arena, " pool=%S grant_avg=%.1f park=%.1f procs=%u/%u",
-                            str8(g_summary_info.pool_name, g_summary_info.pool_name_size), grant_avg, park_seconds, procs_now, procs_peak);
+                            str8(g_summary_info.pool_name, g_summary_info.pool_name_size), pool_grant_avg, pool_park_seconds, pool_procs_now, pool_procs_peak);
   }
 
   // final memory sample (t1) -- 3rd and last GlobalMemoryStatusEx of the link
