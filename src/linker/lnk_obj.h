@@ -63,9 +63,11 @@ typedef struct LNK_Obj
   LNK_SymbolHashTrie **symlinks;
   LNK_ICFFold         *icf_fold;       // /OPT:ICF fold map (per section, sn-1 indexed); 0 if ICF off
   B8                  *icf_lines_only; // .debug$S sections associated to an ICF-folded function: stay
-                                       // LnkRemove'd, but their C13 Lines merge into the module (remapped
-                                       // to the leader RVA) so source breakpoints on folded bodies bind;
-                                       // 0 when ICF off or no folds in this obj (sect_idx indexed)
+                                       // LnkRemove'd, but merge into the module remapped to the leader RVA
+                                       // (sect_idx indexed; 0 array ptr when ICF off / no folds).
+                                       // 1 = C13 Lines only (source breakpoints bind); 2 = full record
+                                       // tree (fold joins a DIFFERENT source location and has locals --
+                                       // watch-window labels come from the right source)
 
   // link
   struct LNK_LibMemberRef *link_member;

@@ -5470,6 +5470,100 @@ typedef struct
   LNK_Obj **objs; // indexed by input_idx (== task_id)
 } LNK_ICFMarkFoldedLinesTask;
 
+// first associated .debug$S child of a function section (name-checked so an associated
+// .debug$T can never be mistaken for symbol/line data)
+internal U32
+lnk_icf_debug_s_child_from_section(LNK_Obj *obj, U32 fn_sn)
+{
+  String8             string_table  = lnk_coff_string_table_from_obj(obj);
+  COFF_SectionHeader *section_table = lnk_coff_section_table_from_obj(obj);
+  for EachNode(assoc_n, U32Node, obj->associated_sections[fn_sn]) {
+    U32 sn = assoc_n->data;
+    if (sn == 0 || sn > obj->header.section_count_no_null)     { continue; }
+    if (~obj->section_flags[sn-1] & LNK_SECTION_FLAG_DEBUG)    { continue; }
+    if (str8_match(coff_name_from_section_header(string_table, &section_table[sn-1]), str8_lit(".debug$S"), 0)) { return sn; }
+  }
+  return 0;
+}
+
+// FILECHKSMS of the obj-wide (non-COMDAT) .debug$S -- the table every per-function
+// Lines fragment's file_off indexes into
+internal String8
+lnk_icf_obj_file_chksms(Arena *scratch, LNK_Obj *obj)
+{
+  String8             string_table  = lnk_coff_string_table_from_obj(obj);
+  COFF_SectionHeader *section_table = lnk_coff_section_table_from_obj(obj);
+  for EachIndex(sect_idx, obj->header.section_count_no_null) {
+    if (~obj->section_flags[sect_idx] & LNK_SECTION_FLAG_DEBUG)    { continue; }
+    if (obj->section_flags[sect_idx] & COFF_SectionFlag_LnkCOMDAT) { continue; }
+    if (!str8_match(coff_name_from_section_header(string_table, &section_table[sect_idx]), str8_lit(".debug$S"), 0)) { continue; }
+    LNK_ObjSection sect = lnk_obj_section_from_sect_idx(obj, sect_idx);
+    String8        raw  = lnk_obj_get_sect_data(obj, sect_idx, sect.frange);
+    CV_DebugS      ds   = cv_debug_s_from_data(scratch, raw);
+    String8List    ck   = cv_sub_section_from_debug_s(ds, CV_C13SubSectionKind_FileChksms);
+    if (ck.node_count) { return ck.first->string; }
+  }
+  return str8_zero();
+}
+
+// source identity of a function: (checksum of its file, first line). Two ICF fold members
+// with equal keys are the same source text (template twins) -- their locals/labels are
+// identical and the leader's record tree serves both.
+typedef struct
+{
+  B32     valid;
+  U32     line;
+  U8      chksum_kind;
+  String8 chksum;
+} LNK_ICFSrcKey;
+
+internal LNK_ICFSrcKey
+lnk_icf_src_key_from_fn(Arena *scratch, LNK_Obj *obj, U32 fn_sn, String8 chksms)
+{
+  LNK_ICFSrcKey key = {0};
+  U32 child_sn = lnk_icf_debug_s_child_from_section(obj, fn_sn);
+  if (child_sn == 0 || chksms.size == 0) { return key; }
+  LNK_ObjSection sect = lnk_obj_section_from_sect_idx(obj, child_sn-1);
+  String8        raw  = lnk_obj_get_sect_data(obj, child_sn-1, sect.frange);
+  CV_DebugS      ds   = cv_debug_s_from_data(scratch, raw);
+  String8List    lines = cv_sub_section_from_debug_s(ds, CV_C13SubSectionKind_Lines);
+  if (lines.node_count == 0) { return key; }
+  String8 frag = lines.first->string;
+  if (frag.size < sizeof(CV_C13SubSecLinesHeader) + sizeof(CV_C13File) + sizeof(CV_C13Line)) { return key; }
+  CV_C13File *file = (CV_C13File *)(frag.str + sizeof(CV_C13SubSecLinesHeader));
+  CV_C13Line *l0   = (CV_C13Line *)((U8 *)file + sizeof(CV_C13File));
+  if ((U64)file->file_off + sizeof(CV_C13Checksum) > chksms.size) { return key; }
+  CV_C13Checksum *ck = (CV_C13Checksum *)(chksms.str + file->file_off);
+  if ((U64)file->file_off + sizeof(CV_C13Checksum) + ck->len > chksms.size) { return key; }
+  key.valid       = 1;
+  key.line        = (U32)(l0->flags & 0xFFFFFF);
+  key.chksum_kind = ck->kind;
+  key.chksum      = str8(chksms.str + file->file_off + sizeof(CV_C13Checksum), ck->len);
+  return key;
+}
+
+// does the function's record tree have anything a watch window would show?
+internal B32
+lnk_icf_debug_s_has_locals(Arena *scratch, LNK_Obj *obj, U32 child_sn)
+{
+  LNK_ObjSection sect = lnk_obj_section_from_sect_idx(obj, child_sn-1);
+  String8        raw  = lnk_obj_get_sect_data(obj, child_sn-1, sect.frange);
+  CV_DebugS      ds   = cv_debug_s_from_data(scratch, raw);
+  String8List    syms = cv_sub_section_from_debug_s(ds, CV_C13SubSectionKind_Symbols);
+  for EachNode(n, String8Node, syms.first) {
+    String8 s = n->string;
+    for (U64 o = 0; o + 4 <= s.size; ) {
+      U16 len, kind;
+      MemoryCopy(&len,  s.str + o,     sizeof(len));
+      MemoryCopy(&kind, s.str + o + 2, sizeof(kind));
+      if (len < 2) { break; }
+      if (kind == CV_SymKind_LOCAL || kind == CV_SymKind_REGREL32) { return 1; }
+      o += len + 2;
+    }
+  }
+  return 0;
+}
+
 // /OPT:ICF debug aliasing: a folded function's associated .debug$S dead-strips with it, which
 // unbinds source breakpoints on every folded-away body (link.exe keeps the records and binds them
 // to the shared leader address). Emitting the full record tree would cost link.exe's ~+30% module
@@ -5481,15 +5575,56 @@ typedef struct
 internal
 THREAD_POOL_TASK_FUNC(lnk_icf_mark_folded_lines_task)
 {
+  Temp scratch = scratch_begin(&arena, 1);
+
   LNK_ICFMarkFoldedLinesTask *task = raw_task;
   LNK_Obj                    *obj  = task->objs[task_id];
-  if (obj->icf_fold == 0) { return; }
+  if (obj->icf_fold == 0) { scratch_end(scratch); return; }
+
+  String8  follower_chksms      = str8_zero();
+  B32      follower_chksms_init = 0;
+  LNK_Obj *cached_leader        = 0;
+  String8  leader_chksms        = str8_zero();
+
   for EachIndex(sect_idx, obj->header.section_count_no_null) {
     LNK_ICFFold fold = obj->icf_fold[sect_idx];
     if (!fold.set)                                                    { continue; }
     if (~obj->section_flags[sect_idx] & COFF_SectionFlag_LnkRemove)   { continue; } // follower kept live -> its own records emit
     LNK_Obj *leader_obj = task->objs[fold.leader_obj_idx];
     if (leader_obj->section_flags[fold.leader_sn - 1] & COFF_SectionFlag_LnkRemove) { continue; } // whole class dead-stripped
+
+    // Lines-only by default. Escalate to the FULL record tree (link.exe parity for this one
+    // fold) when the follower comes from a DIFFERENT source location than the leader (else the
+    // trees are textually identical -- template twins) AND it has locals to show. Measured on
+    // the FN editor DLL: ~6.5% of folds differ in source, most of those are empty virtuals, so
+    // the escalation set is small.
+    U8 mark = 1;
+    {
+      Temp fold_temp = temp_begin(scratch.arena);
+      U32 child_sn = lnk_icf_debug_s_child_from_section(obj, (U32)(sect_idx + 1));
+      if (child_sn != 0) {
+        // the returned String8s slice the objs' section data (only the parse's list nodes live
+        // on the temp arena), so caching them across fold_temp scopes is safe
+        if (!follower_chksms_init) {
+          follower_chksms      = lnk_icf_obj_file_chksms(fold_temp.arena, obj);
+          follower_chksms_init = 1;
+        }
+        if (leader_obj != cached_leader) {
+          cached_leader = leader_obj;
+          leader_chksms = lnk_icf_obj_file_chksms(fold_temp.arena, leader_obj);
+        }
+        LNK_ICFSrcKey fk = lnk_icf_src_key_from_fn(fold_temp.arena, obj, (U32)(sect_idx + 1), follower_chksms);
+        LNK_ICFSrcKey lk = lnk_icf_src_key_from_fn(fold_temp.arena, leader_obj, fold.leader_sn, leader_chksms);
+        B32 same_src = fk.valid && lk.valid &&
+                       fk.line == lk.line && fk.chksum_kind == lk.chksum_kind &&
+                       str8_match(fk.chksum, lk.chksum, 0);
+        if (fk.valid && lk.valid && !same_src && lnk_icf_debug_s_has_locals(fold_temp.arena, obj, child_sn)) {
+          mark = 2;
+        }
+      }
+      temp_end(fold_temp);
+    }
+
     for EachNode(assoc_n, U32Node, obj->associated_sections[sect_idx + 1]) {
       U32 assoc_sn = assoc_n->data;
       if (assoc_sn == 0 || assoc_sn > obj->header.section_count_no_null)   { continue; }
@@ -5498,9 +5633,11 @@ THREAD_POOL_TASK_FUNC(lnk_icf_mark_folded_lines_task)
       if (obj->icf_lines_only == 0) {
         obj->icf_lines_only = push_array(arena, B8, obj->header.section_count_no_null);
       }
-      obj->icf_lines_only[assoc_sn - 1] = 1;
+      obj->icf_lines_only[assoc_sn - 1] = mark;
     }
   }
+
+  scratch_end(scratch);
 }
 
 internal void
