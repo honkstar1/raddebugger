@@ -12,6 +12,17 @@ typedef struct LNK_SymbolNameCache
   U32 *name_sizes;
 } LNK_SymbolNameCache;
 
+// /OPT:ICF fold record (one per section, indexed by section_number-1), filled at fold-apply.
+// Distinguishes ICF folds from same-name COMDAT selection and /OPT:REF removal (all three end
+// up LnkRemove'd with a redirected symlink, but only ICF folds join DIFFERENT-named sections,
+// which is what the debug-info aliasing below needs to know). set==0 means not ICF-folded.
+typedef struct LNK_ICFFold
+{
+  U32 leader_obj_idx; // input_idx of the leader's obj
+  U32 leader_sn;      // leader section number
+  B8  set;
+} LNK_ICFFold;
+
 typedef struct LNK_Obj
 {
   String8 path;
@@ -31,6 +42,13 @@ typedef struct LNK_Obj
   U32                 *comdats;
   U32Node            **associated_sections;
   LNK_ObjSymbolRef   *symlinks;
+  LNK_ICFFold        *icf_fold;       // /OPT:ICF fold map (per section, sn-1 indexed); 0 if ICF off
+  B8                 *icf_lines_only; // .debug$S sections associated to an ICF-folded function: stay
+                                      // LnkRemove'd, but merge into the module remapped to the leader RVA
+                                      // (sect_idx indexed; 0 array ptr when ICF off / no folds).
+                                      // 1 = C13 Lines only (source breakpoints bind); 2 = full record
+                                      // tree (fold joins a DIFFERENT source location and has locals --
+                                      // watch-window labels come from the right source)
 
   // link
   struct LNK_LibMemberRef *link_member;
