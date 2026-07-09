@@ -393,6 +393,7 @@ internal LNK_LinkResult lnk_link_image (TP_Context *tp, TP_Arena *arena, LNK_Con
 
 internal void lnk_opt_ref(TP_Context *tp, LNK_SymbolTable *symtab, LNK_Config *config, LNK_ObjList objs);
 internal void lnk_opt_icf(TP_Context *tp, Arena *perm, LNK_SymbolTable *symtab, LNK_Config *config, LNK_ObjList objs);
+internal void lnk_icf_mark_folded_lines(TP_Context *tp, TP_Arena *arena, LNK_ObjList objs);
 
 // --- Win32 Image -------------------------------------------------------------
 

@@ -36,6 +36,9 @@ typedef struct LNK_ICFFold
   U32 leader_obj_idx; // input_idx of the leader's obj
   U32 leader_sn;      // leader section number
   B8  set;
+  B8  is_extern;      // external-COMDAT fold (also redirected through the symbol table); recorded
+                      // for debug aliasing only -- /OPT:REF's fold redirects must NOT consult these
+                      // (external follower liveness already routes through the redirected symlink)
 } LNK_ICFFold;
 
 typedef struct LNK_Obj
@@ -58,7 +61,11 @@ typedef struct LNK_Obj
   U32                 *comdats;
   U32Node            **associated_sections;
   LNK_SymbolHashTrie **symlinks;
-  LNK_ICFFold         *icf_fold; // /OPT:ICF static-COMDAT fold map (per section, sn-1 indexed); 0 if ICF off
+  LNK_ICFFold         *icf_fold;       // /OPT:ICF fold map (per section, sn-1 indexed); 0 if ICF off
+  B8                  *icf_lines_only; // .debug$S sections associated to an ICF-folded function: stay
+                                       // LnkRemove'd, but their C13 Lines merge into the module (remapped
+                                       // to the leader RVA) so source breakpoints on folded bodies bind;
+                                       // 0 when ICF off or no folds in this obj (sect_idx indexed)
 
   // link
   struct LNK_LibMemberRef *link_member;

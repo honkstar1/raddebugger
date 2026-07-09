@@ -2557,6 +2557,13 @@ lnk_link_image(TP_Context *tp, TP_Arena *arena, LNK_Config *config, LNK_Inputer 
   }
 
   //
+  // keep line info for ICF-folded functions (bound to the leader RVA) -- see task comment
+  //
+  if (config->opt_icf == LNK_SwitchState_Yes && config->opt_ref == LNK_SwitchState_Yes) {
+    lnk_icf_mark_folded_lines(tp, arena, link->objs);
+  }
+
+  //
   // infer minimal padding size for functions from the target machine
   //
   if (config->machine != COFF_MachineType_Unknown && config->infer_function_pad_min) {
@@ -2865,7 +2872,7 @@ THREAD_POOL_TASK_FUNC(lnk_walk_relocs_and_mark_ref_sections_task)
             LNK_Obj *walk_obj      = ref_symbol.obj;
             U32      seed_sn       = ref_parsed.section_number;
             if (walk_obj->icf_fold && seed_sn != 0 && seed_sn <= walk_obj->header.section_count_no_null &&
-                walk_obj->icf_fold[seed_sn - 1].set) {
+                walk_obj->icf_fold[seed_sn - 1].set && !walk_obj->icf_fold[seed_sn - 1].is_extern) {
               LNK_ICFFold fold = walk_obj->icf_fold[seed_sn - 1];
               walk_obj = objs_by_idx[fold.leader_obj_idx];
               seed_sn  = fold.leader_sn;
@@ -2914,7 +2921,7 @@ THREAD_POOL_TASK_FUNC(lnk_walk_relocs_and_mark_ref_sections_task)
                 // the follower and mark its LEADER live (cross-obj), so the follower dead-strips while
                 // its address still resolves to the identical leader.
                 if (walk_obj->icf_fold && assoc_sn >= 1 && assoc_sn <= walk_obj->header.section_count_no_null &&
-                    walk_obj->icf_fold[assoc_sn - 1].set) {
+                    walk_obj->icf_fold[assoc_sn - 1].set && !walk_obj->icf_fold[assoc_sn - 1].is_extern) {
                   LNK_ICFFold afold      = walk_obj->icf_fold[assoc_sn - 1];
                   LNK_Obj    *leader_obj = objs_by_idx[afold.leader_obj_idx];
                   U32         leader_sn  = afold.leader_sn;
@@ -5419,7 +5426,15 @@ lnk_opt_icf(TP_Context *tp, Arena *perm, LNK_SymbolTable *symtab, LNK_Config *co
       void *fp = fold_ptr[k];
       if (((U64)fp & 1) == 0) {
         LNK_SymbolHashTrie *Fnode = (LNK_SymbolHashTrie *)fp;
-        if (Lnode && Fnode != Lnode) { Fnode->symbol = Lnode->symbol; fold_count += 1; }
+        if (Lnode && Fnode != Lnode) {
+          Fnode->symbol = Lnode->symbol;
+          // record the fold in the per-section map too (is_extern: excluded from /OPT:REF's
+          // redirects). Debug aliasing consumes it: the follower's sect_map entry redirects to
+          // the leader contrib so the folded name's public + line info bind at the leader RVA.
+          LNK_ICFCand *F = &cands[sci[k]];
+          F->obj->icf_fold[F->sn - 1] = (LNK_ICFFold){ .leader_obj_idx = group_leader_ii[gi], .leader_sn = group_leader_sn[gi], .set = 1, .is_extern = 1 };
+          fold_count += 1;
+        }
       } else {
         LNK_ICFFold *slot = (LNK_ICFFold *)((U64)fp & ~(U64)1);
         slot->leader_obj_idx = group_leader_ii[gi];
@@ -5448,6 +5463,53 @@ lnk_opt_ref(TP_Context *tp, LNK_SymbolTable *symtab, LNK_Config *config, LNK_Obj
                     tp->worker_count,
                     lnk_walk_relocs_and_mark_ref_sections_task,
                     &(LNK_OptRefTask){ .symtab = symtab, .config = config, .objs = objs });
+}
+
+typedef struct
+{
+  LNK_Obj **objs; // indexed by input_idx (== task_id)
+} LNK_ICFMarkFoldedLinesTask;
+
+// /OPT:ICF debug aliasing: a folded function's associated .debug$S dead-strips with it, which
+// unbinds source breakpoints on every folded-away body (link.exe keeps the records and binds them
+// to the shared leader address). Emitting the full record tree would cost link.exe's ~+30% module
+// bytes; the C13 Lines subsections are ~1% and are all a breakpoint needs to bind. Mark each dead
+// follower's associated .debug$S: it stays LnkRemove'd (no image bytes, no symbol records), but the
+// reloc patcher still patches it and the C13 pass merges ONLY its Lines -- their SECREL/SECTION
+// relocs target the folded function symbol, which resolves to the leader RVA through the redirected
+// sect_map, so the lines land on the surviving body.
+internal
+THREAD_POOL_TASK_FUNC(lnk_icf_mark_folded_lines_task)
+{
+  LNK_ICFMarkFoldedLinesTask *task = raw_task;
+  LNK_Obj                    *obj  = task->objs[task_id];
+  if (obj->icf_fold == 0) { return; }
+  for EachIndex(sect_idx, obj->header.section_count_no_null) {
+    LNK_ICFFold fold = obj->icf_fold[sect_idx];
+    if (!fold.set)                                                    { continue; }
+    if (~obj->section_flags[sect_idx] & COFF_SectionFlag_LnkRemove)   { continue; } // follower kept live -> its own records emit
+    LNK_Obj *leader_obj = task->objs[fold.leader_obj_idx];
+    if (leader_obj->section_flags[fold.leader_sn - 1] & COFF_SectionFlag_LnkRemove) { continue; } // whole class dead-stripped
+    for EachNode(assoc_n, U32Node, obj->associated_sections[sect_idx + 1]) {
+      U32 assoc_sn = assoc_n->data;
+      if (assoc_sn == 0 || assoc_sn > obj->header.section_count_no_null)   { continue; }
+      if (~obj->section_flags[assoc_sn - 1] & LNK_SECTION_FLAG_DEBUG)      { continue; }
+      if (~obj->section_flags[assoc_sn - 1] & COFF_SectionFlag_LnkRemove)  { continue; }
+      if (obj->icf_lines_only == 0) {
+        obj->icf_lines_only = push_array(arena, B8, obj->header.section_count_no_null);
+      }
+      obj->icf_lines_only[assoc_sn - 1] = 1;
+    }
+  }
+}
+
+internal void
+lnk_icf_mark_folded_lines(TP_Context *tp, TP_Arena *arena, LNK_ObjList objs)
+{
+  ProfBeginFunction();
+  LNK_ICFMarkFoldedLinesTask task = { .objs = lnk_array_from_obj_list(arena->v[0], objs) };
+  tp_for_parallel(tp, arena, objs.count, lnk_icf_mark_folded_lines_task, &task); // arena: per-obj icf_lines_only bitmaps
+  ProfEnd();
 }
 
 internal
@@ -5588,6 +5650,10 @@ THREAD_POOL_TASK_FUNC(lnk_set_icf_static_leader_contribs_task)
   for EachIndex(sect_idx, obj->header.section_count_no_null) {
     LNK_ICFFold fold = obj->icf_fold[sect_idx];
     if (!fold.set) { continue; }
+    // external folds: redirect only when the follower section actually dead-stripped (an
+    // externally-folded section can stay live through a residual static-symbol reference;
+    // its own contrib is then the correct target)
+    if (fold.is_extern && (~obj->section_flags[sect_idx] & COFF_SectionFlag_LnkRemove)) { continue; }
     LNK_SectionContrib *leader_sc = task->sect_map[fold.leader_obj_idx][fold.leader_sn - 1];
     task->sect_map[obj_idx][sect_idx] = leader_sc;
   }
@@ -6027,7 +6093,11 @@ THREAD_POOL_TASK_FUNC(lnk_obj_reloc_patcher)
     COFF_SectionFlags   section_flags  = obj->section_flags[sect_idx];
 
     if (section_flags & COFF_SectionFlag_LnkInfo)              { continue; }
-    if (section_flags & COFF_SectionFlag_LnkRemove)            { continue; }
+    if (section_flags & COFF_SectionFlag_LnkRemove) {
+      // exception: ICF-folded functions' .debug$S stays dead but its Lines are merged into the
+      // module bound to the leader RVA -- patch it so those Lines carry real addresses
+      if (!(obj->icf_lines_only && obj->icf_lines_only[sect_idx])) { continue; }
+    }
     if (section_flags & COFF_SectionFlag_CntUninitializedData) { continue; }
 
     COFF_RelocArray relocs = lnk_coff_relocs_from_section_header(obj, section_header);
