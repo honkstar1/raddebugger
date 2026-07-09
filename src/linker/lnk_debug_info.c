@@ -206,6 +206,26 @@ THREAD_POOL_TASK_FUNC(lnk_parse_debug_s_task)
       lnk_error_obj(LNK_Warning_IllData, task->obj_arr[obj_idx], ".debug$S has %u file checksum sub-sections defined, picking first sub-section", checksum_data_list.node_count);
     }
   }
+
+  // ICF-folded functions' associated .debug$S (dead-stripped, excluded from the list above):
+  // merge ONLY their Lines subsections. The reloc patcher patched them to the fold leader's RVA,
+  // so source breakpoints on folded bodies bind; symbol records stay dropped (that is the bulk
+  // of link.exe's size cost for the same feature). File ids in these Lines index the obj-wide
+  // FILECHKSMS merged above, so they stay consistent within this module.
+  {
+    LNK_Obj *obj = task->obj_arr[obj_idx];
+    if (obj->icf_lines_only != 0) {
+      for EachIndex(sect_idx, obj->header.section_count_no_null) {
+        if (!obj->icf_lines_only[sect_idx]) { continue; }
+        LNK_ObjSection section  = lnk_obj_section_from_sect_idx(obj, sect_idx);
+        String8        raw_data = lnk_obj_get_sect_data(obj, sect_idx, section.frange);
+        CV_DebugS      ds       = cv_debug_s_from_data(arena, raw_data);
+        String8List    lines    = cv_sub_section_from_debug_s(ds, CV_C13SubSectionKind_Lines);
+        String8List   *dst      = cv_sub_section_ptr_from_debug_s(debug_s, CV_C13SubSectionKind_Lines);
+        str8_list_concat_in_place(dst, &lines);
+      }
+    }
+  }
 }
 
 internal
@@ -4224,6 +4244,8 @@ THREAD_POOL_TASK_FUNC(lnk_move_global_symbols_to_gsi)
       LNK_SymbolHashTrieChunkList symbol_chunks       = task->symtab->chunks[lane];
       U64                         public_symbol_size  = 0;
       U64                         public_symbol_count = 0;
+      String8                     prev_name           = str8_zero();
+      ISectOff                    prev_sc             = {0};
       for EachNode(chunk, LNK_SymbolHashTrieChunk, symbol_chunks.first) {
         for EachIndex(i, chunk->count) {
           LNK_Symbol        *symbol        = chunk->v[i].symbol;
@@ -4234,7 +4256,21 @@ THREAD_POOL_TASK_FUNC(lnk_move_global_symbols_to_gsi)
           COFF_SymbolValueInterpType symbol_interp = coff_interp_from_parsed_symbol(symbol_parsed);
           if (symbol_interp != COFF_SymbolValueInterp_Regular) { continue; }
 
-          public_symbol_size  += AlignPow2(sizeof(CV_SymPub32) + symbol->name.size + 1, sizeof(void *));
+          // publish under the trie NODE's name, not the resolved symbol's: an /OPT:ICF-folded
+          // external's node points at the fold leader's symbol while node->name keeps the folded
+          // name -- emitting symbol->name printed the leader's name once per follower (~1.4M
+          // byte-identical duplicate publics / 213 MB on a UE editor DLL), and the folded names
+          // were absent entirely (name breakpoints on them could not bind). With the node name,
+          // each follower emits an alias public at the leader's address, like link.exe.
+          String8 pub_name = chunk->v[i].name ? *chunk->v[i].name : symbol->name;
+
+          // drop residual byte-identical duplicates (chunk-order adjacent)
+          ISectOff sc = lnk_sc_from_symbol(symbol);
+          if (sc.isect == prev_sc.isect && sc.off == prev_sc.off && str8_match(prev_name, pub_name, 0)) { continue; }
+          prev_name = pub_name;
+          prev_sc   = sc;
+
+          public_symbol_size  += AlignPow2(sizeof(CV_SymPub32) + pub_name.size + 1, sizeof(void *));
           public_symbol_count += 1;
           public_symbol_node_counts[lane] += 1;
         }
@@ -4266,6 +4302,8 @@ THREAD_POOL_TASK_FUNC(lnk_move_global_symbols_to_gsi)
       Arena                      *public_symbol_arena      = public_symbol_arenas     [lane];
       Arena                      *public_symbol_node_arena = public_symbol_node_arenas[lane];
       CV_SymbolList              *public_symbol_list       = &public_symbols          [lane];
+      String8  prev_name = str8_zero();
+      ISectOff prev_sc   = {0};
       for EachNode(chunk, LNK_SymbolHashTrieChunk, symbol_chunks.first) {
         for EachIndex(i, chunk->count) {
           LNK_Symbol        *symbol        = chunk->v[i].symbol;
@@ -4277,9 +4315,15 @@ THREAD_POOL_TASK_FUNC(lnk_move_global_symbols_to_gsi)
           COFF_SymbolValueInterpType symbol_interp = coff_interp_from_parsed_symbol(symbol_parsed);
           if (symbol_interp != COFF_SymbolValueInterp_Regular) { continue; }
 
+          // node name + dedup (must mirror the count pass above)
+          String8  pub_name = chunk->v[i].name ? *chunk->v[i].name : symbol->name;
+          ISectOff sc       = lnk_sc_from_symbol(symbol);
+          if (sc.isect == prev_sc.isect && sc.off == prev_sc.off && str8_match(prev_name, pub_name, 0)) { continue; }
+          prev_name = pub_name;
+          prev_sc   = sc;
+
           CV_Pub32Flags flags      = COFF_SymbolType_IsFunc(symbol_parsed.type) ? CV_Pub32Flag_Function : 0;
-          ISectOff      sc         = lnk_sc_from_symbol(symbol);
-          CV_Symbol     pub_symbol = cv_make_pub32(public_symbol_arena, flags, safe_cast_u32(sc.off), safe_cast_u16(sc.isect), symbol->name);
+          CV_Symbol     pub_symbol = cv_make_pub32(public_symbol_arena, flags, safe_cast_u32(sc.off), safe_cast_u16(sc.isect), pub_name);
           cv_symbol_list_push(public_symbol_node_arena, public_symbol_list, pub_symbol);
         }
       }
