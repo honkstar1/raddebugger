@@ -2120,6 +2120,22 @@ lnk_link_inputs(TP_Context      *tp,
 }
 
 
+// Find a section's COMDAT-associative .debug$S child (per-function debug payload). Used by the
+// unresolved-symbol reporter to map a reloc through the function's OWN line table.
+internal U32
+lnk_icf_debug_s_child_from_section(LNK_Obj *obj, U32 fn_sn)
+{
+  String8             string_table  = lnk_coff_string_table_from_obj(obj);
+  COFF_SectionHeader *section_table = lnk_coff_section_table_from_obj(obj);
+  for EachNode(assoc_n, U32Node, obj->associated_sections[fn_sn]) {
+    U32 sn = assoc_n->data;
+    if (sn == 0 || sn > obj->header.section_count_no_null)     { continue; }
+    if (~obj->section_flags[sn-1] & LNK_SECTION_FLAG_DEBUG)    { continue; }
+    if (str8_match(coff_name_from_section_header(string_table, &section_table[sn-1]), str8_lit(".debug$S"), 0)) { return sn; }
+  }
+  return 0;
+}
+
 internal LNK_LinkResult
 lnk_link_image(TP_Context *tp, TP_Arena *arena, LNK_Config *config, LNK_Inputer *inputer, LNK_SymbolTable *symtab)
 {
@@ -2495,6 +2511,15 @@ lnk_link_image(TP_Context *tp, TP_Arena *arena, LNK_Config *config, LNK_Inputer 
               String8             section_name   = coff_name_from_section_header(string_table, section_header);
               U64                 section_number = sect_idx+1;
               COFF_RelocArray     relocs         = lnk_coff_relocs_from_section_header(obj, section_header);
+
+              // per-function COMDAT sections must use ONLY their associated .debug$S for line
+              // mapping: nothing is relocated at this point, so every fragment's LINES header
+              // still reads sec_off 0 -- an obj-wide accel would match apply_off against
+              // unrelated functions' rows and report arbitrary files/lines
+              CV_LineArray *section_line_arrays      = 0;
+              U64           section_line_array_count = 0;
+              B32           section_lines_init       = 0;
+
               for EachIndex(reloc_idx, relocs.count) {
                 if (supp_info.node_count > config->unresolved_symbol_ref_limit) {
                   str8_list_pushf(scratch.arena, &supp_info, "too many unresolved symbol references reported, stopping now");
@@ -2514,21 +2539,86 @@ lnk_link_image(TP_Context *tp, TP_Arena *arena, LNK_Config *config, LNK_Inputer 
                       debug_checksums = str8_list_first(&raw_checksums);
                       debug_strings   = str8_list_first(&raw_strings);
                     }
-                    line_matches_count = 0;
-                    line_matches      = cv_line_from_voff(debug_lines, reloc->apply_off, &line_matches_count);
+                    if (!section_lines_init) {
+                      section_lines_init = 1;
+                      U32 child_sn = lnk_icf_debug_s_child_from_section(obj, (U32)section_number);
+                      if (child_sn) {
+                        LNK_ObjSection child_sect = lnk_obj_section_from_sect_idx(obj, child_sn-1);
+                        String8        child_raw  = lnk_obj_get_sect_data(obj, child_sn-1, child_sect.frange);
+                        CV_DebugS      child_ds   = cv_debug_s_from_data(debug_temp.arena, child_raw);
+                        String8List    frags      = cv_sub_section_from_debug_s(child_ds, CV_C13SubSectionKind_Lines);
+                        for EachNode(fn, String8Node, frags.first) {
+                          CV_C13LinesHeaderList hl = cv_c13_lines_from_sub_sections(debug_temp.arena, fn->string, rng_1u64(0, fn->string.size));
+                          section_line_array_count += hl.count;
+                        }
+                        section_line_arrays = push_array_no_zero(debug_temp.arena, CV_LineArray, section_line_array_count ? section_line_array_count : 1);
+                        U64 la_idx = 0;
+                        for EachNode(fn, String8Node, frags.first) {
+                          CV_C13LinesHeaderList hl = cv_c13_lines_from_sub_sections(debug_temp.arena, fn->string, rng_1u64(0, fn->string.size));
+                          for EachNode(hn, CV_C13LinesHeaderNode, hl.first) {
+                            section_line_arrays[la_idx++] = cv_c13_line_array_from_data(debug_temp.arena, fn->string, 0, hn->v);
+                          }
+                        }
+                      }
+                    }
                   }
 
-                  if (line_matches) {
-                    for EachIndex(i, line_matches_count) {
-                      CV_Line        line      = line_matches[i];
-                      CV_C13Checksum checksum  = {0};
-                      String8        file_name = {0};
-                      str8_deserial_read_struct(debug_checksums, line.file_off, &checksum);
-                      str8_deserial_read_cstr(debug_strings, checksum.name_off, &file_name);
-                      str8_list_pushf(scratch.arena, &supp_info, "%S: %S:%u", lnk_loc_from_obj(debug_temp.arena, obj), file_name, line.line_num);
+                  // preceding-row lookup in the function's own line table: the reloc sits on the
+                  // last source line at-or-before its offset. (cv_line_from_voff is next-row
+                  // biased and excludes the final row's span -- unusable for this question.)
+                  U64 printed = 0;
+                  for EachIndex(la_idx, section_line_array_count) {
+                    CV_LineArray *la = &section_line_arrays[la_idx];
+                    if (la->line_count == 0)                    { continue; }
+                    if (reloc->apply_off <  la->voffs[0])       { continue; }
+                    if (reloc->apply_off >= la->voffs[la->line_count]) { continue; }
+                    U64 row = 0;
+                    for (U64 r = 0; r < la->line_count; r += 1) {
+                      if (la->voffs[r] <= reloc->apply_off) { row = r; } else { break; }
                     }
-                  } else {
-                    str8_list_pushf(scratch.arena, &supp_info, "%S: %S(%llx)+%x", lnk_loc_from_obj(debug_temp.arena, obj), section_name, section_number, reloc->apply_off);
+                    if (la->line_nums[row] == 0) { continue; } // compiler marker rows
+                    CV_C13Checksum checksum  = {0};
+                    String8        file_name = {0};
+                    str8_deserial_read_struct(debug_checksums, la->file_off, &checksum);
+                    str8_deserial_read_cstr(debug_strings, checksum.name_off, &file_name);
+                    String8 loc = push_str8f(scratch.arena, "%S: %S:%u", lnk_loc_from_obj(debug_temp.arena, obj), file_name, la->line_nums[row]);
+                    if (supp_info.last == 0 || !str8_match(supp_info.last->string, loc, 0)) { // collapse duplicate refs to one location
+                      str8_list_push(scratch.arena, &supp_info, loc);
+                    }
+                    printed += 1;
+                  }
+
+                  // no per-function fragment covers the reloc (non-COMDAT section, or no line
+                  // info): fall back to the obj-wide accel, else print section+offset
+                  if (printed == 0) {
+                    line_matches_count = 0;
+                    line_matches       = debug_lines ? cv_line_from_voff(debug_lines, reloc->apply_off, &line_matches_count) : 0;
+                    if (section_line_array_count == 0 && line_matches) {
+                      for EachIndex(i, line_matches_count) {
+                        CV_Line line = line_matches[i];
+                        if (line.line_num == 0) { continue; }
+                        CV_C13Checksum checksum  = {0};
+                        String8        file_name = {0};
+                        str8_deserial_read_struct(debug_checksums, line.file_off, &checksum);
+                        str8_deserial_read_cstr(debug_strings, checksum.name_off, &file_name);
+                        String8 loc = push_str8f(scratch.arena, "%S: %S:%u", lnk_loc_from_obj(debug_temp.arena, obj), file_name, line.line_num);
+                        if (supp_info.last == 0 || !str8_match(supp_info.last->string, loc, 0)) {
+                          str8_list_push(scratch.arena, &supp_info, loc);
+                        }
+                        printed += 1;
+                      }
+                    }
+                  }
+                  if (printed == 0) {
+                    // no line info (vftables, RTTI, data): name the section's COMDAT symbol when
+                    // there is one -- "referenced from ??_7Foo@@6B@" beats a raw section number
+                    LNK_ObjSymbolRef sect_symlink = {0};
+                    if (lnk_obj_get_comdat_symlink(obj, (U32)section_number, &sect_symlink)) {
+                      COFF_ParsedSymbol sect_leader = lnk_parsed_symbol_from_coff_symbol_idx(sect_symlink.obj, sect_symlink.symbol_idx);
+                      str8_list_pushf(scratch.arena, &supp_info, "%S: %S+%x", lnk_loc_from_obj(debug_temp.arena, obj), sect_leader.name, reloc->apply_off);
+                    } else {
+                      str8_list_pushf(scratch.arena, &supp_info, "%S: %S(%llx)+%x", lnk_loc_from_obj(debug_temp.arena, obj), section_name, section_number, reloc->apply_off);
+                    }
                   }
                 }
               }
