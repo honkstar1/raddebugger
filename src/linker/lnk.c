@@ -2578,7 +2578,14 @@ lnk_link_image(TP_Context *tp, TP_Arena *arena, LNK_Config *config, LNK_Inputer 
                     }
                   }
                   if (printed == 0) {
-                    str8_list_pushf(scratch.arena, &supp_info, "%S: %S(%llx)+%x", lnk_loc_from_obj(debug_temp.arena, obj), section_name, section_number, reloc->apply_off);
+                    // no line info (vftables, RTTI, data): name the section's COMDAT symbol when
+                    // there is one -- "referenced from ??_7Foo@@6B@" beats a raw section number
+                    LNK_Symbol *sect_symlink = lnk_obj_get_comdat_symlink(obj, section_number);
+                    if (sect_symlink) {
+                      str8_list_pushf(scratch.arena, &supp_info, "%S: %S+%x", lnk_loc_from_obj(debug_temp.arena, obj), sect_symlink->name, reloc->apply_off);
+                    } else {
+                      str8_list_pushf(scratch.arena, &supp_info, "%S: %S(%llx)+%x", lnk_loc_from_obj(debug_temp.arena, obj), section_name, section_number, reloc->apply_off);
+                    }
                   }
                 }
               }
