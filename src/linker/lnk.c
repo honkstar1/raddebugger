@@ -3364,7 +3364,15 @@ typedef struct LNK_ICFRelocKeyEntry
   U16 type;      // COFF_RelocType
   U16 iscand;    // 1 = target is an ICF candidate (identity refined via colors, NOT keyed here)
   U32 apply_off;
-  U64 target;    // canonical non-candidate target id; 0 when iscand
+  U64 target;    // canonical non-candidate target id; for iscand relocs the target OFFSET
+                 // (resolved symbol value). Candidate IDENTITY refines via colors, but the
+                 // interior offset must be keyed: switch jump tables reference case blocks
+                 // through section-local labels ($LN..., value = case offset) with zero inline
+                 // addend, so two byte-identical functions whose tables map cases to DIFFERENT
+                 // blocks differ ONLY in these values. Dropping them folds functions with
+                 // different dispatch (observed: UE GetVertexFactoryParametersLayout<VFa/VFb>
+                 // under /OPT:ICFSTATIC -- folded getter returned null layouts for frequencies
+                 // the follower's vertex factory registered).
 } LNK_ICFRelocKeyEntry;
 StaticAssert(sizeof(LNK_ICFRelocKeyEntry) == 16, lnk_icf_reloc_key_entry_size);
 
@@ -3450,7 +3458,7 @@ lnk_icf_key_reloc(LNK_ICFHashTask *task, LNK_ICFCand *c, U32 *kids, U64 kid_coun
   e.type      = reloc->type;
   e.iscand    = iscand;
   e.apply_off = reloc->apply_off;
-  e.target    = iscand ? 0 : target;
+  e.target    = iscand ? tp.value : target;
   XXH3_128bits_update(h, &e, sizeof(e));
 }
 
@@ -4480,13 +4488,14 @@ lnk_icf_dense_colors(TP_Context *tp, Arena *arena, U64 n, U64 *keys, U32 *colors
 // the symlink/icf_fold writes stay serial+deterministic (cross-class symlink chains must not race).
 typedef struct LNK_ICFFoldVerifyTask
 {
-  Rng1U64     *ranges;      // group-index ranges per worker
-  U32         *group_first;
-  U32         *sci;
-  LNK_ICFCand *cands;
-  U8          *rt_iscand;
-  U64         *rt_target;
-  U32         *colors;
+  Rng1U64         *ranges;      // group-index ranges per worker
+  U32             *group_first;
+  U32             *sci;
+  LNK_ICFCand     *cands;
+  U8              *rt_iscand;
+  U64             *rt_target;
+  U32             *colors;
+  LNK_SymbolTable *symtab;      // for re-resolving reloc target offsets (tp.value) in the shape check
   U32         *leader_sci;  // out: per sorted position -> leader's sci index, or max_U32
   U32         *group_leader_oi; // out: per group -> elected leader sorted-position (for apply)
 
@@ -4508,6 +4517,53 @@ typedef struct LNK_ICFFoldVerifyTask
 } LNK_ICFFoldVerifyTask;
 
 internal
+// Resolved target offset of one reloc, mirroring lnk_icf_key_reloc's resolution: parse the target
+// symbol, chase Undefined/Weak through the symbol table, return its value. This is the interior
+// offset keyed into LNK_ICFRelocKeyEntry.target for candidate-target relocs.
+internal U64
+lnk_icf_reloc_resolved_value(LNK_SymbolTable *symtab, LNK_Obj *obj, COFF_Reloc *reloc)
+{
+  COFF_ParsedSymbol          tp = lnk_parsed_symbol_from_coff_symbol_idx_no_name(obj, reloc->isymbol);
+  COFF_SymbolValueInterpType ti = coff_interp_from_parsed_symbol(tp);
+  if (ti == COFF_SymbolValueInterp_Undefined || ti == COFF_SymbolValueInterp_Weak) {
+    LNK_ObjSymbolRef resolved = {0};
+    if (lnk_resolve_symbol(symtab, (LNK_ObjSymbolRef){ obj, reloc->isymbol }, &resolved)) {
+      tp = lnk_parsed_symbol_from_coff_symbol_idx_no_name(resolved.obj, resolved.symbol_idx);
+    }
+  }
+  return tp.value;
+}
+
+// Lockstep reloc-shape compare for fold-verify: type, apply_off, and resolved target offset must
+// match pairwise. key0 hashes all three (LNK_ICFRelocKeyEntry), so same-class candidates normally
+// agree -- this is the hash-collision guard, the reloc-side counterpart of the byte compare. The
+// caller class-compares target IDENTITY via the rt slice; the offset matters independently: switch
+// jump tables reference case blocks via section-local labels (value = case offset, zero inline
+// addend), so byte-identical functions with different case dispatch differ ONLY here. Walk order
+// mirrors lnk_icf_hash_task (own relocs, then associative children in gather order); the caller
+// has already matched per-section reloc counts.
+internal B32
+lnk_icf_fold_verify_reloc_shape_match(LNK_SymbolTable *symtab,
+                                      LNK_ICFCand *L, U32 *Lkids, U64 Lkid_count,
+                                      LNK_ICFCand *F, U32 *Fkids, U64 Fkid_count)
+{
+  U32 lsn = L->sn, fsn = F->sn;
+  for (U64 si = 0; si <= Lkid_count; si += 1) {
+    if (si > 0) { lsn = Lkids[si - 1]; fsn = Fkids[si - 1]; }
+    COFF_SectionHeader *lh = lnk_coff_section_header_from_section_number(L->obj, lsn);
+    COFF_SectionHeader *fh = lnk_coff_section_header_from_section_number(F->obj, fsn);
+    COFF_RelocArray     lr = lnk_coff_relocs_from_section_header(L->obj, lh);
+    COFF_RelocArray     fr = lnk_coff_relocs_from_section_header(F->obj, fh);
+    if (lr.count != fr.count) { return 0; }
+    for EachIndex(ri, lr.count) {
+      COFF_Reloc *a = &lr.v[ri], *b = &fr.v[ri];
+      if (a->type != b->type || a->apply_off != b->apply_off) { return 0; }
+      if (lnk_icf_reloc_resolved_value(symtab, L->obj, a) != lnk_icf_reloc_resolved_value(symtab, F->obj, b)) { return 0; }
+    }
+  }
+  return 1;
+}
+
 THREAD_POOL_TASK_FUNC(lnk_icf_fold_verify_task)
 {
   LNK_ICFFoldVerifyTask *task = raw_task;
@@ -4574,6 +4630,7 @@ THREAD_POOL_TASK_FUNC(lnk_icf_fold_verify_task)
         if (lt != ft) { relocs_match = 0; break; }
       }
       if (!relocs_match) { continue; }
+      if (!lnk_icf_fold_verify_reloc_shape_match(task->symtab, L, Lkids, Lkid_count, F, Fkids, Fkid_count)) { continue; }
       task->leader_sci[k] = task->sci[leader_oi]; // verified fold
       LNK_SymbolHashTrie *Fnode = F->obj->symlinks[F->sn];
       task->fold_ptr[k] = Fnode ? (void *)Fnode : (void *)((U64)&F->obj->icf_fold[F->sn - 1] | 1);
@@ -5474,6 +5531,7 @@ lnk_opt_icf(TP_Context *tp, Arena *perm, LNK_SymbolTable *symtab, LNK_Config *co
     vt.rt_iscand       = rt_iscand;
     vt.rt_target       = rt_target;
     vt.colors          = colors;
+    vt.symtab          = symtab;
     vt.leader_sci      = leader_sci;
     vt.group_leader_oi = group_leader_oi;
     vt.group_lnode     = group_lnode;
