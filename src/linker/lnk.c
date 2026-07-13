@@ -112,6 +112,7 @@
 #include "lnk_debug_helper.h"
 #include "lnk_obj.h"
 #include "lnk_lib.h"
+#include "codeview_ext/ifc.h"
 #include "lnk_debug_info.h"
 #include "lnk.h"
 
@@ -126,6 +127,7 @@
 #include "lnk_obj.c"
 #include "lnk_debug_helper.c"
 #include "lnk_lib.c"
+#include "codeview_ext/ifc.c"
 #include "lnk_debug_info.c"
 
 // -----------------------------------------------------------------------------
