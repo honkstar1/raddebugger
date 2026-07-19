@@ -43,6 +43,8 @@ typedef struct LNK_Obj
   U32Node            **associated_sections;
   LNK_ObjSymbolRef   *symlinks;
   LNK_ICFFold        *icf_fold;       // /OPT:ICF fold map (per section, sn-1 indexed); 0 if ICF off
+  String8             icf_file_chksms;      // memoized obj-wide FILECHKSMS slice (see lnk_icf_obj_file_chksms);
+  B32                 icf_file_chksms_init; // idempotent racy fill, flag published last
   B8                 *icf_lines_only; // .debug$S sections associated to an ICF-folded function: stay
                                       // LnkRemove'd, but merge into the module remapped to the leader RVA
                                       // (sect_idx indexed; 0 array ptr when ICF off / no folds).

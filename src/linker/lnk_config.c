@@ -84,6 +84,7 @@ global read_only LNK_CmdSwitch g_cmd_switch_map[] =
   { LNK_CmdSwitch_Rad_EnvLib,                       0, "RAD_ENV_LIB",                          "[:NO]",     "Collect libraries from %%LIB%% and %%LIBPATH%% varibles."                         },
   { LNK_CmdSwitch_Rad_Exe,                          0, "RAD_EXE",                              "[:NO]",     "Set EXE bit in the image header."                                                 },
   { LNK_CmdSwitch_Rad_Guid,                         0, "RAD_GUID",                             ":{IMAGEBLAKE3|XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXXXXXX}", "The image guid that is embeded in the debug info." },
+  { LNK_CmdSwitch_Rad_IcfHashAlg,                   0, "RAD_ICF_HASH_ALG",                     ":{BLAKE3|XXH3}", "Sets hashing algorithm for /OPT:ICF refinement round keys. Default BLAKE3."  },
   { LNK_CmdSwitch_Rad_LargePages,                   0, "RAD_LARGE_PAGES",                      "[:NO]",     "Disabled by default on Windows."                                                  },
   { LNK_CmdSwitch_Rad_LinkVer,                      0, "RAD_LINK_VER",                         ":##,##",    "Linker version."                                                                  },
   { LNK_CmdSwitch_Rad_Log,                          0, "RAD_LOG",                              ":{ALL,INPUT_OBJ,INPUT_LIB,IO,LINK_STATS,TIMERS}", "Loggers."                                   },
@@ -2344,6 +2345,19 @@ lnk_apply_cmd_option_to_config(LNK_Config *config, String8 cmd_name, String8List
 
   case LNK_CmdSwitch_Rad_TimeStamp: {
     lnk_cmd_switch_parse_u32(obj, cmd_switch, value_strings, &config->time_stamp, 0);
+  } break;
+
+  case LNK_CmdSwitch_Rad_IcfHashAlg: {
+    String8 alg = {0};
+    if (lnk_cmd_switch_parse_string(obj, cmd_switch, value_strings, &alg)) {
+      if (str8_match(alg, str8_lit("BLAKE3"), StringMatchFlag_CaseInsensitive)) {
+        config->icf_hash_xxh3 = 0;
+      } else if (str8_match(alg, str8_lit("XXH3"), StringMatchFlag_CaseInsensitive)) {
+        config->icf_hash_xxh3 = 1;
+      } else {
+        lnk_error_cmd_switch(LNK_Error_Cmdl, obj, cmd_switch, "unknown hash alg: %S", alg);
+      }
+    }
   } break;
 
   case LNK_CmdSwitch_Rad_DebugTypeHash: {

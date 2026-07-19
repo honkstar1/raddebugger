@@ -115,6 +115,7 @@ typedef enum
   LNK_CmdSwitch_Rad_Exe,
   LNK_CmdSwitch_Rad_Guid,
   LNK_CmdSwitch_Rad_Ignore,
+  LNK_CmdSwitch_Rad_IcfHashAlg,
   LNK_CmdSwitch_Rad_ImageAltPath,
   LNK_CmdSwitch_Rad_LargePages,
   LNK_CmdSwitch_Rad_LinkVer, 
@@ -316,6 +317,7 @@ typedef struct LNK_Config
   B32                         ghash;
   LNK_SwitchState             opt_ref;
   LNK_SwitchState             opt_icf;
+  B32                         icf_hash_xxh3; // /RAD_ICF_HASH_ALG:XXH3 -- XXH3-128 refinement round keys instead of blake3
   LNK_SwitchState             opt_lbr;
   LNK_SwitchState             opt_gc_types; // /OPT:GCTYPES -- prune unreferenced CodeView types. Default OFF: shrinks PDB but a pruned type can't be cast-to in the debugger watch window.
   U64                         opt_iter_count;

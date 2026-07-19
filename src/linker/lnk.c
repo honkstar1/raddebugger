@@ -3517,6 +3517,10 @@ THREAD_POOL_TASK_FUNC(lnk_opt_icf_task)
   U64      *split_offsets      = 0;
   U32      *is_part_stable     = 0;
   U64      *next_color         = 0;
+  U64      *last_split_rng     = 0; // (lo, hi]: colors allocated by the PREVIOUS round's splits.
+                                    // next_color is monotone and a split's retained subgroup keeps its
+                                    // exact old color value, so a target's color changed last round
+                                    // IFF it lies in this window -- the whole dirty test is one read.
   if (task_id == 0) {
     ProfBegin("Init");
 
@@ -3540,6 +3544,7 @@ THREAD_POOL_TASK_FUNC(lnk_opt_icf_task)
     split_offsets   = push_array(scratch.arena, U64, tp->worker_count + 1);
     is_part_stable  = push_array(scratch.arena, U32, 1);
     next_color      = push_array(scratch.arena, U64, 1);
+    last_split_rng  = push_array(scratch.arena, U64, 2);
     *next_color     = LNK_ICF_ColorSpace_COUNT + noncontrib_count;
 
     lnk_log(LNK_Log_Debug, "  Contrib count: %S", str8_from_count(scratch.arena, contrib_count));
@@ -3555,6 +3560,7 @@ THREAD_POOL_TASK_FUNC(lnk_opt_icf_task)
   tp_broadcast(&split_offsets);
   tp_broadcast(&is_part_stable);
   tp_broadcast(&next_color);
+  tp_broadcast(&last_split_rng);
 
   ProfBegin("Compute Hashes");
   HashMap reloc_target_hm = {0}; // cache source-symbol resolution so refinement only reads colors and hashes
@@ -3716,22 +3722,58 @@ THREAD_POOL_TASK_FUNC(lnk_opt_icf_task)
     U64 ready_state            = (table_generation_value << 2) | 2;
 
     ProfBegin("Compute colored hashes");
+    B32 use_xxh3 = task->config->icf_hash_xxh3;
     for EachInRange(contrib_idx, contrib_ranges[task_id]) {
       Contrib *contrib = &contribs[contrib_idx];
       contrib->key.old_color = color_map[contrib->obj_idx][contrib->sect_idx];
 
-      blake3_hasher hasher; blake3_hasher_init(&hasher);
-      blake3_hasher_update(&hasher, &contrib->static_hash, sizeof(contrib->static_hash));
-      for EachIndex(reloc_idx, contrib->reloc_count) {
-        RelocTarget *target    = contrib->reloc_targets[reloc_idx];
-        U64          target_id = target->color ? *target->color : target->static_id;
-        blake3_hasher_update(&hasher, &target_id, sizeof(target_id));
+      // the key hash is a pure function of static_hash + target colors, so recompute it only
+      // when one of this contrib's target colors changed in the previous round's update --
+      // unchanged inputs reproduce the cached hash bit-for-bit. A color changed last round
+      // IFF its value lies in the previous round's split-allocation window (colors are
+      // monotone and a split's retained subgroup keeps its exact old value), so the dirty
+      // test is one read per target. Refinement converges fast, so after the first few
+      // rounds almost every contrib skips the hash entirely.
+      B32 must_hash = (iter_count == 0);
+      if (!must_hash) {
+        U64 dirty_lo = last_split_rng[0], dirty_hi = last_split_rng[1];
+        for EachIndex(reloc_idx, contrib->reloc_count) {
+          RelocTarget *target = contrib->reloc_targets[reloc_idx];
+          if (target->color) {
+            U64 c = *target->color;
+            if (c > dirty_lo && c <= dirty_hi) { must_hash = 1; break; }
+          }
+        }
       }
-      U128 hash;
-      blake3_hasher_finalize(&hasher, (U8 *)&hash, sizeof(hash));
+      if (must_hash) {
+        if (use_xxh3) {
+          // /RAD_ICF_HASH_ALG:XXH3 -- non-cryptographic round keys; group equality still
+          // compares the full 128-bit hash + old_color, and the content identity that decides
+          // WHAT folds stays anchored by the blake3 static_hash mixed into every key
+          XXH3_state_t hasher; XXH3_128bits_reset(&hasher);
+          XXH3_128bits_update(&hasher, &contrib->static_hash, sizeof(contrib->static_hash));
+          for EachIndex(reloc_idx, contrib->reloc_count) {
+            RelocTarget *target    = contrib->reloc_targets[reloc_idx];
+            U64          target_id = target->color ? *target->color : target->static_id;
+            XXH3_128bits_update(&hasher, &target_id, sizeof(target_id));
+          }
+          XXH128_hash_t hash = XXH3_128bits_digest(&hasher);
+          MemoryCopy(&contrib->key.hash, &hash, sizeof(contrib->key.hash));
+        } else {
+          blake3_hasher hasher; blake3_hasher_init(&hasher);
+          blake3_hasher_update(&hasher, &contrib->static_hash, sizeof(contrib->static_hash));
+          for EachIndex(reloc_idx, contrib->reloc_count) {
+            RelocTarget *target    = contrib->reloc_targets[reloc_idx];
+            U64          target_id = target->color ? *target->color : target->static_id;
+            blake3_hasher_update(&hasher, &target_id, sizeof(target_id));
+          }
+          U128 hash;
+          blake3_hasher_finalize(&hasher, (U8 *)&hash, sizeof(hash));
+          contrib->key.hash = hash;
+        }
+      }
 
       // insert the colored hash into the concurrent table
-      contrib->key.hash = hash;
 
       Assert(color_table.slots_count > 0 && (color_table.slots_count & (color_table.slots_count - 1)) == 0);
       U64 table_hash     = hash_map_hasher(str8_struct(&contrib->key));
@@ -3843,9 +3885,14 @@ THREAD_POOL_TASK_FUNC(lnk_opt_icf_task)
         total_split_count += split_counts[worker_id];
       }
       split_offsets[tp->worker_count] = start_next_color;
-      
+
       *next_color += total_split_count;
       *is_part_stable = (total_split_count == 0);
+
+      // publish this round's split-allocation window for the next round's dirty test
+      // (fresh colors handed out below are start_next_color+1 .. *next_color)
+      last_split_rng[0] = start_next_color;
+      last_split_rng[1] = *next_color;
 
       lnk_log(LNK_Log_Debug, "  Round %llu found %S splits", iter_count, str8_from_count(scratch.arena, total_split_count));
 
@@ -4103,9 +4150,11 @@ typedef struct
 
 
 // FILECHKSMS of the obj-wide (non-COMDAT) .debug$S -- the table every per-function
-// Lines fragment's file_off indexes into
+// Lines fragment's file_off indexes into. Direct header walk with early-out instead of
+// cv_debug_s_from_data: the obj-wide .debug$S is megabytes of subsections and the full
+// parse pushes a list node per subsection; here we only need one slice.
 internal String8
-lnk_icf_obj_file_chksms(Arena *scratch, LNK_Obj *obj)
+lnk_icf_obj_file_chksms_scan(LNK_Obj *obj)
 {
   String8             string_table  = lnk_coff_string_table_from_obj(obj);
   COFF_SectionHeader *section_table = lnk_coff_section_table_from_obj(obj);
@@ -4115,11 +4164,33 @@ lnk_icf_obj_file_chksms(Arena *scratch, LNK_Obj *obj)
     if (!str8_match(coff_name_from_section_header(string_table, &section_table[sect_idx]), str8_lit(".debug$S"), 0)) { continue; }
     LNK_ObjSection sect = lnk_obj_section_from_sect_idx(obj, sect_idx);
     String8        raw  = lnk_obj_get_sect_data(obj, sect_idx, sect.frange);
-    CV_DebugS      ds   = cv_debug_s_from_data(scratch, raw);
-    String8List    ck   = cv_sub_section_from_debug_s(ds, CV_C13SubSectionKind_FileChksms);
-    if (ck.node_count) { return ck.first->string; }
+    if (raw.size < sizeof(CV_Signature) || cv_signature_from_debug_s(raw) != CV_Signature_C13) { continue; }
+    for (U64 cursor = sizeof(CV_Signature); cursor + sizeof(CV_C13SubSectionHeader) <= raw.size; ) {
+      CV_C13SubSectionHeader header = {0};
+      cursor += str8_deserial_read_struct(raw, cursor, &header);
+      if (header.kind == CV_C13SubSectionKind_FileChksms) {
+        return str8_substr(raw, r1u64(cursor, cursor + header.size));
+      }
+      cursor += header.size;
+      cursor = AlignPow2(cursor, CV_C13SubSectionAlign);
+    }
   }
   return str8_zero();
+}
+
+// Memoized per obj: leaders are shared across many follower objs, so without the memo the
+// scan reruns once per (follower obj x leader switch). The result slices the immutable
+// obj->data mapping, so the racy fill is idempotent (every worker writes identical bytes);
+// the init flag is published last.
+internal String8
+lnk_icf_obj_file_chksms(LNK_Obj *obj)
+{
+  if (!ins_atomic_u32_eval((U32 *)&obj->icf_file_chksms_init)) {
+    String8 chksms = lnk_icf_obj_file_chksms_scan(obj);
+    obj->icf_file_chksms = chksms;
+    ins_atomic_u32_eval_assign((U32 *)&obj->icf_file_chksms_init, 1);
+  }
+  return obj->icf_file_chksms;
 }
 
 // source identity of a function: (checksum of its file, first line). Two ICF fold members
@@ -4198,11 +4269,6 @@ THREAD_POOL_TASK_FUNC(lnk_icf_mark_folded_lines_task)
   LNK_Obj                    *obj  = task->objs[task_id];
   if (obj->icf_fold == 0) { scratch_end(scratch); return; }
 
-  String8  follower_chksms      = str8_zero();
-  B32      follower_chksms_init = 0;
-  LNK_Obj *cached_leader        = 0;
-  String8  leader_chksms        = str8_zero();
-
   for EachIndex(sect_idx, obj->header.section_count_no_null) {
     LNK_ICFFold fold = obj->icf_fold[sect_idx];
     if (!fold.set)                                                    { continue; }
@@ -4220,16 +4286,8 @@ THREAD_POOL_TASK_FUNC(lnk_icf_mark_folded_lines_task)
       Temp fold_temp = temp_begin(scratch.arena);
       U32 child_sn = lnk_icf_debug_s_child_from_section(obj, (U32)(sect_idx + 1));
       if (child_sn != 0) {
-        // the returned String8s slice the objs' section data (only the parse's list nodes live
-        // on the temp arena), so caching them across fold_temp scopes is safe
-        if (!follower_chksms_init) {
-          follower_chksms      = lnk_icf_obj_file_chksms(fold_temp.arena, obj);
-          follower_chksms_init = 1;
-        }
-        if (leader_obj != cached_leader) {
-          cached_leader = leader_obj;
-          leader_chksms = lnk_icf_obj_file_chksms(fold_temp.arena, leader_obj);
-        }
+        String8 follower_chksms = lnk_icf_obj_file_chksms(obj);        // per-obj memo -- leaders
+        String8 leader_chksms   = lnk_icf_obj_file_chksms(leader_obj); // shared across follower objs
         LNK_ICFSrcKey fk = lnk_icf_src_key_from_fn(fold_temp.arena, obj, (U32)(sect_idx + 1), follower_chksms);
         LNK_ICFSrcKey lk = lnk_icf_src_key_from_fn(fold_temp.arena, leader_obj, fold.leader_sn, leader_chksms);
         B32 same_src = fk.valid && lk.valid &&
