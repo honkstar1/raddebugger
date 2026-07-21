@@ -295,6 +295,8 @@ typedef struct
       Rng1U64                    *common_block_ranges;
       LNK_CommonBlockContrib     *common_block_contribs;
       COFF_SymbolValueInterpType  fixup_type;
+      U8                         *symtab_copy_base;    // private symbol-table copies (patchers write here, not the CoW input mapping)
+      U64                        *symtab_copy_offsets; // [objs_count+1] byte offsets into symtab_copy_base
     } patch_symtabs;
     struct {
       String8             image_data;

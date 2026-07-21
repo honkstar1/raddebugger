@@ -62,6 +62,11 @@ typedef struct LNK_Obj
   // lnk_obj_get_sect_data which prefers the copy when present.
   String8 *sect_data_copies;
 
+  // Private copy of the COFF symbol table; set before the image symbol-patch passes so their
+  // section-number/value stores land here instead of copy-on-writing the input mapping.
+  // lnk_coff_symbol_table_from_obj prefers this when present.
+  String8 symbol_table_copy;
+
   // type info
   U32 debug_t_sect_idx;
   U32 debug_p_sect_idx;

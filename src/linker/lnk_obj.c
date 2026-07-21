@@ -733,6 +733,9 @@ lnk_coff_string_table_from_obj(LNK_Obj *obj)
 internal String8
 lnk_coff_symbol_table_from_obj(LNK_Obj *obj)
 {
+  if (obj->symbol_table_copy.size) {
+    return obj->symbol_table_copy;
+  }
   return str8_substr(obj->data, obj->header.symbol_table_range);
 }
 

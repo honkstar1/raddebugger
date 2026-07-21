@@ -4542,6 +4542,21 @@ THREAD_POOL_TASK_FUNC(lnk_set_comdat_leaders_contribs_task)
 }
 
 internal
+THREAD_POOL_TASK_FUNC(lnk_copy_symbol_tables_task)
+{
+  LNK_BuildImageTask *task    = raw_task;
+  U64                 obj_idx = task_id;
+  LNK_Obj            *obj     = task->objs[obj_idx];
+
+  U64 copy_size = task->u.patch_symtabs.symtab_copy_offsets[obj_idx+1] - task->u.patch_symtabs.symtab_copy_offsets[obj_idx];
+  if (copy_size > 0) {
+    U8 *copy = task->u.patch_symtabs.symtab_copy_base + task->u.patch_symtabs.symtab_copy_offsets[obj_idx];
+    MemoryCopy(copy, obj->data.str + obj->header.symbol_table_range.min, copy_size);
+    obj->symbol_table_copy = str8(copy, copy_size);
+  }
+}
+
+internal
 THREAD_POOL_TASK_FUNC(lnk_flag_debug_symbols_task)
 {
   LNK_BuildImageTask *task    = raw_task;
@@ -6488,6 +6503,29 @@ lnk_build_image(TP_Arena *arena, TP_Context *tp, LNK_Config *config, LNK_SymbolT
 
       // flag debug symbols to prevent them from being patched in subsequent passes
       tp_for_parallel_prof(tp, 0, objs_count, lnk_flag_debug_symbols_task, &task, "Flag Debug Symbols");
+
+      // The patch passes below store final section numbers / values into every regular
+      // symbol record. The symbol tables live in the copy-on-write input mapping, so
+      // patching them in place copy-on-writes one page per touched symbol-table page
+      // (~1.2M pages / ~4.5GB of CoW commit on a large editor link). Give each obj a
+      // private copy of its symbol table up front -- lnk_coff_symbol_table_from_obj
+      // prefers the copy, and every patcher writes through symbol.raw_symbol pointers
+      // derived from it, so the input mapping stays clean. One sequential memcpy per
+      // obj costs the same bytes the CoW faults would have copied anyway, without the
+      // per-page fault + zero + charge machinery.
+      ProfScope("Copy Symbol Tables")
+      {
+        U64 *symtab_offsets = push_array_no_zero(temp.arena, U64, objs_count + 1);
+        U64  total_size     = 0;
+        for EachIndex(obj_idx, objs_count) {
+          symtab_offsets[obj_idx] = total_size;
+          total_size += dim_1u64(objs[obj_idx]->header.symbol_table_range);
+        }
+        symtab_offsets[objs_count] = total_size;
+        task.u.patch_symtabs.symtab_copy_base    = push_array_no_zero(lnk_get_huge_arena(), U8, total_size);
+        task.u.patch_symtabs.symtab_copy_offsets = symtab_offsets;
+        tp_for_parallel_prof(tp, 0, objs_count, lnk_copy_symbol_tables_task, &task, "Copy Symbol Tables");
+      }
 
       // patch symbols
       tp_for_parallel_prof(tp, 0, objs_count,       lnk_patch_comdat_leaders_task,       &task, "COMDAT Leaders"      );
