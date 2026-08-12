@@ -6759,7 +6759,7 @@ TEST(cyclic_type)
   str8_serial_push_string(arena, debug_t, cv_make_leaf(arena, CV_LeafKind_POINTER, str8_struct((&(CV_LeafPointer){ .itype = 0x1000 })), CV_LeafAlign));
 
   CV_DebugS debug_s = {0};
-  str8_list_push(arena, &debug_s.data_list[CV_C13SubSectionIdxKind_Symbols], cv_make_symbol(arena, CV_SymKind_GPROC32, cv_make_proc32(arena, (CV_SymProc32){ .itype = 0x1001 }, str8_lit("foo"))));
+  str8_list_push(arena, cv_sub_section_ptr_from_debug_s(&debug_s, CV_C13SubSectionKind_Symbols), cv_make_symbol(arena, CV_SymKind_GPROC32, cv_make_proc32(arena, (CV_SymProc32){ .itype = 0x1001 }, str8_lit("foo"))));
   String8List debug_s_string = cv_data_from_debug_s_c13(arena, &debug_s, 1);
 
   String8 raw_coff = t_coff_from_def_obj(arena, (T_COFF_DefObj){
@@ -6911,7 +6911,7 @@ TEST(validate_gsi)
   for EachElement(i, raw_symbols) { symbols[i] = cv_symbol_from_ptr(raw_symbols[i].str); }
 
   CV_DebugS debug_s = {0};
-  for EachElement(i, symbols) { str8_list_push(arena, &debug_s.data_list[CV_C13SubSectionIdxKind_Symbols], cv_data_from_symbol(arena, &symbols[i], CV_SymbolAlign)); }
+  for EachElement(i, symbols) { str8_list_push(arena, cv_sub_section_ptr_from_debug_s(&debug_s, CV_C13SubSectionKind_Symbols), cv_data_from_symbol(arena, &symbols[i], CV_SymbolAlign)); }
   String8List raw_debug_s_list = cv_data_from_debug_s_c13(arena, &debug_s, 1);
   String8     raw_debug_s      = str8_list_join(arena, &raw_debug_s_list, 0);
 
@@ -6970,7 +6970,7 @@ TEST(validate_gsi_procs_and_typedefs)
   for EachElement(i, raw_symbols) { symbols[i] = cv_symbol_from_ptr(raw_symbols[i].str); }
 
   CV_DebugS debug_s = {0};
-  for EachElement(i, symbols) { str8_list_push(arena, &debug_s.data_list[CV_C13SubSectionIdxKind_Symbols], cv_data_from_symbol(arena, &symbols[i], CV_SymbolAlign)); }
+  for EachElement(i, symbols) { str8_list_push(arena, cv_sub_section_ptr_from_debug_s(&debug_s, CV_C13SubSectionKind_Symbols), cv_data_from_symbol(arena, &symbols[i], CV_SymbolAlign)); }
   String8List raw_debug_s_list = cv_data_from_debug_s_c13(arena, &debug_s, 1);
   String8     raw_debug_s      = str8_list_join(arena, &raw_debug_s_list, 0);
 
@@ -7166,7 +7166,7 @@ TEST(pdbstripped)
     for EachElement(i, raw_symbols) { symbols[i] = cv_symbol_from_ptr(raw_symbols[i].str); }
 
     CV_DebugS debug_s = {0};
-    for EachElement(i, symbols) { str8_list_push(arena, &debug_s.data_list[CV_C13SubSectionIdxKind_Symbols], cv_data_from_symbol(arena, &symbols[i], CV_SymbolAlign)); }
+    for EachElement(i, symbols) { str8_list_push(arena, cv_sub_section_ptr_from_debug_s(&debug_s, CV_C13SubSectionKind_Symbols), cv_data_from_symbol(arena, &symbols[i], CV_SymbolAlign)); }
     String8List raw_debug_s_list = cv_data_from_debug_s_c13(arena, &debug_s, 1);
     String8     raw_debug_s      = str8_list_join(arena, &raw_debug_s_list, 0);
 
