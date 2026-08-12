@@ -819,6 +819,20 @@ lnk_obj_get_sect_data(LNK_Obj *obj, U64 sect_idx, Rng1U64 frange)
   return str8_substr(obj->data, frange);
 }
 
+// Drop the obj's patched debug-section copies: zero each entry so lnk_obj_get_sect_data
+// falls back to the (still-mapped) input view. The copy BYTES live on the shared
+// per-worker SECT_DATA_COPIES arenas (see lnk_obj_reloc_patcher) and are handed back
+// wholesale via arena_release at the caller; only call once every reader of the patched
+// bytes is done. Idempotent.
+internal void
+lnk_obj_drop_sect_data_copies(LNK_Obj *obj)
+{
+  if (obj->sect_data_copies == 0) { return; }
+  for EachIndex(sect_idx, obj->header.section_count_no_null) {
+    obj->sect_data_copies[sect_idx] = str8_zero();
+  }
+}
+
 internal
 THREAD_POOL_TASK_FUNC(lnk_collect_obj_chunks_task)
 {

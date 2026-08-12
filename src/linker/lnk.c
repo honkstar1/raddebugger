@@ -5155,12 +5155,16 @@ THREAD_POOL_TASK_FUNC(lnk_obj_reloc_patcher)
 
       // patch-on-copy: relocs on debug sections would otherwise dirty the copy-on-write input
       // mapping (input views are FILE_MAP_COPY); copy the section into private memory and patch
-      // the copy. Readers pick the copy up through lnk_obj_get_sect_data.
+      // the copy. Readers pick the copy up through lnk_obj_get_sect_data. The copy bytes go on
+      // dedicated per-worker SECT_DATA_COPIES arenas (free-list warm-page reuse, unlike raw
+      // reserve+commit) so lnk_build_pdb can hand the whole set back with arena_release once
+      // the last $S reader is done -- GB-class at FN scale (the String8 table itself stays on
+      // the worker arena; it must outlive the copies for the zeroing sweep).
       if (obj->sect_data_copies == 0) {
         obj->sect_data_copies = push_array(arena, String8, obj_header.section_count_no_null);
       }
       String8 src  = str8_substr(obj->data, section_frange);
-      U8     *copy = push_array_no_zero(arena, U8, src.size);
+      U8     *copy = push_array_no_zero(g_sect_copy_arenas[worker_id], U8, src.size);
       MemoryCopy(copy, src.str, src.size);
       obj->sect_data_copies[sect_idx] = str8(copy, src.size);
       section_data = obj->sect_data_copies[sect_idx];
@@ -6732,8 +6736,16 @@ lnk_build_image(TP_Arena *arena, TP_Context *tp, LNK_Config *config, LNK_SymbolT
 
     // patch relocs
     {
+      // dedicated per-worker arenas for the patched debug-section copies: free-list
+      // block reuse keeps the pages warm (a raw reserve+commit per copy paid ~11.6GB of
+      // fresh zero-page faults per link at FN scale), and lnk_build_pdb hands the whole
+      // set back with arena_release after the last $S reader
+      g_sect_copy_arena_count = tp->worker_count;
+      g_sect_copy_arenas      = push_array(arena->v[0], Arena *, g_sect_copy_arena_count);
+      for EachIndex(i, g_sect_copy_arena_count) { g_sect_copy_arenas[i] = arena_alloc(.name = "SECT_DATA_COPIES"); }
+
       LNK_ObjRelocPatcher task = { .image_data = image_data, .objs = objs, .image_base = pe.image_base, .image_section_table = image_section_table };
-      tp_for_parallel_prof(tp, arena, objs_count, lnk_obj_reloc_patcher, &task, "Patch Relocs"); // arena: debug sections are patched-on-copy into private memory
+      tp_for_parallel_prof(tp, arena, objs_count, lnk_obj_reloc_patcher, &task, "Patch Relocs"); // arena: the per-obj sect_data_copies String8 tables
     }
 
     // patch load config

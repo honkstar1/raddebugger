@@ -278,6 +278,14 @@ typedef struct
   PDB_DbiSCList       *sc_list; // [obj_count]
 
   struct LNK_PdbOutput *output; // when non-null, module streams enqueue to the background writer as they complete
+
+  // when set, lnk_build_pdb drops every obj's patched debug-section copies
+  // (LNK_Obj.sect_data_copies) and releases the SECT_DATA_COPIES arenas right after
+  // "Move Global Symbols" (the last $S reader); also gates the /names bucket rehome and
+  // the mod->source_file_list repoint that decouple the string consumers from the
+  // copies. Must be 0 when a /PDBSTRIPPED build follows -- it re-walks cv->debug_s_arr
+  // after lnk_build_pdb.
+  B32 free_sect_copies;
 } LNK_BuildPdb;
 
 typedef struct
