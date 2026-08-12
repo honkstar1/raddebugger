@@ -52,6 +52,32 @@ lnk_arena_release_thread(void *raw_arena)
   ProfEnd();
 }
 
+// Reaper entry point for a per-worker arena array (TP_Arena). Same ownership rule as
+// lnk_arena_release_thread: caller hands over EXCLUSIVE ownership. The TP_Arena header and its
+// v[] array live inside v[0] (tp_arena_alloc layout), which tp_arena_release frees last, so the
+// walk below and the release order are safe.
+internal void
+lnk_tp_arena_release_thread(void *raw_arena)
+{
+  ProfBeginFunction();
+  U64       begin_us = now_time_us();
+  TP_Arena *tp_arena = raw_arena;
+
+  U64 committed_size = 0;
+  for EachIndex(i, tp_arena->count) {
+    for (Arena *n = tp_arena->v[i]->current; n != 0; n = n->prev)   { committed_size += n->cmt; }
+#if ARENA_FREE_LIST
+    for (Arena *n = tp_arena->v[i]->free_last; n != 0; n = n->prev) { committed_size += n->cmt; }
+#endif
+  }
+
+  tp_arena_release(&tp_arena);
+
+  lnk_log(LNK_Log_Timers, "[teardown] background release of %llu MiB worker arenas took %.2f ms (off main thread)",
+          committed_size / MB(1), (F64)(now_time_us() - begin_us) / 1000.0);
+  ProfEnd();
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 //~ Fault-storm mitigation: batched PrefetchVirtualMemory over mapped input
 //  ranges. The .debug$S/$T parse and type-merge loops first-touch tens of GB of
@@ -3587,25 +3613,45 @@ lnk_merge_types(TP_Context *tp, TP_Arena *tp_temp, LNK_CodeViewInput *input, LNK
     }
   }
 
+  // The dedup/prepopulate tasks below push one LNK_LeafRef node per hash-table insert/update onto
+  // their worker arena. Routing those pushes through tp_temp (the caller's link-lifetime worker
+  // arenas) buries the nodes under everything later phases push there: they stay committed through
+  // the PDB-build peak even though the last read of any node is inside this function (the
+  // materialize/unbucket passes -- everything after keys LNK_LeafRefs by value). Give them
+  // dedicated per-worker arenas instead and hand the whole set to the background reaper before
+  // returning. Layout mirrors tp_arena_alloc: the TP_Arena header + v[] live inside v[0], which
+  // tp_arena_release frees last.
+  TP_Arena *leaf_ref_arenas = 0;
+  {
+    Temp temp = temp_begin(scratch.arena);
+    Arena **arr = push_array(temp.arena, Arena *, tp->worker_count);
+    for EachIndex(i, tp->worker_count) { arr[i] = arena_alloc(.commit_size = MB(2), .name = "TYPE_MERGE_SCRATCH"); }
+    leaf_ref_arenas        = push_array(arr[0], TP_Arena, 1);
+    leaf_ref_arenas->count = tp->worker_count;
+    leaf_ref_arenas->v     = push_array(arr[0], Arena *, tp->worker_count);
+    MemoryCopyTyped(leaf_ref_arenas->v, arr, tp->worker_count);
+    temp_end(temp);
+  }
+
   for (U64 attempt = 0; ; attempt += 1) {
     ProfBegin("Prepopulate hash table with largest type-set");
     if (largest_ts) {
-      tp_for_parallel(tp, tp_temp, tp->worker_count, lnk_populate_leaf_ht, &task);
+      tp_for_parallel(tp, leaf_ref_arenas, tp->worker_count, lnk_populate_leaf_ht, &task);
     }
     ProfEnd();
 
     ProfBegin("Leaf Dedup");
     task.indices = input->debug_p_indices;
-    tp_for_parallel_prof(tp, tp_temp, task.indices.count, lnk_leaf_dedup_task, &task, ".debug$P");
+    tp_for_parallel_prof(tp, leaf_ref_arenas, task.indices.count, lnk_leaf_dedup_task, &task, ".debug$P");
 
     task.indices = input->int_obj_indices;
-    tp_for_parallel_prof(tp, tp_temp, task.indices.count, lnk_leaf_dedup_task, &task, ".debug$T");
+    tp_for_parallel_prof(tp, leaf_ref_arenas, task.indices.count, lnk_leaf_dedup_task, &task, ".debug$T");
 
     task.indices = dedup_type_server_indices;
-    tp_for_parallel_prof(tp, tp_temp, task.indices.count, lnk_leaf_dedup_task, &task, "Type Servers");
+    tp_for_parallel_prof(tp, leaf_ref_arenas, task.indices.count, lnk_leaf_dedup_task, &task, "Type Servers");
 
     task.indices = input->ifc_indices;
-    tp_for_parallel_prof(tp, tp_temp, task.indices.count, lnk_leaf_dedup_task, &task, "IFC Blobs");
+    tp_for_parallel_prof(tp, leaf_ref_arenas, task.indices.count, lnk_leaf_dedup_task, &task, "IFC Blobs");
     ProfEnd();
 
     if (ins_atomic_u32_eval(&task.leaf_ht_overflow) == 0) { break; }
@@ -3836,6 +3882,16 @@ lnk_merge_types(TP_Context *tp, TP_Arena *tp_temp, LNK_CodeViewInput *input, LNK
   }
 
   MemoryCopyTyped(task.result.min_type_indices, input->min_type_indices, CV_TypeIndexSource_COUNT);
+
+  // the LNK_LeafRef nodes are dead past this point: the last derefs are the materialize/unbucket
+  // passes above (bucket_arr itself was released after the extract loop), and everything the result
+  // carries out of this function lives on tp_temp->v[0] or in standalone leaf_buffers. Hand the
+  // dedicated node arenas to the background reaper so their multi-GB commit is gone before the
+  // PDB-build peak without a serial VirtualFree on the critical path.
+  for EachIndex(ti_source, CV_TypeIndexSource_COUNT) { task.unique_leaf_refs_arr[ti_source] = (LNK_LeafRefArray){0}; }
+  if (g_arena_reaper_thread.u64[0] != 0) { thread_join(g_arena_reaper_thread, max_U64); }
+  g_arena_reaper_thread = thread_launch(lnk_tp_arena_release_thread, leaf_ref_arenas);
+  leaf_ref_arenas = 0;
 
   temp_end(scratch);
   ProfEnd();
