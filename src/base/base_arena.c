@@ -239,7 +239,20 @@ arena_push(Arena *arena, U64 size, U64 align, B32 zero)
                               .flags        = current->flags,
                               .allocation_site_file = current->allocation_site_file,
                               .allocation_site_line = current->allocation_site_line);
-      
+
+      // an oversized block must not bequeath its size as the growth params for
+      // subsequent chained blocks: res_size/cmt_size stored on the block are the
+      // sizing PARAMS for the NEXT chain step (read at the top of this scope), not
+      // the block's physical size (that is res/cmt). Without this reset, a 2GiB
+      // push (e.g. an MSF page-data node) is immediately followed by the next tiny
+      // push (its 24B list header) chaining -- and FULLY COMMITTING -- another 2GiB
+      // block that then receives a few KB before the next oversized push chains
+      // again, doubling the arena's committed footprint. Restore the inherited
+      // (pre-override) params so follow-up blocks are normal-sized. Capacity and
+      // release decisions elsewhere read res/cmt actuals, so this is safe.
+      new_block->res_size = current->res_size;
+      new_block->cmt_size = current->cmt_size;
+
       size_to_zero = 0;
     }
     else
