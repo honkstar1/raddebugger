@@ -67,6 +67,11 @@ typedef struct LNK_Obj
   // lnk_coff_symbol_table_from_obj prefers this when present.
   String8 symbol_table_copy;
 
+  // Final image contribution for each input section. The arrays are the image builder's
+  // existing section map; retaining the per-object pointer lets later relocation/PDB
+  // consumers read final offsets without rewriting the mapped COFF section headers.
+  LNK_SectionContrib **section_contribs;
+
   // type info
   U32 debug_t_sect_idx;
   U32 debug_p_sect_idx;

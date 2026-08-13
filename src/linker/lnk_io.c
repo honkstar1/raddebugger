@@ -257,29 +257,6 @@ lnk_cow_page_promote_veh(EXCEPTION_POINTERS *info)
 }
 #endif
 
-// Bulk page promotion for known hot in-place writers (obj section-header patching writes
-// ~20 pages per obj; taking a VEH exception per page costs ~100us each, ~25s kernel across
-// a big link). One VirtualProtect over the whole range replaces per-page exceptions.
-// No-op for heap-backed inputs (MEM_PRIVATE) and for read-write shared views (their
-// PAGE_READWRITE section refuses PAGE_WRITECOPY, and their pages never write-fault),
-// so this is safe to call regardless of /RAD_MEMORY_MAP_FILES mode.
-internal void
-lnk_cow_promote_range(void *ptr, U64 size)
-{
-#if OS_WINDOWS
-  if (size == 0) { return; }
-  U8 *first = (U8 *)AlignDownPow2((U64)ptr, KB(4));
-  U8 *opl   = (U8 *)AlignPow2((U64)ptr + size, KB(4));
-  MEMORY_BASIC_INFORMATION mbi = {0};
-  if (VirtualQuery(first, &mbi, sizeof(mbi)) >= sizeof(mbi) &&
-      mbi.Type == MEM_MAPPED &&
-      (mbi.Protect == PAGE_READONLY || mbi.Protect == PAGE_WRITECOPY)) {
-    DWORD old_protect = 0;
-    VirtualProtect(first, (U64)(opl - first), PAGE_WRITECOPY, &old_protect);
-  }
-#endif
-}
-
 internal
 THREAD_POOL_TASK_FUNC(lnk_memory_map_file_task)
 {

@@ -5968,7 +5968,15 @@ THREAD_POOL_TASK_FUNC(lnk_push_dbi_sec_contrib_task)
     B32             is_virt = !!(*section.flags & COFF_SectionFlag_CntUninitializedData);
 
     // pick section range
-    Rng1U64 section_range = is_virt ? section.vrange : section.frange;
+    LNK_SectionContrib *image_sc = obj->section_contribs[sect_idx];
+    U64 section_size = lnk_size_from_section_contrib(image_sc);
+    Rng1U64 section_range;
+    if (is_virt) {
+      section_range = r1u64s(image_sc->voff, section_size);
+    } else {
+      COFF_SectionHeader *image_sect = task->image_section_table[image_sc->u.sect_idx + 1];
+      section_range = r1u64s(image_sect->foff + image_sc->u.off, section_size);
+    }
     if (dim_1u64(section_range) == 0) { continue; }
 
     // map the SC offset to the image section range that contains it

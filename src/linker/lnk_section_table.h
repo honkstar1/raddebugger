@@ -23,6 +23,7 @@ typedef struct LNK_SectionContrib
   } u;
   U16 align; // contribution alignment in the image
   B8 hotpatch;
+  U32 voff;  // final virtual offset; occupies the struct's former tail padding
 } LNK_SectionContrib;
 
 typedef struct LNK_SectionContribChunk

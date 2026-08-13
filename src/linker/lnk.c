@@ -4483,7 +4483,10 @@ THREAD_POOL_TASK_FUNC(lnk_gather_sections_task)
 
     ProfBegin("Alloc Section Map");
     task->sect_map = push_array(main_arena, LNK_SectionContrib **, task->objs_count);
-    for EachIndex(obj_idx, task->objs_count) { task->sect_map[obj_idx] = push_array(main_arena, LNK_SectionContrib *, task->objs[obj_idx]->header.section_count_no_null); }
+    for EachIndex(obj_idx, task->objs_count) {
+      task->sect_map[obj_idx] = push_array(main_arena, LNK_SectionContrib *, task->objs[obj_idx]->header.section_count_no_null);
+      task->objs[obj_idx]->section_contribs = task->sect_map[obj_idx];
+    }
     ProfEnd();
   }
 
@@ -5122,9 +5125,10 @@ THREAD_POOL_TASK_FUNC(lnk_obj_reloc_patcher)
     COFF_RelocArray relocs = lnk_coff_relocs_from_section_header(obj, section_header);
 
     // get section bytes (special case debug info because it is not copied to the image)
-    Rng1U64 section_frange = rng_1u64(section_header->foff, section_header->foff + section_header->fsize);
+    Rng1U64 section_frange = {0};
     String8 section_data;
     if (section_flags & LNK_SECTION_FLAG_DEBUG) {
+      section_frange = rng_1u64(section_header->foff, section_header->foff + section_header->fsize);
       // debug sections only feed the PDB/RDI path; objs excluded from debug info never get
       // there, so patching their debug relocs would only dirty input pages for nothing
       if (obj->exclude_from_debug_info) { continue; }
@@ -5157,6 +5161,9 @@ THREAD_POOL_TASK_FUNC(lnk_obj_reloc_patcher)
       obj->sect_data_copies[sect_idx] = str8(copy, src.size);
       section_data = obj->sect_data_copies[sect_idx];
     } else {
+      LNK_SectionContrib *sc = obj->section_contribs[sect_idx];
+      COFF_SectionHeader *image_section = task->image_section_table[sc->u.sect_idx + 1];
+      section_frange = r1u64s(image_section->foff + sc->u.off, lnk_size_from_section_contrib(sc));
       section_data = str8_substr(task->image_data, section_frange);
     }
 
@@ -5576,52 +5583,18 @@ lnk_build_guard_tables(TP_Context       *tp,
 }
 
 internal
-THREAD_POOL_TASK_FUNC(lnk_patch_virtual_offsets_and_sizes_in_obj_section_headers_task)
+THREAD_POOL_TASK_FUNC(lnk_assign_final_section_voffs_task)
 {
   LNK_BuildImageTask *task    = raw_task;
   U64                 obj_idx = task_id;
   LNK_Obj            *obj     = task->objs[obj_idx];
 
-  ProfBeginV("Patch Virtual Offset And Size In Section Headers [%S]", obj->path);
-  COFF_SectionHeader *section_table = (COFF_SectionHeader *)str8_substr(obj->data, obj->header.section_table_range).str;
-  // headers live in the read-only mapped input view; promote the whole table in one call
-  // instead of taking a copy-on-write fault per page (~20 pages/obj on section-heavy objs)
-  lnk_cow_promote_range(section_table, dim_1u64(obj->header.section_table_range));
+  ProfBeginV("Assign Final Virtual Offsets [%S]", obj->path);
   for (U64 sect_idx = 0; sect_idx < obj->header.section_count_no_null; sect_idx += 1) {
-    COFF_SectionHeader *sect_header = &section_table[sect_idx];
     if (~obj->section_flags[sect_idx] & COFF_SectionFlag_LnkRemove) {
       LNK_SectionContrib *sc   = task->sect_map[obj_idx][sect_idx];
       LNK_Section        *sect = task->image_sects.v[sc->u.sect_idx];
-      sect_header->vsize = lnk_size_from_section_contrib(sc);
-      sect_header->voff  = sect->voff + sc->u.off;
-    }
-  }
-  ProfEnd();
-}
-
-internal
-THREAD_POOL_TASK_FUNC(lnk_patch_file_offsets_and_sizes_in_obj_section_headers_task)
-{
-  LNK_BuildImageTask *task    = raw_task;
-  U64                 obj_idx = task_id;
-  LNK_Obj            *obj     = task->objs[obj_idx];
-
-  ProfBeginV("Patch File Offsets And Sizes In Obj Section Headers [%S]", obj->path);
-  COFF_SectionHeader *section_table = (COFF_SectionHeader *)str8_substr(obj->data, obj->header.section_table_range).str;
-  // usually a no-op: the virtual-offset patch task already promoted (and dirtied) these pages
-  lnk_cow_promote_range(section_table, dim_1u64(obj->header.section_table_range));
-  for (U64 sect_idx = 0; sect_idx < obj->header.section_count_no_null; sect_idx += 1) {
-    COFF_SectionHeader *sect_header = &section_table[sect_idx];
-    COFF_SectionFlags   sect_flags  = obj->section_flags[sect_idx];
-    B32 patch_section_header = (~sect_flags & COFF_SectionFlag_LnkRemove) &&
-                               (~sect_flags & LNK_SECTION_FLAG_DEBUG);
-    if (patch_section_header) {
-      LNK_SectionContrib *sc   = task->sect_map[obj_idx][sect_idx];
-      LNK_Section        *sect = task->image_sects.v[sc->u.sect_idx];
-      if (~sect->flags & COFF_SectionFlag_CntUninitializedData) {
-        sect_header->fsize = lnk_size_from_section_contrib(sc);
-        sect_header->foff  = sect->foff + sc->u.off;
-      }
+      sc->voff = safe_cast_u32(sect->voff + sc->u.off);
     }
   }
   ProfEnd();
@@ -5738,7 +5711,7 @@ THREAD_POOL_TASK_FUNC(lnk_gather_base_reloc_pages_task)
       U64 is_addr = coff_is_addr_reloc(obj->header.machine, r->type);
       if (is_addr == 0) { continue; }
 
-      U64                    reloc_voff = sect_header->voff + r->apply_off;
+      U64                    reloc_voff = obj->section_contribs[sect_idx]->voff + r->apply_off;
       U64                    page_voff  = AlignDownPow2(reloc_voff, task->page_size);
       LNK_BaseRelocPageNode *page       = hash_table_search_u64_raw(page_ht, page_voff);
       if (page == 0) {
@@ -6478,7 +6451,7 @@ lnk_build_image(TP_Arena *arena, TP_Context *tp, LNK_Config *config, LNK_SymbolT
     expected_image_header_size = lnk_compute_win32_image_header_size(config, task.image_sects.count);
     U64 voff_cursor = AlignPow2(expected_image_header_size + sizeof(COFF_SectionHeader), config->sect_align);
     for EachIndex(sect_idx, task.image_sects.count) { lnk_assign_section_virtual_space(task.image_sects.v[sect_idx], config->sect_align, &voff_cursor); }
-    tp_for_parallel_prof(tp, 0, task.objs_count, lnk_patch_virtual_offsets_and_sizes_in_obj_section_headers_task, &task, "Patch Virtual Offsets and Sizes in Obj Section Headers");
+    tp_for_parallel_prof(tp, 0, task.objs_count, lnk_assign_final_section_voffs_task, &task, "Assign Final Section Virtual Offsets");
 
     // build base relocs
     if (~config->flags & LNK_ConfigFlag_Fixed) {
@@ -6504,7 +6477,6 @@ lnk_build_image(TP_Arena *arena, TP_Context *tp, LNK_Config *config, LNK_SymbolT
     // assign file offsets to sections
     U64 foff_cursor = AlignPow2(expected_image_header_size, config->file_align);
     for EachIndex(sect_idx, task.image_sects.count) { lnk_assign_section_file_space(task.image_sects.v[sect_idx], &foff_cursor); }
-    tp_for_parallel_prof(tp, 0, task.objs_count, lnk_patch_file_offsets_and_sizes_in_obj_section_headers_task, &task, "Patch File Offsets And Sizes In Section Headers");
   }
 
   // build win32 image header
@@ -6896,10 +6868,13 @@ lnk_obj_sect_idx_from_section(Arena *arena, U64 objs_count, LNK_Obj **objs, LNK_
       coff_parse_section_name(full_section_name, &section_name, &section_postfix);
 
       if (obj->section_flags[sect_idx] & COFF_SectionFlag_LnkRemove) { continue; }
-      if (section_header->fsize == 0)                         { continue; }
       if (lnk_is_section_removed(config, section_name))       { continue; }
 
-      if (sect->voff <= section_header->voff && section_header->voff < sect->voff + sect->vsize) {
+      LNK_SectionContrib *sc = obj->section_contribs[sect_idx];
+      U64 final_fsize = (obj->section_flags[sect_idx] & COFF_SectionFlag_CntUninitializedData) ?
+                        section_header->fsize : lnk_size_from_section_contrib(sc);
+      if (final_fsize == 0) { continue; }
+      if (sect->voff <= sc->voff && sc->voff < sect->voff + sect->vsize) {
         Assert(obj_sect_idxs_count < max_contribs);
         obj_sect_idxs[obj_sect_idxs_count].v0 = obj_idx;
         obj_sect_idxs[obj_sect_idxs_count].v1 = sect_idx;
@@ -6916,12 +6891,10 @@ lnk_obj_sect_idx_from_section(Arena *arena, U64 objs_count, LNK_Obj **objs, LNK_
   return obj_sect_idxs;
 }
 
-internal COFF_SectionHeader *
-lnk_coff_section_header_from_obj_sect_idx_pair(LNK_Obj **objs, PairU32 p)
+internal LNK_SectionContrib *
+lnk_section_contrib_from_obj_sect_idx_pair(LNK_Obj **objs, PairU32 p)
 {
-  LNK_Obj            *obj           = objs[p.v0];
-  COFF_SectionHeader *section_table = str8_deserial_get_raw_ptr(obj->data, obj->header.section_table_range.min, 0);
-  return &section_table[p.v1];
+  return objs[p.v0]->section_contribs[p.v1];
 }
 
 global LNK_Obj **g_rad_map_objs;
@@ -6930,9 +6903,9 @@ internal int
 lnk_obj_sect_idx_is_before(void *raw_a, void *raw_b)
 {
   PairU32 *a = raw_a, *b = raw_b;
-  COFF_SectionHeader *section_header_a = lnk_coff_section_header_from_obj_sect_idx_pair(g_rad_map_objs, *a);
-  COFF_SectionHeader *section_header_b = lnk_coff_section_header_from_obj_sect_idx_pair(g_rad_map_objs, *b);
-  return section_header_a->voff < section_header_b->voff;
+  LNK_SectionContrib *sc_a = lnk_section_contrib_from_obj_sect_idx_pair(g_rad_map_objs, *a);
+  LNK_SectionContrib *sc_b = lnk_section_contrib_from_obj_sect_idx_pair(g_rad_map_objs, *b);
+  return sc_a->voff < sc_b->voff;
 }
 
 internal U64
@@ -6941,22 +6914,22 @@ lnk_pair_u32_nearest_section(PairU32 *arr, U64 count, LNK_Obj **objs, U32 voff)
   U64 result = max_U64;
 
   if (count > 0) {
-    COFF_SectionHeader *first = lnk_coff_section_header_from_obj_sect_idx_pair(objs, arr[0]);
+    LNK_SectionContrib *first = lnk_section_contrib_from_obj_sect_idx_pair(objs, arr[0]);
     if (first->voff == voff) {
       return 0;
     }
 
-    COFF_SectionHeader *last = lnk_coff_section_header_from_obj_sect_idx_pair(objs, arr[count-1]);
+    LNK_SectionContrib *last = lnk_section_contrib_from_obj_sect_idx_pair(objs, arr[count-1]);
     if (last->voff <= voff) {
       return count - 1;
     }
 
-    if (first->voff <= voff && voff < last->voff + last->vsize) {
+    if (first->voff <= voff && voff < last->voff + lnk_size_from_section_contrib(last)) {
       U64 l = 0;
       U64 r = count - 1;
       for (; l <= r; ) {
         U64 m = l + (r - l) / 2;
-        COFF_SectionHeader *s = lnk_coff_section_header_from_obj_sect_idx_pair(objs, arr[m]);
+        LNK_SectionContrib *s = lnk_section_contrib_from_obj_sect_idx_pair(objs, arr[m]);
         if (s->voff == voff) {
           return m;
         } else if (s->voff < voff) {

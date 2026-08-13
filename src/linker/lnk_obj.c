@@ -911,8 +911,13 @@ lnk_obj_apply_relocs_to_buffer(LNK_Obj *obj, U64 sect_idx, COFF_SectionHeader *s
       continue;
     }
 
-    // compute virtual offsets
-    U64 reloc_voff = section_header->voff + reloc->apply_off;
+    // compute virtual offsets. Removed ICF debug followers intentionally keep their
+    // original COFF-relative base; live sections use the final contribution offset.
+    U64 section_voff = section_header->voff;
+    if (~section_flags & COFF_SectionFlag_LnkRemove) {
+      section_voff = obj->section_contribs[sect_idx]->voff;
+    }
+    U64 reloc_voff = section_voff + reloc->apply_off;
 
     // compute symbol location values
     U32 symbol_secnum = 0;
