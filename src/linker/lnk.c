@@ -3422,10 +3422,11 @@ THREAD_POOL_TASK_FUNC(lnk_opt_icf_task)
   } Contrib;
 
   // Reuse both tables without clearing them between refinement rounds. U32 generations and
-  // indices keep these records at 48 and 16 bytes respectively (down from 56 and 24 bytes).
+  // indices keep these records at 40 and 16 bytes respectively. The old-color key is dead
+  // after group indexing/counting, so the assignment phase overwrites it with the output color
+  // instead of carrying a second U64 through the 16M-slot table.
   typedef struct {
     ColorKey key;
-    U64      color;
     U32      state; // generation << 2 | (0 = empty, 1 = initializing, 2 = ready)
     U32      first_contrib_idx;
     U32      old_color_slot_idx;
@@ -3923,11 +3924,11 @@ THREAD_POOL_TASK_FUNC(lnk_opt_icf_task)
        ColorHashSlot *color_slot = &color_table.slots[contrib->color_slot_idx];
       if (ins_atomic_u32_eval(&color_slot->first_contrib_idx) != contrib_idx) { continue; }
 
-       OldColorHashSlot *old_color_slot = &old_color_table.slots[color_slot->old_color_slot_idx];
+      OldColorHashSlot *old_color_slot = &old_color_table.slots[color_slot->old_color_slot_idx];
       if (ins_atomic_u32_eval(&old_color_slot->first_contrib_idx) == contrib_idx) {
-        color_slot->color = color_slot->key.old_color;
+        // key.old_color has completed its lookup lifetime; reuse it as the output color
       } else {
-        color_slot->color = ++next_split_color;
+        color_slot->key.old_color = ++next_split_color;
       }
     }
     ProfEnd();
@@ -3940,7 +3941,7 @@ THREAD_POOL_TASK_FUNC(lnk_opt_icf_task)
       Rng1U64 obj_contrib_range = r1u64(contrib_offsets[obj_idx], contrib_offsets[obj_idx] + contrib_counts[obj_idx]);
       for EachInRange(contrib_idx, obj_contrib_range) {
         Contrib *contrib = &contribs[contrib_idx];
-        color_map[contrib->obj_idx][contrib->sect_idx] = color_table.slots[contrib->color_slot_idx].color;
+        color_map[contrib->obj_idx][contrib->sect_idx] = color_table.slots[contrib->color_slot_idx].key.old_color;
       }
     }
     ProfEnd();
