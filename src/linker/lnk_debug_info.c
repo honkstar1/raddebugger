@@ -4334,6 +4334,10 @@ lnk_merge_types(TP_Context *tp, TP_Arena *tp_temp, LNK_CodeViewInput *input, LNK
               break;
             }
           }
+          if (!is_range_not_empty) {
+            ProfEnd();
+            continue;
+          }
 
           ProfBegin("Counts -> Offsets");
           {
