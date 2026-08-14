@@ -2132,8 +2132,9 @@ lnk_icf_debug_s_child_from_section(LNK_Obj *obj, U32 fn_sn)
 {
   String8             string_table  = lnk_coff_string_table_from_obj(obj);
   COFF_SectionHeader *section_table = lnk_coff_section_table_from_obj(obj);
-  for EachNode(assoc_n, U32Node, obj->associated_sections[fn_sn]) {
-    U32 sn = assoc_n->data;
+  U32Array associated_sections = lnk_obj_associated_sections_from_section_number(obj, fn_sn);
+  for EachIndex(assoc_idx, associated_sections.count) {
+    U32 sn = associated_sections.v[assoc_idx];
     if (sn == 0 || sn > obj->header.section_count_no_null)     { continue; }
     if (~obj->section_flags[sn-1] & LNK_SECTION_FLAG_DEBUG)    { continue; }
     if (str8_match(coff_name_from_section_header(string_table, &section_table[sn-1]), str8_lit(".debug$S"), 0)) { return sn; }
@@ -3110,8 +3111,9 @@ THREAD_POOL_TASK_FUNC(lnk_opt_ref_task)
               }
 
               // push associated section
-              for EachNode(associated_n, U32Node, walk_obj->associated_sections[section_number]) {
-                U32 assoc_sn = associated_n->data;
+              U32Array associated_sections = lnk_obj_associated_sections_from_section_number(walk_obj, section_number);
+              for EachIndex(associated_idx, associated_sections.count) {
+                U32 assoc_sn = associated_sections.v[associated_idx];
 
 
                 {
@@ -4329,8 +4331,9 @@ THREAD_POOL_TASK_FUNC(lnk_icf_mark_folded_lines_task)
       temp_end(fold_temp);
     }
 
-    for EachNode(assoc_n, U32Node, obj->associated_sections[sect_idx + 1]) {
-      U32 assoc_sn = assoc_n->data;
+    U32Array associated_sections = lnk_obj_associated_sections_from_section_number(obj, (U32)(sect_idx + 1));
+    for EachIndex(assoc_idx, associated_sections.count) {
+      U32 assoc_sn = associated_sections.v[assoc_idx];
       if (assoc_sn == 0 || assoc_sn > obj->header.section_count_no_null)   { continue; }
       if (~obj->section_flags[assoc_sn - 1] & LNK_SECTION_FLAG_DEBUG)      { continue; }
       // exclude the follower's .debug$S from full module collection (it would otherwise merge

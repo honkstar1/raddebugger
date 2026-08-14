@@ -40,7 +40,8 @@ typedef struct LNK_Obj
 
   // COMDAT
   U32                 *comdats;
-  U32Node            **associated_sections;
+  U32                 *associated_section_offs;
+  U32                 *associated_sections;
   LNK_ObjSymbolRef   *symlinks;
   LNK_ICFFold        *icf_fold;       // /OPT:ICF fold map (per section, sn-1 indexed); 0 if ICF off
   String8             icf_file_chksms;      // memoized obj-wide FILECHKSMS slice (see lnk_icf_obj_file_chksms);
@@ -190,6 +191,7 @@ internal struct LNK_Lib * lnk_obj_get_lib(LNK_Obj *obj);
 internal String8          lnk_obj_get_lib_path(LNK_Obj *obj);
 internal U32              lnk_obj_get_removed_section_number(LNK_Obj *obj);
 internal B32              lnk_obj_get_comdat_symlink(LNK_Obj *obj, U64 section_number, LNK_ObjSymbolRef *symlink_out);
+internal U32Array         lnk_obj_associated_sections_from_section_number(LNK_Obj *obj, U32 section_number);
 internal U32List          lnk_obj_collect_associated_sections(Arena *arena, LNK_Obj *obj, U32 root_section, COFF_SectionFlags skip_flags);
 
 // --- Symbol & Section Helpers ------------------------------------------------

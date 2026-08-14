@@ -167,6 +167,7 @@ THREAD_POOL_TASK_FUNC(lnk_obj_initer)
   }
 
   U64                 name_block_count = CeilIntegerDiv(header.symbol_count, 64);
+  U32                *associated_section_offs = push_array(arena, U32, header.section_count_no_null + 2);
   LNK_SymbolNameCache symbol_name_cache = {
     .masks       = push_array(arena, U64, name_block_count),
     .block_bases = push_array_no_zero(arena, U32, name_block_count),
@@ -199,6 +200,8 @@ THREAD_POOL_TASK_FUNC(lnk_obj_initer)
           if (select == COFF_ComdatSelect_Associative) {
             if (section_number == 0 || section_number > header.section_count_no_null) {
               lnk_error_input_obj(LNK_Error_IllData, input, "section definition symbol %S (No. 0x%x) associates with an out of bounds section 0x%x", symbol.name, symbol_idx, symbol.section_number);
+            } else if (symbol.section_number > 0 && symbol.section_number <= header.section_count_no_null) {
+              associated_section_offs[section_number + 1] += 1;
             }
           }
         }
@@ -208,6 +211,14 @@ THREAD_POOL_TASK_FUNC(lnk_obj_initer)
       symbol_name_cache.block_bases[next_block++] = name_count;
     }
   }
+
+  // Convert per-parent association counts to CSR offsets. The offsets double as fill cursors
+  // below; the backwards pass restores them and the old SLLStackPush sibling order.
+  for (U64 section_number = 1; section_number <= header.section_count_no_null; section_number += 1) {
+    associated_section_offs[section_number + 1] += associated_section_offs[section_number];
+  }
+  U32  associated_section_count = associated_section_offs[header.section_count_no_null + 1];
+  U32 *associated_sections      = push_array_no_zero(arena, U32, associated_section_count);
 
   //
   // create symbol links to COMDAT sections
@@ -226,10 +237,16 @@ THREAD_POOL_TASK_FUNC(lnk_obj_initer)
         if (symbol.storage_class == COFF_SymStorageClass_Static) {
           if (symbol.section_number > 0 && symbol.section_number <= header.section_count_no_null) {
             COFF_SectionHeader *sect_header = &coff_section_table[symbol.section_number-1];
-            if (section_flags[symbol.section_number-1] & COFF_SectionFlag_LnkCOMDAT) {
-              if (symbol.aux_symbol_count) {
-                U32 section_length = 0;
-                coff_parse_secdef(symbol, header.is_big_obj, 0, 0, &section_length, 0);
+            if (symbol.aux_symbol_count) {
+              COFF_ComdatSelectType selection      = COFF_ComdatSelect_Null;
+              U32                   section_number = 0;
+              U32                   section_length = 0;
+              coff_parse_secdef(symbol, header.is_big_obj, &selection, &section_number, &section_length, 0);
+              if (selection == COFF_ComdatSelect_Associative && section_number > 0 && section_number <= header.section_count_no_null) {
+                U32 cursor = associated_section_offs[section_number]++;
+                associated_sections[cursor] = symbol.section_number;
+              }
+              if (section_flags[symbol.section_number-1] & COFF_SectionFlag_LnkCOMDAT) {
                 if (sect_header->fsize == section_length) {
                   if (comdats[symbol.section_number-1] == ~0) {
                     comdats[symbol.section_number-1] = symbol_idx;
@@ -246,6 +263,14 @@ THREAD_POOL_TASK_FUNC(lnk_obj_initer)
           }
         }
       }
+    }
+  }
+  for (U64 section_number = header.section_count_no_null; section_number > 0; section_number -= 1) {
+    associated_section_offs[section_number] = associated_section_offs[section_number - 1];
+    U32 min = associated_section_offs[section_number];
+    U32 max = associated_section_offs[section_number + 1];
+    for (U32 child_idx = 0; child_idx < (max - min) / 2; child_idx += 1) {
+      Swap(U32, associated_sections[min + child_idx], associated_sections[max - child_idx - 1]);
     }
   }
 
@@ -296,28 +321,6 @@ THREAD_POOL_TASK_FUNC(lnk_obj_initer)
     }
 
     scratch_end(scratch);
-  }
-
-  //
-  // collect sections associations
-  //
-  U32Node **associated_sections = push_array(arena, U32Node *, header.section_count_no_null + 1);
-  {
-    COFF_ParsedSymbol symbol;
-    for (U32 symbol_idx = 0; symbol_idx < header.symbol_count; symbol_idx += (1 + symbol.aux_symbol_count)) {
-      symbol = coff_parse_symbol_no_name(header, raw_coff_symbol_table, symbol_idx);
-      COFF_SymbolValueInterpType interp = coff_interp_from_parsed_symbol(symbol);
-      if (interp == COFF_SymbolValueInterp_Regular && symbol.storage_class == COFF_SymStorageClass_Static && symbol.aux_symbol_count > 0) {
-        COFF_ComdatSelectType selection      = COFF_ComdatSelect_Null;
-        U32                   section_number = 0;
-        coff_parse_secdef(symbol, header.is_big_obj, &selection, &section_number, 0, 0);
-        if (selection != COFF_ComdatSelect_Associative) { continue; }
-
-        U32Node *associated_node = push_array(arena, U32Node, 1);
-        associated_node->data    = symbol.section_number;
-        SLLStackPush(associated_sections[section_number], associated_node);
-      }
-    }
   }
 
   B8 hotpatch = 0;
@@ -377,6 +380,7 @@ THREAD_POOL_TASK_FUNC(lnk_obj_initer)
   obj->comdats                 = comdats;
   obj->exclude_from_debug_info = input->exclude_from_debug_info;
   obj->hotpatch                = hotpatch;
+  obj->associated_section_offs = associated_section_offs;
   obj->associated_sections     = associated_sections;
   obj->self                    = &task->objs[task_id];
   obj->link_member             = input->link_member;
@@ -545,8 +549,9 @@ lnk_obj_collect_associated_sections(Arena *arena, LNK_Obj *obj, U32 root_section
 
   // walk the complete descendant chain because associated COMDATs can nest
   for EachNode(parent_n, U32Node, queue.first) {
-    for EachNode(associated_n, U32Node, obj->associated_sections[parent_n->data]) {
-      U32 child_section = associated_n->data;
+    U32Array associated_sections = lnk_obj_associated_sections_from_section_number(obj, parent_n->data);
+    for EachIndex(associated_idx, associated_sections.count) {
+      U32 child_section = associated_sections.v[associated_idx];
 
       if (child_section == 0)                                 { continue; }
       if (hash_map_search_u64_u64(&seen_hm, child_section))   { continue; }
@@ -658,6 +663,19 @@ lnk_obj_get_comdat_symlink(LNK_Obj *obj, U64 section_number, LNK_ObjSymbolRef *s
     *symlink_out = symlink;
   }
   return is_valid;
+}
+
+internal U32Array
+lnk_obj_associated_sections_from_section_number(LNK_Obj *obj, U32 section_number)
+{
+  Assert(section_number <= obj->header.section_count_no_null);
+  U32 min = obj->associated_section_offs[section_number];
+  U32 max = obj->associated_section_offs[section_number + 1];
+  U32Array result = { .count = max - min };
+  if (result.count) {
+    result.v = obj->associated_sections + min;
+  }
+  return result;
 }
 
 internal COFF_SectionHeader *
