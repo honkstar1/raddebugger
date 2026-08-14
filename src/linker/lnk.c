@@ -3403,8 +3403,10 @@ THREAD_POOL_TASK_FUNC(lnk_opt_icf_task)
   // only target colors vary between rounds, so cache non-recursive relocation data
   // and rehash target colors each round
   typedef struct {
-    U64 *color;
-    U64 static_id;
+    union {
+      U64 *color;
+      U64  static_id;
+    };
     U32 value;
     COFF_SymbolValueInterpType interp;
   } RelocTarget;
@@ -3755,7 +3757,7 @@ THREAD_POOL_TASK_FUNC(lnk_opt_icf_task)
         U64 dirty_lo = last_split_rng[0], dirty_hi = last_split_rng[1];
         for EachIndex(reloc_idx, contrib->reloc_count) {
           RelocTarget *target = contrib->reloc_targets[reloc_idx];
-          if (target->color) {
+          if (target->interp == COFF_SymbolValueInterp_Regular) {
             U64 c = *target->color;
             if (c > dirty_lo && c <= dirty_hi) { must_hash = 1; break; }
           }
@@ -3770,7 +3772,7 @@ THREAD_POOL_TASK_FUNC(lnk_opt_icf_task)
           XXH3_128bits_update(&hasher, &contrib->static_hash, sizeof(contrib->static_hash));
           for EachIndex(reloc_idx, contrib->reloc_count) {
             RelocTarget *target    = contrib->reloc_targets[reloc_idx];
-            U64          target_id = target->color ? *target->color : target->static_id;
+            U64          target_id = target->interp == COFF_SymbolValueInterp_Regular ? *target->color : target->static_id;
             XXH3_128bits_update(&hasher, &target_id, sizeof(target_id));
           }
           XXH128_hash_t hash = XXH3_128bits_digest(&hasher);
@@ -3780,7 +3782,7 @@ THREAD_POOL_TASK_FUNC(lnk_opt_icf_task)
           blake3_hasher_update(&hasher, &contrib->static_hash, sizeof(contrib->static_hash));
           for EachIndex(reloc_idx, contrib->reloc_count) {
             RelocTarget *target    = contrib->reloc_targets[reloc_idx];
-            U64          target_id = target->color ? *target->color : target->static_id;
+            U64          target_id = target->interp == COFF_SymbolValueInterp_Regular ? *target->color : target->static_id;
             blake3_hasher_update(&hasher, &target_id, sizeof(target_id));
           }
           U128 hash;
