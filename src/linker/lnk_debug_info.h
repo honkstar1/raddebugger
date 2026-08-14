@@ -211,10 +211,18 @@ typedef struct
 typedef struct { U32 obj_idx; U32 leaf_idx;  } LNK_LeafRef;
 typedef struct { U64 count; LNK_LeafRef **v; } LNK_LeafRefArray;
 
+// The U64 member gives bucket nodes 8-byte alignment. The dedup table uses the
+// otherwise-zero low pointer bits as a short hash fingerprint while probing.
+typedef union
+{
+  LNK_LeafRef ref;
+  U64         align;
+} LNK_LeafBucket;
+
 typedef struct
 {
-  U64           cap;
-  LNK_LeafRef **bucket_arr;
+  U64             cap;
+  LNK_LeafBucket **bucket_arr;
 } LNK_LeafHashTable;
 
 typedef struct
