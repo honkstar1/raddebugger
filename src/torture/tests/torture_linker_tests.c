@@ -302,6 +302,61 @@ TEST(expect_pdb_indexes_linker_output)
   T_Ok(t_result_is_ok(result));
 }
 
+TEST(default_lib_matches_explicit_path)
+{
+  T_Ok(t_write_entry_obj());
+  char *dirs[] = {"sdk libs", "other libs"};
+  char *symbols[] = {"first_provider", "second_provider"};
+  for EachIndex(i, ArrayCount(dirs)) {
+    T_Ok(make_directory(t_make_file_path(arena, str8_cstring(dirs[i]))));
+    COFF_ObjWriter *obj = coff_obj_writer_alloc(0, COFF_MachineType_X64);
+    coff_obj_writer_push_symbol_abs(obj, str8_cstring(symbols[i]), 1, COFF_SymStorageClass_External);
+    COFF_LibWriter *lib = coff_lib_writer_alloc();
+    coff_lib_writer_push_obj(lib, str8_lit("provider.obj"), coff_obj_writer_serialize(arena, obj));
+    T_Ok(t_write_file(str8f(arena, "%s/provider.lib", dirs[i]), coff_lib_writer_serialize(arena, lib, 0, 0, 1)));
+    coff_lib_writer_release(&lib);
+    coff_obj_writer_release(&obj);
+  }
+
+  char *args = "/subsystem:console /entry:entry /out:default.exe entry.obj /include:first_provider";
+  String8 paths[] = {str8_lit("sdk libs/provider.lib"), t_make_file_path(arena, str8_lit("sdk libs/provider.lib"))};
+  // Debug builds also write normal progress to stderr; reject only the missing-library diagnostic.
+  char *names[] = {"provider.lib", "PROVIDER.LIB", "provider"};
+  for EachIndex(path_idx, ArrayCount(paths)) {
+    for EachIndex(name_idx, ArrayCount(names)) {
+      t_invoke_linkerf("%s \"%S\" /defaultlib:%s", args, paths[path_idx], names[name_idx]);
+      T_Ok(g_last_exit_code == 0);
+      T_Ok(str8_find_needle(g_errors, 0, str8_lit("unable to find library"), 0) == g_errors.size);
+    }
+  }
+
+  // Embedded directives use a separate input-source queue from /DEFAULTLIB.
+  COFF_ObjWriter *directive = coff_obj_writer_alloc(0, COFF_MachineType_X64);
+  coff_obj_writer_push_directive(directive, str8_lit("/DEFAULTLIB:provider.lib"));
+  T_Ok(t_write_file(str8_lit("directive.obj"), coff_obj_writer_serialize(arena, directive)));
+  coff_obj_writer_release(&directive);
+  t_invoke_linkerf("%s \"%S\" directive.obj", args, paths[1]);
+  T_Ok(g_last_exit_code == 0);
+  T_Ok(str8_find_needle(g_errors, 0, str8_lit("unable to find library"), 0) == g_errors.size);
+
+  // A basename match must not swallow another explicitly named library, or a
+  // path-qualified default, with the same basename but a different provider.
+  t_invoke_linkerf("%s \"%S\" \"other libs/provider.lib\" /include:second_provider", args, paths[1]);
+  T_Ok(g_last_exit_code == 0);
+  T_Ok(str8_find_needle(g_errors, 0, str8_lit("unable to find library"), 0) == g_errors.size);
+  t_invoke_linkerf("%s \"%S\" /defaultlib:\"other libs/provider.lib\" /include:second_provider", args, paths[1]);
+  T_Ok(g_last_exit_code == 0);
+  T_Ok(str8_find_needle(g_errors, 0, str8_lit("unable to find library"), 0) == g_errors.size);
+
+  // Missing defaults must still warn; explicit bare paths are not defaults.
+  t_invoke_linkerf("%s \"%S\" /defaultlib:missing_provider.lib", args, paths[1]);
+  T_Ok(g_last_exit_code == 0);
+  T_Ok(str8_find_needle(g_errors, 0, str8_lit("unable to find library `missing_provider.lib`"), 0) < g_errors.size);
+  t_invoke_linkerf("%s \"%S\" provider.lib", args, paths[1]);
+  T_Ok(g_last_exit_code == 0);
+  T_Ok(str8_find_needle(g_errors, 0, str8_lit("unable to find library `provider.lib`"), 0) < g_errors.size);
+}
+
 TEST(link_large_import_object)
 {
   // Each named import creates three sections in the synthesized DLL object.
