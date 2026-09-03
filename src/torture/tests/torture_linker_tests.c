@@ -356,6 +356,171 @@ TEST(link_large_import_object)
   }
 }
 
+TEST(compressed_debug_reloc_parity)
+{
+#if OS_WINDOWS
+  // The optional Oodle compressor is built with `rad_obj_compress`; ordinary
+  // torture builds do not require its SDK.
+  String8 compressor = str8f(arena, "%S/build/rad_obj_compress.exe", t_cwd_path());
+  if (!file_path_exists(compressor)) { TestSkip(); }
+
+  // Two relocations per record: overflow COFF's 16-bit relocation count,
+  // cross compressed-segment boundaries, and finish with a partial segment.
+  U32 record_count = 32769;
+  U32 *record_offsets = push_array(arena, U32, record_count);
+  CV_DebugS debug_s = {0};
+  String8List *symbols = cv_sub_section_ptr_from_debug_s(&debug_s, CV_C13SubSectionKind_Symbols);
+  for EachIndex(i, record_count) {
+    record_offsets[i] = sizeof(CV_Signature) + sizeof(CV_C13SubSectionHeader) + safe_cast_u32(symbols->total_size);
+    String8 raw = cv_make_symbol(arena, CV_SymKind_GDATA32,
+        cv_make_data32(arena, (CV_SymData32){.itype = 0x74, .off = (U32)i*4}, str8f(arena, "relocated_%05u", (U32)i)));
+    CV_Symbol symbol = cv_symbol_from_ptr(raw.str);
+    str8_list_push(arena, symbols, cv_data_from_symbol(arena, &symbol, CV_SymbolAlign));
+  }
+  String8List debug_data = cv_data_from_debug_s_c13(arena, &debug_s, 1);
+  COFF_ObjWriter *writer = coff_obj_writer_alloc(0, COFF_MachineType_X64);
+  COFF_ObjSection *data = coff_obj_writer_push_section(writer, str8_lit(".data"),
+      COFF_SectionFlag_CntInitializedData|COFF_SectionFlag_MemRead|COFF_SectionFlag_MemWrite,
+      str8(push_array(arena, U8, record_count*4 + 16), record_count*4 + 16));
+  COFF_ObjSymbol *target = coff_obj_writer_push_symbol_static(writer, str8_lit("target"), 16, data);
+  coff_obj_writer_push_section(writer, str8_lit(".debug$S"),
+      COFF_SectionFlag_CntInitializedData|COFF_SectionFlag_MemRead|COFF_SectionFlag_MemDiscardable,
+      str8_list_join(arena, &debug_data, 0));
+  // Many small relocation tables share compressed segments. Exercise their
+  // decoding interleaved with section-data reads.
+  for EachIndex(i, 512) {
+    CV_DebugS small_debug_s = {0};
+    String8 raw = cv_make_symbol(arena, CV_SymKind_GDATA32,
+        cv_make_data32(arena, (CV_SymData32){.itype = 0x74, .off = (U32)i*4}, str8f(arena, "small_%04u", (U32)i)));
+    CV_Symbol symbol = cv_symbol_from_ptr(raw.str);
+    str8_list_push(arena, cv_sub_section_ptr_from_debug_s(&small_debug_s, CV_C13SubSectionKind_Symbols),
+        cv_data_from_symbol(arena, &symbol, CV_SymbolAlign));
+    String8List small_data = cv_data_from_debug_s_c13(arena, &small_debug_s, 1);
+    COFF_ObjSection *small_section = coff_obj_writer_push_section(writer, str8_lit(".debug$S"),
+        COFF_SectionFlag_CntInitializedData|COFF_SectionFlag_MemRead|COFF_SectionFlag_MemDiscardable,
+        str8_list_join(arena, &small_data, 0));
+    U32 off = sizeof(CV_Signature) + sizeof(CV_C13SubSectionHeader) + sizeof(CV_SymbolHeader);
+    coff_obj_writer_section_push_reloc(writer, small_section, off + OffsetOf(CV_SymData32, sec), target, COFF_Reloc_X64_Section);
+    coff_obj_writer_section_push_reloc(writer, small_section, off + OffsetOf(CV_SymData32, off), target, COFF_Reloc_X64_SecRel);
+  }
+  String8 obj = coff_obj_writer_serialize(arena, writer);
+  // The fixture writer only emits 16-bit relocation counts. Append an explicit
+  // overflow table after its ordinary object data; symbol indices are now final.
+  U32 reloc_count = record_count*2;
+  COFF_Reloc *relocs = push_array(arena, COFF_Reloc, reloc_count + 1);
+  relocs[0].apply_off = reloc_count + 1;
+  U32 reloc_idx = 1;
+  // Deliberately reversed, so the copy must preserve records and their sort keys.
+  for (U32 i = record_count; i-- > 0;) {
+    U32 off = record_offsets[i] + sizeof(CV_SymbolHeader);
+    relocs[reloc_idx++] = (COFF_Reloc){off + OffsetOf(CV_SymData32, sec), target->idx, COFF_Reloc_X64_Section};
+    relocs[reloc_idx++] = (COFF_Reloc){off + OffsetOf(CV_SymData32, off), target->idx, COFF_Reloc_X64_SecRel};
+  }
+  coff_obj_writer_release(&writer);
+  COFF_FileHeaderInfo header = coff_file_header_info_from_data(obj);
+  COFF_SectionHeader *sections = (COFF_SectionHeader *)(obj.str + header.section_table_range.min);
+  sections[1].relocs_foff = safe_cast_u32(obj.size);
+  sections[1].reloc_count = max_U16;
+  sections[1].flags |= COFF_SectionFlag_LnkNRelocOvfl;
+  String8List obj_parts = {0};
+  str8_list_push(arena, &obj_parts, obj);
+  str8_list_push(arena, &obj_parts, str8_array(relocs, reloc_count + 1));
+  obj = str8_list_join(arena, &obj_parts, 0);
+  T_Ok(t_write_file(str8_lit("raw.obj"), obj));
+  T_Ok(t_write_file(str8_lit("reloc_input.obj"), obj));
+  T_Ok(t_write_entry_obj());
+  char *args = "/subsystem:console /entry:entry /debug:full /rad_time_stamp:0 /rad_workers:1 /out:reloc.exe /pdbaltpath:reloc.pdb entry.obj reloc_input.obj";
+  t_invoke_linkerf("%s", args);
+  T_Ok(g_last_exit_code == 0);
+  String8 expected_image = t_read_file(arena, str8_lit("reloc.exe"));
+  String8 expected_pdb = t_read_file(arena, str8_lit("reloc.pdb"));
+  T_Ok(t_invoke(compressor, str8_lit("raw.obj compressed.obj 64 kraken 256 fast"), TIMEOUT_SEC(30)));
+  T_Ok(g_last_exit_code == 0);
+  T_Ok(t_write_file(str8_lit("reloc_input.obj"), t_read_file(arena, str8_lit("compressed.obj"))));
+  t_invoke_linkerf("%s", args);
+  T_Ok(g_last_exit_code == 0);
+  T_Ok(str8_match(expected_image, t_read_file(arena, str8_lit("reloc.exe")), 0));
+  T_Ok(str8_match(expected_pdb, t_read_file(arena, str8_lit("reloc.pdb")), 0));
+#else
+  TestSkip();
+#endif
+}
+
+TEST(compressed_icf_debug_record_selection)
+{
+#if OS_WINDOWS
+  String8 compressor = str8f(arena, "%S/build/rad_obj_compress.exe", t_cwd_path());
+  if (!file_path_exists(compressor)) { TestSkip(); }
+  // Three folded pairs: no locals, locals at different source lines, and locals
+  // at the same source line. Only the second pair needs both full record trees.
+  String8 source = str8_lit(
+      "__declspec(noinline) int empty_a(void) { return 3; }\n"
+      "__declspec(noinline) int empty_b(void) { return 3; }\n"
+      "__declspec(noinline) int different_a(int x) { int a = x+1; return a; }\n"
+      "__declspec(noinline) int different_b(int x) { int b = x+1; return b; }\n"
+      "#line 200 \"shared.h\"\n"
+      "__declspec(noinline) int same_a(int x) { int a = x+2; return a; }\n"
+      "#line 200 \"shared.h\"\n"
+      "__declspec(noinline) int same_b(int x) { int b = x+2; return b; }\n"
+      "int (*volatile functions[])(int) = {different_a,different_b,same_a,same_b};\n"
+      "int (*volatile empty[])(void) = {empty_a,empty_b};\n"
+      "int entry(void) { return functions[0] != functions[1] || functions[2] != functions[3] || empty[0] != empty[1]; }\n");
+  T_Ok(t_write_file(str8_lit("icf_source.c"), source));
+  // Permit ICF despite the address comparisons used to verify the folds below.
+  T_Ok(t_invoke(t_clang_path(), str8_lit("--target=x86_64-pc-windows-msvc -c -O0 -g -gcodeview -ffunction-sections -fno-addrsig -o raw.obj icf_source.c"), TIMEOUT_SEC(30)));
+  T_Ok(g_last_exit_code == 0);
+  String8 raw_obj = t_read_file(arena, str8_lit("raw.obj"));
+  T_Ok(t_invoke(compressor, str8_lit("raw.obj compressed.obj 64 kraken 256 fast"), TIMEOUT_SEC(30)));
+  T_Ok(g_last_exit_code == 0);
+  String8 inputs[] = {raw_obj, t_read_file(arena, str8_lit("compressed.obj"))};
+  String8 expected_image = {0}, expected_pdb = {0};
+  for EachElement(input_idx, inputs) {
+    T_Ok(t_write_file(str8_lit("icf_input.obj"), inputs[input_idx]));
+    t_invoke_linkerf("/nodefaultlib /subsystem:console /entry:entry /debug:full /opt:ref,icf /rad_time_stamp:0 /rad_workers:1 /out:icf.exe /pdbaltpath:icf.pdb icf_input.obj");
+    T_Ok(g_last_exit_code == 0);
+    T_Ok(t_invoke(t_make_file_path(arena, str8_lit("icf.exe")), str8_zero(), TIMEOUT_SEC(5)));
+    T_Ok(g_last_exit_code == 0); // prove all three function pairs actually folded
+    String8 image_data = t_read_file(arena, str8_lit("icf.exe"));
+    String8 pdb_data = t_read_file(arena, str8_lit("icf.pdb"));
+    if (input_idx == 0) {
+      expected_image = image_data;
+      expected_pdb = pdb_data;
+    } else {
+      T_Ok(str8_match(expected_image, image_data, 0));
+      T_Ok(str8_match(expected_pdb, pdb_data, 0));
+    }
+
+    MSF_Parsed *msf = msf_parsed_from_data(arena, pdb_data);
+    T_Ok(msf != 0);
+    if (!msf) { continue; }
+    PDB_DbiParsed *dbi = pdb_dbi_from_data(arena, msf_data_from_stream(msf, PDB_FixedStream_Dbi));
+    PDB_CompUnitArray *modules = pdb_comp_unit_array_from_data(arena, pdb_data_from_dbi_range(dbi, PDB_DbiRange_ModuleInfo));
+    U32 empty_count = 0, different_count = 0, same_count = 0;
+    for EachIndex(module_idx, modules->count) {
+      String8 symbols = pdb_data_from_unit_range(msf, modules->units[module_idx], PDB_DbiCompUnitRange_Symbols);
+      for (U64 cursor = 0; cursor < symbols.size;) {
+        CV_Symbol symbol = {0}; U64 read_size = 0; String8 error = {0};
+        B32 ok = t_codec_pdb_read_symbol(symbols, cursor, PDB_SYMBOL_ALIGN, &symbol, &read_size, &error);
+        T_Ok(ok);
+        if (!ok) { break; }
+        if (CV_IsProc32(symbol.kind)) {
+          String8 name = cv_name_from_symbol(symbol.kind, symbol.data);
+          if (str8_match(name, str8_lit("empty_a"), 0) || str8_match(name, str8_lit("empty_b"), 0)) { empty_count += 1; }
+          if (str8_match(name, str8_lit("different_a"), 0) || str8_match(name, str8_lit("different_b"), 0)) { different_count += 1; }
+          if (str8_match(name, str8_lit("same_a"), 0) || str8_match(name, str8_lit("same_b"), 0)) { same_count += 1; }
+        }
+        cursor += read_size;
+      }
+    }
+    T_Ok(empty_count == 1);
+    T_Ok(different_count == 2);
+    T_Ok(same_count == 1);
+  }
+#else
+  TestSkip();
+#endif
+}
+
 TEST(pdbstripped_coff_artifact_parity)
 {
   String8 path = str8f(arena, "%S/linker/tests/pdbstripped.tst", t_src_path());
