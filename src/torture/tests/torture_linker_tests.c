@@ -93,6 +93,57 @@ t_codec_test_pdb_data(Arena *arena)
   return data;
 }
 
+// Port of dev's ICF regression to the combined branch's native torture tests.
+TEST(icf_nonzero_local_reloc_targets_do_not_fold)
+{
+  U8 address_of_local[] = {0x48, 0x8d, 0x05, 0, 0, 0, 0, 0xc3, 0x90};
+  U8 entry_text[] = {0xc3};
+  U64 addresses[2] = {0};
+  T_Ok(t_write_def_obj("icf_nonzero_local.obj", (T_COFF_DefObj){
+    .machine = T_COFF_DefSetMachine(X64),
+    .sections = (T_COFF_DefSection[]){
+      {"entry", ".text", str8_array_fixed(entry_text), .flags = "rx:code@1"},
+      {"func_a", ".text$mn", str8_array_fixed(address_of_local), .flags = "rx:code@1",
+       .raw_flags = COFF_SectionFlag_LnkCOMDAT,
+       .relocs = (T_COFF_DefReloc[]){T_COFF_DefReloc(X64_Rel32, 3, "local_a"), {0}}},
+      {"func_b", ".text$mn", str8_array_fixed(address_of_local), .flags = "rx:code@1",
+       .raw_flags = COFF_SectionFlag_LnkCOMDAT,
+       .relocs = (T_COFF_DefReloc[]){T_COFF_DefReloc(X64_Rel32, 3, "local_b"), {0}}},
+      {"addresses", ".data", str8_array_fixed(addresses), .flags = "rw:data@8",
+       .relocs = (T_COFF_DefReloc[]){T_COFF_DefReloc(X64_Addr64, 0, "func_a"),
+                                   T_COFF_DefReloc(X64_Addr64, 8, "func_b"), {0}}},
+      {0}},
+    .symbols = (T_COFF_DefSymbol[]){
+      T_COFF_DefSymbol_Secdef("func_a", COFF_ComdatSelect_Any),
+      T_COFF_DefSymbol_Secdef("func_b", COFF_ComdatSelect_Any),
+      T_COFF_DefSymbol_ExternFunc("entry", "entry", 0),
+      T_COFF_DefSymbol_ExternFunc("func_a", "func_a", 0),
+      T_COFF_DefSymbol_ExternFunc("func_b", "func_b", 0),
+      T_COFF_DefSymbol_Static("local_a", "func_a", 7),
+      T_COFF_DefSymbol_Static("local_b", "func_b", 8),
+      T_COFF_DefSymbol_Extern("addresses", "addresses", 0),
+      {0}},
+  }));
+  t_invoke_linkerf("/subsystem:console /entry:entry /out:icf_nonzero_local.exe /opt:ref,icf /include:addresses icf_nonzero_local.obj");
+  T_Ok(g_last_exit_code == 0);
+  String8 image = t_read_file(arena, str8_lit("icf_nonzero_local.exe"));
+  PE_BinInfo bin = pe_bin_info_from_data(arena, image);
+  COFF_SectionHeader *sections = (COFF_SectionHeader *)(image.str + bin.section_table_range.min);
+  B32 found = 0;
+  for EachIndex(i, bin.section_count) {
+    if (MemoryMatch(sections[i].name, ".data", 6)) {
+      String8 data = str8_substr(image, r1u64s(sections[i].foff, sizeof(addresses)));
+      T_Ok(data.size == sizeof(addresses));
+      MemoryCopy(addresses, data.str, sizeof(addresses));
+      found = 1;
+      break;
+    }
+  }
+  T_Ok(found);
+  T_Ok(addresses[0] != 0 && addresses[1] != 0);
+  T_Ok(addresses[0] != addresses[1]);
+}
+
 TEST(comdat_any_nonzero_prefix)
 {
   // The symbol value is the prefix length, not the length of the function.
