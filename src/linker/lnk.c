@@ -4940,9 +4940,14 @@ THREAD_POOL_TASK_FUNC(lnk_patch_regular_symbols_task)
       LNK_SectionContrib *sc = task->sect_map[obj_idx][symbol.section_number];
       U32                 section_number;
       U32                 value;
-      if (sc == task->null_sc) {
-        section_number = lnk_obj_get_removed_section_number(obj);
-        value          = max_U32;
+        if (sc == task->null_sc) {
+          section_number = lnk_obj_get_removed_section_number(obj);
+          value          = max_U32;
+          COFF_ComdatSelectType selection = COFF_ComdatSelect_Null;
+          if (lnk_try_comdat_props_from_section_number(obj, symbol.section_number, &selection, 0, 0, 0) &&
+              selection == COFF_ComdatSelect_Associative) {
+            value = LNK_REMOVED_ASSOCIATIVE_SYMBOL_VALUE;
+          }
       } else {
         section_number = safe_cast_u32(sc->u.sect_idx + 1);
         value          = sc->u.off + symbol.value;
@@ -4978,9 +4983,10 @@ lnk_patch_obj_symtab(LNK_SymbolTable *symtab, LNK_Obj *obj, B8 *was_symbol_patch
 
       U32 section_number;
       U32 value;
-      if (was_fixup_removed || fixup_type == COFF_SymbolValueInterp_Undefined || fixup_type == COFF_SymbolValueInterp_Weak) {
-        section_number = lnk_obj_get_removed_section_number(obj);
-        value          = 0;
+        if (was_fixup_removed || fixup_type == COFF_SymbolValueInterp_Undefined || fixup_type == COFF_SymbolValueInterp_Weak) {
+          section_number = lnk_obj_get_removed_section_number(obj);
+          value          = was_fixup_removed && fixup_src.value == LNK_REMOVED_ASSOCIATIVE_SYMBOL_VALUE ?
+                           LNK_REMOVED_ASSOCIATIVE_SYMBOL_VALUE : 0;
       } else {
         section_number = fixup_src.section_number;
         value          = fixup_src.value;

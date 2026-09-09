@@ -1085,16 +1085,22 @@ lnk_obj_apply_relocs_to_buffer(LNK_Obj *obj, U64 section_number, COFF_SectionHea
       COFF_SymbolValueInterpType interp = coff_interp_from_parsed_symbol(symbol);
       if (interp == COFF_SymbolValueInterp_Regular) {
         if (symbol.section_number == lnk_obj_get_removed_section_number(obj)) {
-          if (~section_flags & LNK_SECTION_FLAG_DEBUG) {
+          if (section_flags & LNK_SECTION_FLAG_DEBUG) { continue; }
+          if (symbol.value != LNK_REMOVED_ASSOCIATIVE_SYMBOL_VALUE) {
             String8 sect_name   = lnk_obj_section_name_from_section_number(obj, section_number);
             String8 symbol_name = lnk_symbol_name_from_coff_symbol_idx(obj, reloc->isymbol);
             lnk_error_obj(LNK_Error_RelocationAgainstRemovedSection, obj, "relocating against symbol that is in a removed section (symbol: %S, reloc-section: %S 0x%llx, reloc-index: 0x%llx)", symbol_name, sect_name, section_number, reloc_idx);
+            continue;
           }
-          continue;
+          // MSVC permits references to discarded associative metadata (ASan
+          // filename strings can be shared across different COMDAT owners).
+          // Use a zero target RVA/section/offset, retaining the relocation's
+          // normal addend and image-base adjustment. Do not revive the section.
+        } else {
+          symbol_secnum = symbol.section_number;
+          symbol_secoff = symbol.value;
+          symbol_voff   = safe_cast_u32((U64)image_section_table[symbol.section_number]->voff + (U64)symbol_secoff);
         }
-        symbol_secnum = symbol.section_number;
-        symbol_secoff = symbol.value;
-        symbol_voff   = safe_cast_u32((U64)image_section_table[symbol.section_number]->voff + (U64)symbol_secoff);
       } else if (interp == COFF_SymbolValueInterp_Abs) {
         // There aren't enough bits in COFF symbol to store full image base address,
         // so we special case __ImageBase. A better solution would be to add
