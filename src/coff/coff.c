@@ -55,10 +55,30 @@ internal String8
 coff_name_from_section_header(String8 string_table, COFF_SectionHeader *header)
 {
   String8 name = str8_cstring_capped(header->name, header->name + sizeof(header->name));
-  if (name.str[0] == '/') {
-    String8 name_off_str = str8_skip(name, 1);
-    U64     name_off     = u64_from_str8(name_off_str, 10);
-    name = str8_cstring_capped(string_table.str + name_off, string_table.str+string_table.size);
+  if (name.size > 0 && name.str[0] == '/') {
+    U64 name_off = 0;
+    B32 valid = 1;
+    if (name.size > 1 && name.str[1] == '/') {
+      // LLVM/GNU encode offsets that do not fit in seven decimal digits as
+      // "//" followed by up to six standard Base64 digits, most significant first.
+      valid = name.size > 2;
+      for (U64 i = 2; i < name.size && valid; i += 1) {
+        U8 c = name.str[i];
+        U64 digit = 0;
+        if      ('A' <= c && c <= 'Z') { digit = c - 'A'; }
+        else if ('a' <= c && c <= 'z') { digit = c - 'a' + 26; }
+        else if ('0' <= c && c <= '9') { digit = c - '0' + 52; }
+        else if (c == '+')            { digit = 62; }
+        else if (c == '/')            { digit = 63; }
+        else                         { valid = 0; }
+        name_off = (name_off << 6) | digit;
+      }
+    } else {
+      name_off = u64_from_str8(str8_skip(name, 1), 10);
+    }
+    name = valid && name_off < string_table.size
+         ? str8_cstring_capped(string_table.str + name_off, string_table.str + string_table.size)
+         : str8_zero();
   }
   return name;
 }

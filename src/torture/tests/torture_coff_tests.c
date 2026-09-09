@@ -13,6 +13,46 @@ t_coff_test_encode(Arena *arena, TestCtx *ctx, String8 file_name, String8 source
   return value != 0 ? value->data : str8_zero();
 }
 
+TEST(coff_section_name_offsets)
+{
+  String8 expected = str8_lit(".lcovfun$M");
+  U64 offsets[] = {4, 62, 63, 64, 9999999, 10000000, 13169462};
+  String8 encoded[] = {
+    str8_lit("//AAAAAE"), str8_lit("//AAAAA+"), str8_lit("//AAAAA/"),
+    str8_lit("//AAAABA"), str8_lit("//AAmJZ/"), str8_lit("//AAmJaA"),
+    str8_lit("//AAyPM2"),
+  };
+  String8 table = str8(push_array(arena, U8, 13169462 + 32), 13169462 + 32);
+  for EachIndex(i, ArrayCount(offsets)) {
+    MemoryCopy(table.str + offsets[i], expected.str, expected.size + 1);
+    COFF_SectionHeader header = {0};
+    MemoryCopy(header.name, encoded[i].str, encoded[i].size);
+    T_Ok(str8_match(coff_name_from_section_header(table, &header), expected, 0));
+    if (offsets[i] <= 9999999) {
+      String8 decimal = str8f(arena, "/%llu", offsets[i]);
+      MemoryZeroStruct(&header);
+      MemoryCopy(header.name, decimal.str, decimal.size);
+      T_Ok(str8_match(coff_name_from_section_header(table, &header), expected, 0));
+    }
+  }
+  String8 invalid[] = {
+    str8_lit("//AAAAA!"), str8_lit("//"), str8_lit("////////"),
+    str8_lit("//AAAAAE"), // offset exactly at the end of the short table below
+    str8_lit("/9999999"),
+  };
+  String8 short_table = str8_prefix(table, 4);
+  for EachIndex(i, ArrayCount(invalid)) {
+    COFF_SectionHeader header = {0};
+    MemoryCopy(header.name, invalid[i].str, invalid[i].size);
+    T_Ok(coff_name_from_section_header(short_table, &header).size == 0);
+  }
+  COFF_SectionHeader inline_header = {0};
+  MemoryCopy(inline_header.name, ".text$mn", 8);
+  T_Ok(str8_match(coff_name_from_section_header(str8_zero(), &inline_header), str8_lit(".text$mn"), 0));
+  MemoryZeroStruct(&inline_header);
+  T_Ok(coff_name_from_section_header(str8_zero(), &inline_header).size == 0);
+}
+
 TEST(coff_writer_bigobj)
 {
   // Exercise the standard-COFF boundary and an associative parent above 16 bits.
